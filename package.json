@@ -1,0 +1,44 @@
+{
+  "name": "pi-submarine",
+  "version": "0.1.0",
+  "description": "A no-nonsense Pi extension for focused foreground child-session delegation.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "subagent",
+    "pi"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json",
+    "smoke:registration": "vitest run test/registration.test.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.79.1",
+    "@earendil-works/pi-coding-agent": "0.79.1",
+    "@types/node": "24.12.4",
+    "typebox": "1.1.38",
+    "typescript": "5.9.3",
+    "vitest": "3.2.4"
+  }
+}
