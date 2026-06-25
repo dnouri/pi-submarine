@@ -1,6 +1,6 @@
 {
   "name": "pi-submarine",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A no-nonsense Pi extension for focused foreground child-session delegation.",
   "license": "MIT",
   "type": "module",
