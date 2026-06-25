@@ -1,8 +1,17 @@
 {
   "name": "pi-submarine",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A no-nonsense Pi extension for focused foreground child-session delegation.",
+  "author": "Daniel Nouri",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dnouri/pi-submarine"
+  },
+  "homepage": "https://github.com/dnouri/pi-submarine#readme",
+  "bugs": {
+    "url": "https://github.com/dnouri/pi-submarine/issues"
+  },
   "type": "module",
   "keywords": [
     "pi-package",
@@ -26,7 +35,9 @@
   "pi": {
     "extensions": [
       "./src/index.ts"
-    ]
+    ],
+    "video": "https://raw.githubusercontent.com/dnouri/pi-submarine/0.1.2/media/pi-submarine.mp4",
+    "image": "https://raw.githubusercontent.com/dnouri/pi-submarine/0.1.2/media/pi-submarine.jpg"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
