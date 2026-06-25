@@ -32,9 +32,9 @@ describe("pi-submarine extension registration", () => {
     expect(tools.map((tool) => tool.name)).toEqual(["subagent", "subagent_resume", "subagent_list"]);
     expect(tools.map((tool) => tool.label)).toEqual(["Subagent", "Resume subagent", "List subagents"]);
     expect(tools.map((tool) => tool.description)).toEqual([
-      expect.stringContaining("Run one focused task"),
+      expect.stringContaining("Delegate one focused task"),
       expect.stringContaining("Continue an existing child Pi session"),
-      expect.stringContaining("List pi-submarine markdown agents"),
+      expect.stringContaining("List specialized markdown"),
     ]);
   });
 
@@ -75,50 +75,57 @@ describe("pi-submarine extension registration", () => {
   it("presents the subagent contract in model-facing metadata", () => {
     const [subagent, subagentResume, subagentList] = registeredToolsFromFactory();
 
-    expect(subagent?.description).toContain("foreground child Pi session");
-    expect(subagent?.description).toContain("one focused task");
+    expect(subagent?.description).toContain("Delegate one focused task");
     expect(subagent?.description).toContain("compact session metadata");
-    expect(subagent?.promptSnippet).toContain("foreground pi-submarine child session");
+    expect(subagent?.promptSnippet).toContain("synchronous subagent");
     const guidelines = subagent?.promptGuidelines?.join("\n") ?? "";
-    expect(guidelines).toContain("subagent is pi-submarine's foreground-only delegation tool");
-    expect(guidelines).toContain("one child Pi session");
-    expect(guidelines).toContain("does not provide async/background jobs, chains, dashboards, or a workflow engine");
-    expect(guidelines).toContain("nearest project .pi/agents/*.md overrides user agents");
-    expect(guidelines).toContain("intentionally approve project-local Pi inputs");
-    expect(guidelines).toContain(".pi/settings.json");
-    expect(guidelines).toContain("generic default mode only when agent is omitted");
-    expect(guidelines).toContain("context defaults to fresh");
-    expect(guidelines).toContain("cwd controls project-agent discovery, AGENTS.md / CLAUDE.md, skills, and prompt resources");
+    expect(guidelines).toContain("Common calls");
+    expect(guidelines).toContain("subagent({ task: \"...\" })");
+    expect(guidelines).toContain("subagent({ agent: \"reviewer\", task: \"...\" })");
+    expect(guidelines).toContain("subagent({ context: \"fork\", task: \"...\" })");
+    expect(guidelines).toContain("do not see the parent conversation");
+    expect(guidelines).toContain("foreground child");
+    expect(guidelines).toContain("not a background job or workflow engine");
+    expect(guidelines).toContain("project .pi/agents/*.md overrides same-named user agents");
+    expect(guidelines).toContain("Omit `agent` for default mode");
+    expect(guidelines).toContain("Role text inside `task` does not select an agent");
+    expect(guidelines).toContain("Usually omit `cwd`");
 
     expect(subagent?.parameters).toMatchObject({
       properties: {
-        agent: { description: expect.stringContaining(".pi/agents/<name>.md") },
-        task: { description: expect.stringContaining("single child Pi session") },
-        context: { description: expect.stringContaining("defaults to fresh") },
-        cwd: { description: expect.stringContaining("Relative paths resolve from the caller cwd") },
+        agent: { description: expect.stringContaining("project agents from the effective `cwd`") },
+        task: { description: expect.stringContaining("does not see the parent conversation") },
+        context: { description: expect.stringContaining("Defaults to `fresh`") },
+        cwd: { description: expect.stringContaining("relative tool paths, bash") },
       },
     });
     expect(subagentResume?.description).toContain("Continue an existing child Pi session");
     expect(subagentResume?.description).toContain("session ID");
     expect(subagentResume?.description).toContain("compact session metadata");
-    expect(subagentResume?.promptSnippet).toContain("Continue an existing pi-submarine child session");
+    expect(subagentResume?.promptSnippet).toContain("Continue an existing subagent child session");
     const resumeGuidelines = subagentResume?.promptGuidelines?.join("\n") ?? "";
-    expect(resumeGuidelines).toContain("subagent_resume continues an existing child Pi session");
+    expect(resumeGuidelines).toContain("subagent_resume({ sessionId: \"...\", message: \"...\" })");
+    expect(resumeGuidelines).toContain("continuing the same child context");
+    expect(resumeGuidelines).toContain("information only in the parent conversation");
+    expect(resumeGuidelines).toContain("`subagent_resume` continues an existing child subagent session");
     expect(resumeGuidelines).toContain("current parent/root session");
-    expect(resumeGuidelines).toContain("does not search globally, fork, or copy the child session");
-    expect(resumeGuidelines).toContain("approved project-local resource policy for the recorded cwd");
-    expect(resumeGuidelines).toContain("Use subagent for unrelated work");
-    expect(resumeGuidelines).toContain("You were interrupted. Continue work exactly where you left off.");
-    expect(resumeGuidelines).toContain("Good. Now also check the edge cases you mentioned and update your recommendation.");
-    expect(resumeGuidelines).toContain("Please summarize what you did so far for a handoff so we can continue later.");
+    expect(resumeGuidelines).toContain("Use `subagent` instead for new work");
     expect(subagentResume?.parameters).toMatchObject({
       properties: {
-        sessionId: { description: expect.stringContaining("child Pi session ID from an earlier subagent or subagent_resume result") },
-        message: { description: expect.stringContaining("append") },
+        sessionId: { description: expect.stringContaining("child subagent session ID from an earlier subagent or subagent_resume result") },
+        message: { description: expect.stringContaining("existing child conversation") },
       },
     });
-    expect(subagentList?.promptSnippet).toContain("Inspect visible pi-submarine subagents");
-    expect(subagentList?.promptGuidelines?.join("\n") ?? "").toContain("Usually omit cwd for subagent_list");
+    expect(subagentList?.promptSnippet).toContain("Inspect visible subagents");
+    const listGuidelines = subagentList?.promptGuidelines?.join("\n") ?? "";
+    expect(listGuidelines).toContain("subagent_list({})");
+    expect(listGuidelines).toContain("subagent_list({ cwd: \"/path\" })");
+    expect(listGuidelines).toContain("do not call it first if you already know the agent name");
+    expect(subagentList?.parameters).toMatchObject({
+      properties: {
+        cwd: { description: expect.stringContaining("intentionally inspecting another directory") },
+      },
+    });
   });
 
   it("keeps registration model-free while execution requires a persisted parent session", async () => {

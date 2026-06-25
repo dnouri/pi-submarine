@@ -45,6 +45,20 @@ rejected.
 > [!IMPORTANT]
 > `pi-submarine` treats project-local Pi inputs for the child cwd as trusted. Review unfamiliar `.pi/` and `.agents/` files before running subagents.
 
+The common calls are intentionally small:
+
+```ts
+subagent({ task: "Inspect src/runner.ts and summarize the control flow." })
+subagent({ agent: "reviewer", task: "Review the changes in src/runner.ts." })
+subagent({ context: "fork", task: "Use the current conversation branch to check my last plan." })
+```
+
+Fresh runs are independent child sessions. They can use files and
+tools in their cwd, but they do not see the current parent
+conversation, so put the needed background, paths, constraints, and
+desired output in `task`. Use `context: "fork"` only when the child
+should inherit a copy of the current conversation.
+
 ### `subagent({ agent?, task, context?, cwd? })`
 
 Runs one focused task in a child Pi session and returns compact session metadata plus the child's final answer.
@@ -60,11 +74,11 @@ Arguments:
   new child session. Use `"fork"` only when the child must inherit the
   current conversation branch.
 - `cwd` is optional and valid only with fresh runs. Usually omit it;
-  the child then uses the caller cwd, including the caller project's
-  agents and prompt resources. An explicit `cwd` is an advanced
-  project-context override; relative paths resolve from the caller
-  cwd. It controls project-agent discovery, `AGENTS.md` / `CLAUDE.md`,
-  skills, and prompt resources.
+  the child then uses the caller cwd. Set it only when another
+  directory should be the child's workspace/project: relative tool
+  paths and bash run there, and project-agent discovery, context
+  files such as `AGENTS.md` / `CLAUDE.md`, skills, and Pi resources
+  follow that cwd. Relative `cwd` values resolve from the caller cwd.
 
 Fresh runs create a new child session below the current root session's
 `.subagents/` directory; nested subagents share that directory. Fork
