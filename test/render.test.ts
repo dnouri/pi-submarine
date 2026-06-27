@@ -91,7 +91,7 @@ describe("subagent display helpers", () => {
       activity: "using bash",
       activityLog: "/tmp/root.jsonl.subagents.md",
     }))).toBe([
-      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md",
       "- experiment (5 turns): using bash",
     ].join("\n"));
   });
@@ -112,7 +112,7 @@ describe("subagent display helpers", () => {
       activity: "using bash",
       activityLog,
     }))).toBe([
-      "Log: ~/.pi/agent/sessions/--encoded-project-cwd--/2026-06-27T01-11-06-774Z_019f06a1-5f16-7a06-b591-3d6225353ca2.jsonl.subagents.md  Subagents:",
+      "Log: ~/.pi/agent/sessions/--encoded-project-cwd--/2026-06-27T01-11-06-774Z_019f06a1-5f16-7a06-b591-3d6225353ca2.jsonl.subagents.md",
       "- experiment (5 turns): using bash",
     ].join("\n"));
   });
@@ -127,7 +127,7 @@ describe("subagent display helpers", () => {
       activity: "using bash",
       activityLog,
     }))).toBe([
-      `Log: ${displayLog}  Subagents:`,
+      `Log: ${displayLog}`,
       "- experiment (5 turns): using bash",
     ].join("\n"));
   });
@@ -151,7 +151,7 @@ describe("subagent display helpers", () => {
         })],
       })],
     }))).toBe([
-      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md",
       "- experiment (5 turns) -> execution (16 turns) -> implementation (3 turns): preparing tool call",
     ].join("\n"));
   });
@@ -167,7 +167,7 @@ describe("subagent display helpers", () => {
         runView({ episodeId: "research", agent: "research", turnCount: 2, activity: "responding" }),
       ],
     }))).toBe([
-      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md",
       "- experiment (5 turns) -> execution (16 turns): using bash",
       "- experiment (5 turns) -> research (2 turns): responding",
     ].join("\n"));
@@ -188,7 +188,7 @@ describe("subagent display helpers", () => {
         activity: "responding",
       })],
     }))).toBe([
-      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md",
       "- experiment (6% ctx, 5 turns) -> execution (12% ctx, 16 turns): responding",
     ].join("\n"));
   });
@@ -201,7 +201,7 @@ describe("subagent display helpers", () => {
       activity: "preparing tool call",
       activityLog: "/tmp/root.jsonl.subagents.md",
     }))).toBe([
-      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md",
       "- implementation (? ctx, 3 turns): preparing tool call",
     ].join("\n"));
   });
@@ -221,7 +221,7 @@ describe("subagent display helpers", () => {
         activity: "completed",
       })],
     }))).toBe([
-      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md",
       "- experiment (1 turn): failed",
     ].join("\n"));
   });
@@ -238,7 +238,7 @@ describe("subagent display helpers", () => {
         activity: "failed",
       })],
     }))).toBe([
-      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md",
       "- experiment (0 turns): failed subagent",
     ].join("\n"));
   });
