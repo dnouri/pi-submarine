@@ -27,6 +27,7 @@ describe("subagent artifact root detection", () => {
     expect(resolved).toEqual({
       rootSessionFile: parentSession,
       subagentsDir: `${parentSession}.subagents`,
+      activityLogPath: `${parentSession}.subagents.md`,
       parentEpisodeId: null,
     });
   });
@@ -42,16 +43,17 @@ describe("subagent artifact root detection", () => {
     expect(resolved).toEqual({
       rootSessionFile: rootSession,
       subagentsDir,
+      activityLogPath: `${rootSession}.subagents.md`,
       parentEpisodeId: "run-parent",
     });
   });
 
-  it("returns the shared aggregate activity log path for a subagents directory", async () => {
+  it("returns the shared aggregate activity log path beside a subagents directory", async () => {
     const root = await tempRoot();
     const parentSession = path.join(root, "parent.jsonl");
     const subagentsDir = `${parentSession}.subagents`;
 
-    expect(activityLogPathForSubagentsRoot(subagentsDir)).toBe(path.join(subagentsDir, "subagents.live.md"));
+    expect(activityLogPathForSubagentsRoot(subagentsDir)).toBe(`${parentSession}.subagents.md`);
   });
 
   it("reconstructs a nested parent episode id from manifest started records", async () => {
@@ -61,7 +63,7 @@ describe("subagent artifact root detection", () => {
     await mkdir(root, { recursive: true });
     await writeFile(
       manifest,
-      `${JSON.stringify({ type: "started", episodeId: "run-1", sessionId: "session-1", parentEpisodeId: null, agent: "subagent", cwd: root, context: "fresh", sessionFile: childSession, activityLog: path.join(root, "subagents.live.md"), startedAt: "2026-01-01T00:00:00.000Z" })}\n`,
+      `${JSON.stringify({ type: "started", episodeId: "run-1", sessionId: "session-1", parentEpisodeId: null, agent: "subagent", cwd: root, context: "fresh", sessionFile: childSession, activityLog: path.join(root, "parent.jsonl.subagents.md"), startedAt: "2026-01-01T00:00:00.000Z" })}\n`,
       "utf8",
     );
 
@@ -78,9 +80,9 @@ describe("subagent artifact root detection", () => {
     await writeFile(
       manifest,
       [
-        { type: "started", episodeId: "initial-run", sessionId: "session-1", parentEpisodeId: null, agent: "subagent", cwd: root, context: "fresh", sessionFile: childSession, activityLog: path.join(root, "subagents.live.md"), startedAt: "2026-01-01T00:00:00.000Z" },
+        { type: "started", episodeId: "initial-run", sessionId: "session-1", parentEpisodeId: null, agent: "subagent", cwd: root, context: "fresh", sessionFile: childSession, activityLog: path.join(root, "parent.jsonl.subagents.md"), startedAt: "2026-01-01T00:00:00.000Z" },
         { type: "finished", episodeId: "initial-run", status: "completed", finishedAt: "2026-01-01T00:01:00.000Z" },
-        { type: "resume_started", episodeId: "resume-run", sessionId: "session-1", parentEpisodeId: null, agent: "subagent", cwd: root, context: "fresh", sessionFile: childSession, activityLog: path.join(root, "subagents.live.md"), startedAt: "2026-01-01T00:02:00.000Z" },
+        { type: "resume_started", episodeId: "resume-run", sessionId: "session-1", parentEpisodeId: null, agent: "subagent", cwd: root, context: "fresh", sessionFile: childSession, activityLog: path.join(root, "parent.jsonl.subagents.md"), startedAt: "2026-01-01T00:02:00.000Z" },
       ].map((record) => JSON.stringify(record)).join("\n") + "\n",
       "utf8",
     );

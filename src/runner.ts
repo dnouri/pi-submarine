@@ -18,9 +18,9 @@ import {
 import { MissingMarkdownAgentError, resolveMarkdownAgent } from "./agents.js";
 import { cloneRunView, createActivityState, createInitialRunView, reduceActivityEvent } from "./activity.js";
 import { QueuedActivityLogWriter, appendActivityLogFinished, appendActivityLogStarted, ensureActivityLogHeader, type DegradedActivityLogOptions } from "./activity-log.js";
-import { appendManifestRecord, findParentEpisodeId, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
+import { appendManifestRecord, findLatestEpisodeStartedRecordBySessionFile, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
 import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult } from "./render.js";
-import { activityLogPathForSubagentsRoot, assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
+import { assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
 import { namedForkPrompt } from "./tool-prompts.js";
 import { OMITTED_AGENT_LABEL, type AgentSelection, type MarkdownAgent, type SubagentContextMode, type SubagentContextUsage, type SubagentParams, type SubagentResumeParams, type SubagentToolDetails, type TextToolResult } from "./types.js";
 
@@ -100,6 +100,7 @@ interface ResumeRunPlan extends ChildSessionPlan {
   childSessionFile: string;
   activityPath: string[];
   rootSessionFile: string;
+  activityLogPath: string;
   userPrompt: string;
 }
 
@@ -305,7 +306,7 @@ export async function runSubagentResume(
       episodeId: deps.createEpisodeId(),
       sessionId: plan.startedRecord.sessionId,
       agent: plan.startedRecord.agent,
-      activityLog: plan.startedRecord.activityLog,
+      activityLog: plan.activityLogPath,
       now: startedAt,
     });
     await ensureActivityLogHeader(run.activityLog, plan.rootSessionFile, startedAt, deps.artifactOptions?.activityLog);
@@ -405,7 +406,7 @@ async function prepareResumeRun(
   const startedRecord = requireUniqueStartedRecordBySessionId(records, params.sessionId);
   assertUsableStartedRecord(startedRecord, params.sessionId);
   assertSessionFileInSubagentsRoot(startedRecord.sessionFile, root.subagentsDir, params.sessionId);
-  assertActivityLogMatchesSubagentsRoot(startedRecord.activityLog, root.subagentsDir, params.sessionId);
+  assertActivityLogMatchesCanonicalPath(startedRecord.activityLog, root.activityLogPath, params.sessionId);
   if (path.resolve(parentSessionFile) === path.resolve(startedRecord.sessionFile)) {
     throw new Error(`Subagent session '${params.sessionId}' is the current session; send a normal message instead of resuming it through subagent_resume.`);
   }
@@ -450,6 +451,7 @@ async function prepareResumeRun(
     childSessionFile,
     activityPath: [...parentPath, startedRecord.agent],
     rootSessionFile: root.rootSessionFile,
+    activityLogPath: root.activityLogPath,
     agentDir,
     settingsManager,
     resourceLoader,
@@ -625,13 +627,12 @@ function assertUsableStartedRecord(record: StartedManifestRecord, sessionId: str
 
 function assertSessionFileInSubagentsRoot(sessionFile: string, subagentsDir: string, sessionId: string): void {
   const relative = path.relative(path.resolve(subagentsDir), path.resolve(sessionFile));
-  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+  if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error(`Subagent session '${sessionId}' points outside the current parent/root subagents directory.`);
   }
 }
 
-function assertActivityLogMatchesSubagentsRoot(activityLog: string, subagentsDir: string, sessionId: string): void {
-  const expectedActivityLog = activityLogPathForSubagentsRoot(subagentsDir);
+function assertActivityLogMatchesCanonicalPath(activityLog: string, expectedActivityLog: string, sessionId: string): void {
   if (path.resolve(activityLog) !== path.resolve(expectedActivityLog)) {
     throw new Error(`Subagent session '${sessionId}' has an invalid activity-log manifest path.`);
   }
@@ -688,7 +689,17 @@ async function resolveArtifactRoot(parentSessionFile: string): Promise<{ root: S
   const manifestPath = manifestPathForSubagentsRoot(provisionalRoot.subagentsDir);
   const isNestedRun = path.dirname(path.resolve(parentSessionFile)) === path.resolve(provisionalRoot.subagentsDir);
   const records = await readManifestRecords(manifestPath);
-  const parentEpisodeId = isNestedRun ? runtimeEpisodeBySessionFile.get(path.resolve(parentSessionFile)) ?? findParentEpisodeId(records, parentSessionFile) ?? null : null;
+  let parentEpisodeId: string | null = null;
+  if (isNestedRun) {
+    parentEpisodeId = runtimeEpisodeBySessionFile.get(path.resolve(parentSessionFile)) ?? null;
+    if (parentEpisodeId === null) {
+      const parentRecord = findLatestEpisodeStartedRecordBySessionFile(records, parentSessionFile);
+      if (parentRecord) {
+        assertActivityLogMatchesCanonicalPath(parentRecord.activityLog, provisionalRoot.activityLogPath, parentRecord.sessionId);
+        parentEpisodeId = parentRecord.episodeId;
+      }
+    }
+  }
   if (isNestedRun && parentEpisodeId === null) {
     throw new Error(`Could not determine parent subagent episode for nested session: ${parentSessionFile}`);
   }
@@ -713,7 +724,7 @@ async function startRunArtifacts(
 ): Promise<StartedRun> {
   const episodeId = deps.createEpisodeId();
   const startedAt = deps.now();
-  const activityLog = activityLogPathForSubagentsRoot(plan.root.subagentsDir);
+  const activityLog = plan.root.activityLogPath;
   const activityPath = [...plan.parentPath, plan.profile.agentName];
   const childSessionManager = createChildSessionManager(plan, deps);
   const childSessionFile = childSessionManager.getSessionFile();

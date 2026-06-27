@@ -12,7 +12,7 @@ function initialRun(): SubagentRunView {
     episodeId: "run-1",
     sessionId: "session-1",
     agent: "reviewer",
-    activityLog: "/tmp/subagents.live.md",
+    activityLog: "/tmp/root.jsonl.subagents.md",
     now: "2026-01-01T00:00:00.000Z",
   });
 }
@@ -79,7 +79,7 @@ describe("activity reducer", () => {
 
   it("merges nested subagent run updates by episode id without duplicating child detail into parent activity", () => {
     const state = createActivityState(initialRun());
-    const child = createInitialRunView({ episodeId: "child-1", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/subagents.live.md", now: "2026-01-01T00:00:01.000Z" });
+    const child = createInitialRunView({ episodeId: "child-1", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/root.jsonl.subagents.md", now: "2026-01-01T00:00:01.000Z" });
     child.activity = "using read";
     child.contextUsage = { tokens: 12_000, contextWindow: 200_000, percent: 6 };
 
@@ -92,7 +92,7 @@ describe("activity reducer", () => {
     }), "2026-01-01T00:00:02.000Z");
 
     expect(update.changed).toBe(true);
-    expect(update.nestedRun).toMatchObject({ episodeId: "child-1", activityLog: "/tmp/subagents.live.md", contextUsage: { percent: 6 } });
+    expect(update.nestedRun).toMatchObject({ episodeId: "child-1", activityLog: "/tmp/root.jsonl.subagents.md", contextUsage: { percent: 6 } });
     expect(state.run.children).toHaveLength(1);
     expect(state.run.children[0]).toMatchObject({ episodeId: "child-1", activity: "using read", contextUsage: { tokens: 12_000 } });
     expect(state.run.activity).toBe("using subagent");
@@ -113,7 +113,7 @@ describe("activity reducer", () => {
 
   it("merges nested subagent_resume run updates like subagent updates", () => {
     const state = createActivityState(initialRun());
-    const child = createInitialRunView({ episodeId: "resume-1", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/subagents.live.md", now: "2026-01-01T00:00:01.000Z" });
+    const child = createInitialRunView({ episodeId: "resume-1", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/root.jsonl.subagents.md", now: "2026-01-01T00:00:01.000Z" });
     child.activity = "responding";
 
     reduceActivityEvent(state, event({
@@ -131,10 +131,10 @@ describe("activity reducer", () => {
 
   it("keeps repeated resume episodes for the same child session as separate activity children", () => {
     const state = createActivityState(initialRun());
-    const firstResume = createInitialRunView({ episodeId: "resume-1", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/subagents.live.md", now: "2026-01-01T00:00:01.000Z" });
+    const firstResume = createInitialRunView({ episodeId: "resume-1", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/root.jsonl.subagents.md", now: "2026-01-01T00:00:01.000Z" });
     firstResume.activity = "completed";
     firstResume.status = "completed";
-    const secondResume = createInitialRunView({ episodeId: "resume-2", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/subagents.live.md", now: "2026-01-01T00:00:02.000Z" });
+    const secondResume = createInitialRunView({ episodeId: "resume-2", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/root.jsonl.subagents.md", now: "2026-01-01T00:00:02.000Z" });
     secondResume.activity = "responding";
 
     reduceActivityEvent(state, event({
@@ -166,7 +166,7 @@ describe("activity reducer", () => {
       turnCount: 0,
       lastActivityAt: "2026-01-01T00:00:01.000Z",
       activity: "using read",
-      activityLog: "/tmp/subagents.live.md",
+      activityLog: "/tmp/root.jsonl.subagents.md",
       contextUsage: { tokens: "many", contextWindow: 200_000, percent: 6 },
       children: [],
     };
@@ -185,7 +185,7 @@ describe("activity reducer", () => {
 
   it("preserves a failed nested partial when Pi's final thrown tool result has no details", () => {
     const state = createActivityState(initialRun());
-    const failedChild = createInitialRunView({ episodeId: "child-1", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/subagents.live.md", now: "2026-01-01T00:00:01.000Z" });
+    const failedChild = createInitialRunView({ episodeId: "child-1", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/root.jsonl.subagents.md", now: "2026-01-01T00:00:01.000Z" });
     failedChild.status = "failed";
     failedChild.activity = "failed";
 
@@ -211,7 +211,7 @@ describe("activity reducer", () => {
 
   it("accepts aborted nested partials and summarizes them as interrupted subagents", () => {
     const state = createActivityState(initialRun());
-    const abortedChild = createInitialRunView({ episodeId: "child-1", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/subagents.live.md", now: "2026-01-01T00:00:01.000Z" });
+    const abortedChild = createInitialRunView({ episodeId: "child-1", sessionId: "session-child-1", agent: "scout", activityLog: "/tmp/root.jsonl.subagents.md", now: "2026-01-01T00:00:01.000Z" });
     abortedChild.status = "aborted";
     abortedChild.activity = "interrupted";
 

@@ -18,8 +18,8 @@ run metadata, the child session ID, and the child's final answer.
   including `subagent_list` for showing what is visible from a cwd.
 - Runtime status updates that report activity, turn counts, nested
   children, and context usage.
-- An append-only `subagents.live.md` activity log that can be tailed
-  while children run.
+- An append-only `<parent-session>.jsonl.subagents.md` activity log
+  that can be tailed while children run.
 - Nested subagents, with a depth limit to prevent accidental circular
   delegation.
 - Support for parallel subagents through Pi's native multi tool
@@ -85,10 +85,10 @@ Arguments:
   follow that cwd. Relative `cwd` values resolve from the caller cwd.
 
 Fresh runs create a new child session below the current root session's
-`.subagents/` directory; nested subagents share that directory. Fork
-runs branch from the current conversation leaf into the same
-`.subagents/` directory; `cwd` is invalid for fork because the child
-keeps the branch cwd and prompt shape.
+`.subagents/` directory; nested subagents share that directory. The
+tail-able Markdown activity log is the sibling
+`<parent-session>.jsonl.subagents.md` file. Fork runs branch from the
+current conversation leaf into the same `.subagents/` directory.
 
 If a named agent cannot be found from an explicit `cwd` but would have
 been found from the caller cwd, `subagent` fails with a hint to omit
@@ -214,23 +214,22 @@ later fails or is aborted:
 
 ```text
 <parent-session>.jsonl
+<parent-session>.jsonl.subagents.md
 <parent-session>.jsonl.subagents/
   manifest.jsonl
-  subagents.live.md
   <child-session>.jsonl
 ```
 
 `manifest.jsonl` records lifecycle data used for resume and
-nesting. `subagents.live.md` is an append-only status stream suitable
-for `tail -f`, not a transcript. Full child messages remain in the
-child session JSONL.
+nesting. `<parent-session>.jsonl.subagents.md` is an append-only
+status stream suitable for `tail -f`, not a transcript. Full child
+messages remain in the child session JSONL.
 
 While a child runs, Pi frontends receive portable text partial updates
 like this:
 
 ```text
-Active log: /path/to/parent.jsonl.subagents/subagents.live.md
-Subagents:
+Log: ~/.pi/agent/sessions/.../parent.jsonl.subagents.md  Subagents:
 - subagent (6% ctx, 1 turn) -> reviewer (? ctx, 2 turns): using read
 ```
 
