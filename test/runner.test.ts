@@ -1047,7 +1047,7 @@ describe("subagent runner", () => {
     expect(updates.some((update) => update.details.run.activity === "thinking")).toBe(true);
     expect(updates.some((update) => update.details.run.activity.startsWith("using bash"))).toBe(true);
     expect(updates.some((update) => update.details.run.turnCount === 1)).toBe(true);
-    expect(updates.every((update) => update.content[0]?.text.split("\n")[0] === `Log: ${expectedActivityLog}  Subagents:`)).toBe(true);
+    expect(updates.every((update) => update.content[0]?.text.split("\n")[0] === `Log: ${expectedActivityLog}`)).toBe(true);
     expect(updates.every((update) => update.content[0]?.text.includes("\n- subagent"))).toBe(true);
     expect(updates.every((update) => !update.content[0]?.text.includes("Activity log:"))).toBe(true);
     expect(updates.every((update) => !update.content[0]?.text.includes("ctx"))).toBe(true);

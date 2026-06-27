@@ -62,7 +62,7 @@ export function renderSubagentRecoverableError(selection: AgentSelection, sessio
 
 export function renderSubagentProgress(run: SubagentRunView): string {
   return [
-    `Log: ${formatActiveLogPath(run.activityLog)}  Subagents:`,
+    `Log: ${formatActiveLogPath(run.activityLog)}`,
     ...activeRunPaths(run).map(formatRunProgressBullet),
   ].join("\n");
 }

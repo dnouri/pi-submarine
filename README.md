@@ -229,7 +229,7 @@ While a child runs, Pi frontends receive portable text partial updates
 like this:
 
 ```text
-Log: ~/.pi/agent/sessions/.../parent.jsonl.subagents.md  Subagents:
+Log: ~/.pi/agent/sessions/.../parent.jsonl.subagents.md
 - subagent (6% ctx, 1 turn) -> reviewer (? ctx, 2 turns): using read
 ```
 
