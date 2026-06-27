@@ -27,7 +27,7 @@ const started: ManifestRecord = {
   cwd: "/repo",
   context: "fresh",
   sessionFile: "/sessions/root.jsonl.subagents/child.jsonl",
-  activityLog: "/sessions/root.jsonl.subagents/subagents.live.md",
+  activityLog: "/sessions/root.jsonl.subagents.md",
   startedAt: "2026-01-01T00:00:00.000Z",
 };
 
@@ -40,7 +40,7 @@ function runView(overrides: Partial<SubagentRunView> = {}): SubagentRunView {
     turnCount: 3,
     lastActivityAt: "2026-01-01T00:01:00.000Z",
     activity: "completed",
-    activityLog: "/sessions/root.jsonl.subagents/subagents.live.md",
+    activityLog: "/sessions/root.jsonl.subagents.md",
     children: [],
     ...overrides,
   };
@@ -80,7 +80,7 @@ describe("manifest helpers", () => {
       cwd: "/repo",
       context: "fresh",
       sessionFile: "/sessions/root.jsonl.subagents/child.jsonl",
-      activityLog: "/sessions/root.jsonl.subagents/subagents.live.md",
+      activityLog: "/sessions/root.jsonl.subagents.md",
       startedAt: "2026-01-01T00:02:00.000Z",
     };
     const resumeAborted: ManifestRecord = { type: "resume_finished", episodeId: "resume-1", sessionId: "session-1", status: "aborted", finishedAt: "2026-01-01T00:03:00.000Z", error: "Interrupted by parent abort." };
@@ -114,7 +114,7 @@ describe("activity log helpers", () => {
   it("creates one idempotent aggregate header for the root parent session", async () => {
     const root = await tempRoot();
     const rootSession = path.join(root, "parent.jsonl");
-    const activityLog = path.join(`${rootSession}.subagents`, "subagents.live.md");
+    const activityLog = `${rootSession}.subagents.md`;
 
     await ensureActivityLogHeader(activityLog, rootSession, "2026-01-01T00:00:00.000Z");
     await ensureActivityLogHeader(activityLog, rootSession, "2026-01-01T00:00:01.000Z");
@@ -131,7 +131,7 @@ describe("activity log helpers", () => {
   it("appends start, status, and completion events with JSONL session references", async () => {
     const root = await tempRoot();
     const rootSession = path.join(root, "parent.jsonl");
-    const activityLog = path.join(`${rootSession}.subagents`, "subagents.live.md");
+    const activityLog = `${rootSession}.subagents.md`;
     const childSession = path.join(`${rootSession}.subagents`, "child.jsonl");
     await ensureActivityLogHeader(activityLog, rootSession, "2026-01-01T00:00:00.000Z");
 
@@ -162,7 +162,7 @@ describe("activity log helpers", () => {
 
   it("renders unknown final context usage honestly", async () => {
     const root = await tempRoot();
-    const activityLog = path.join(root, "subagents.live.md");
+    const activityLog = path.join(root, "subagents.md");
     const childSession = path.join(root, "child.jsonl");
 
     await appendActivityLogFinished(activityLog, "2026-01-01T00:00:05.000Z", ["implementation"], childSession, runView({
@@ -175,7 +175,7 @@ describe("activity log helpers", () => {
 
   it("appends failed and aborted completion events with one-line errors", async () => {
     const root = await tempRoot();
-    const activityLog = path.join(root, "subagents.live.md");
+    const activityLog = path.join(root, "subagents.md");
     const childSession = path.join(root, "child.jsonl");
 
     await appendActivityLogFinished(activityLog, "2026-01-01T00:00:05.000Z", ["implementation"], childSession, runView({
@@ -200,9 +200,9 @@ describe("activity log helpers", () => {
       throw new Error("permission denied");
     });
 
-    await expect(appendActivityLogFinished("/nope/subagents.live.md", "now", ["subagent"], "/nope/child.jsonl", runView({ status: "failed" }), "boom", { appendFile, logger })).resolves.toBe(false);
+    await expect(appendActivityLogFinished("/nope/root.jsonl.subagents.md", "now", ["subagent"], "/nope/child.jsonl", runView({ status: "failed" }), "boom", { appendFile, logger })).resolves.toBe(false);
 
-    const writer = new QueuedActivityLogWriter("/nope/subagents.live.md", ["subagent"], "/nope/child.jsonl", { appendFile, logger });
+    const writer = new QueuedActivityLogWriter("/nope/root.jsonl.subagents.md", ["subagent"], "/nope/child.jsonl", { appendFile, logger });
     writer.appendStatus("now", "using read");
     await expect(writer.drain()).resolves.toBeUndefined();
 

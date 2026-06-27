@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult, resultHeading, subagentTitle } from "../src/render.js";
 import type { SubagentRunView } from "../src/types.js";
@@ -11,7 +13,7 @@ function runView(overrides: Partial<SubagentRunView> = {}): SubagentRunView {
     turnCount: 0,
     lastActivityAt: "now",
     activity: "starting",
-    activityLog: "/tmp/subagents.live.md",
+    activityLog: "/tmp/root.jsonl.subagents.md",
     children: [],
     ...overrides,
   };
@@ -62,7 +64,7 @@ describe("subagent display helpers", () => {
       "- Good. Now also check the edge cases you mentioned and update your recommendation.",
       "- Please summarize what you did so far for a handoff so we can continue later.",
     ].join("\n"));
-    expect(text).not.toMatch(/\.jsonl|\.subagents|subagents\.live\.md|Activity log|stack|runId|episodeId/i);
+    expect(text).not.toMatch(/\.jsonl|\.subagents|Activity log|stack|runId|episodeId/i);
   });
 
   it("renders recoverable child failure text without calling it interrupted", () => {
@@ -79,7 +81,7 @@ describe("subagent display helpers", () => {
       "This child session may be resumable. To continue this exact child session, call `subagent_resume` with this session ID and a message.",
     ].join("\n"));
     expect(text).not.toContain("interrupted");
-    expect(text).not.toMatch(/\.jsonl|\.subagents|subagents\.live\.md|Activity log|stack|runId|episodeId/i);
+    expect(text).not.toMatch(/\.jsonl|\.subagents|Activity log|stack|runId|episodeId/i);
   });
 
   it("renders a single running root as an active progress bullet", () => {
@@ -87,10 +89,45 @@ describe("subagent display helpers", () => {
       agent: "experiment",
       turnCount: 5,
       activity: "using bash",
-      activityLog: "/tmp/subagents.live.md",
+      activityLog: "/tmp/root.jsonl.subagents.md",
     }))).toBe([
-      "Active log: /tmp/subagents.live.md",
-      "Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
+      "- experiment (5 turns): using bash",
+    ].join("\n"));
+  });
+
+  it("shortens active log paths under the home directory", () => {
+    const activityLog = path.join(
+      homedir(),
+      ".pi",
+      "agent",
+      "sessions",
+      "--encoded-project-cwd--",
+      "2026-06-27T01-11-06-774Z_019f06a1-5f16-7a06-b591-3d6225353ca2.jsonl.subagents.md",
+    );
+
+    expect(renderSubagentProgress(runView({
+      agent: "experiment",
+      turnCount: 5,
+      activity: "using bash",
+      activityLog,
+    }))).toBe([
+      "Log: ~/.pi/agent/sessions/--encoded-project-cwd--/2026-06-27T01-11-06-774Z_019f06a1-5f16-7a06-b591-3d6225353ca2.jsonl.subagents.md  Subagents:",
+      "- experiment (5 turns): using bash",
+    ].join("\n"));
+  });
+
+  it("does not shorten paths that merely share the home string prefix", () => {
+    const activityLog = path.join(`${homedir()}-sibling`, ".pi", "agent", "root.jsonl.subagents.md");
+    const displayLog = activityLog.split(path.sep).join("/");
+
+    expect(renderSubagentProgress(runView({
+      agent: "experiment",
+      turnCount: 5,
+      activity: "using bash",
+      activityLog,
+    }))).toBe([
+      `Log: ${displayLog}  Subagents:`,
       "- experiment (5 turns): using bash",
     ].join("\n"));
   });
@@ -100,7 +137,7 @@ describe("subagent display helpers", () => {
       agent: "experiment",
       turnCount: 5,
       activity: "using subagent",
-      activityLog: "/tmp/subagents.live.md",
+      activityLog: "/tmp/root.jsonl.subagents.md",
       children: [runView({
         episodeId: "execution",
         agent: "execution",
@@ -114,8 +151,7 @@ describe("subagent display helpers", () => {
         })],
       })],
     }))).toBe([
-      "Active log: /tmp/subagents.live.md",
-      "Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
       "- experiment (5 turns) -> execution (16 turns) -> implementation (3 turns): preparing tool call",
     ].join("\n"));
   });
@@ -125,14 +161,13 @@ describe("subagent display helpers", () => {
       agent: "experiment",
       turnCount: 5,
       activity: "using subagent",
-      activityLog: "/tmp/subagents.live.md",
+      activityLog: "/tmp/root.jsonl.subagents.md",
       children: [
         runView({ episodeId: "execution", agent: "execution", turnCount: 16, activity: "using bash" }),
         runView({ episodeId: "research", agent: "research", turnCount: 2, activity: "responding" }),
       ],
     }))).toBe([
-      "Active log: /tmp/subagents.live.md",
-      "Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
       "- experiment (5 turns) -> execution (16 turns): using bash",
       "- experiment (5 turns) -> research (2 turns): responding",
     ].join("\n"));
@@ -144,7 +179,7 @@ describe("subagent display helpers", () => {
       turnCount: 5,
       contextUsage: { tokens: 12_400, contextWindow: 200_000, percent: 6.2 },
       activity: "using bash",
-      activityLog: "/tmp/subagents.live.md",
+      activityLog: "/tmp/root.jsonl.subagents.md",
       children: [runView({
         episodeId: "execution",
         agent: "execution",
@@ -153,8 +188,7 @@ describe("subagent display helpers", () => {
         activity: "responding",
       })],
     }))).toBe([
-      "Active log: /tmp/subagents.live.md",
-      "Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
       "- experiment (6% ctx, 5 turns) -> execution (12% ctx, 16 turns): responding",
     ].join("\n"));
   });
@@ -165,10 +199,9 @@ describe("subagent display helpers", () => {
       turnCount: 3,
       contextUsage: { tokens: null, contextWindow: 200_000, percent: null },
       activity: "preparing tool call",
-      activityLog: "/tmp/subagents.live.md",
+      activityLog: "/tmp/root.jsonl.subagents.md",
     }))).toBe([
-      "Active log: /tmp/subagents.live.md",
-      "Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
       "- implementation (? ctx, 3 turns): preparing tool call",
     ].join("\n"));
   });
@@ -179,7 +212,7 @@ describe("subagent display helpers", () => {
       status: "failed",
       turnCount: 1,
       activity: "failed",
-      activityLog: "/tmp/subagents.live.md",
+      activityLog: "/tmp/root.jsonl.subagents.md",
       children: [runView({
         episodeId: "execution",
         agent: "execution",
@@ -188,8 +221,7 @@ describe("subagent display helpers", () => {
         activity: "completed",
       })],
     }))).toBe([
-      "Active log: /tmp/subagents.live.md",
-      "Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
       "- experiment (1 turn): failed",
     ].join("\n"));
   });
@@ -198,7 +230,7 @@ describe("subagent display helpers", () => {
     expect(renderSubagentProgress(runView({
       agent: "experiment",
       activity: "failed subagent",
-      activityLog: "/tmp/subagents.live.md",
+      activityLog: "/tmp/root.jsonl.subagents.md",
       children: [runView({
         episodeId: "execution",
         agent: "execution",
@@ -206,8 +238,7 @@ describe("subagent display helpers", () => {
         activity: "failed",
       })],
     }))).toBe([
-      "Active log: /tmp/subagents.live.md",
-      "Subagents:",
+      "Log: /tmp/root.jsonl.subagents.md  Subagents:",
       "- experiment (0 turns): failed subagent",
     ].join("\n"));
   });

@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import path from "node:path";
 import { OMITTED_AGENT_LABEL, type AgentSelection, type SubagentRunView } from "./types.js";
 
 export function omittedAgentSelection(): AgentSelection {
@@ -60,10 +62,30 @@ export function renderSubagentRecoverableError(selection: AgentSelection, sessio
 
 export function renderSubagentProgress(run: SubagentRunView): string {
   return [
-    `Active log: ${run.activityLog}`,
-    "Subagents:",
+    `Log: ${formatActiveLogPath(run.activityLog)}  Subagents:`,
     ...activeRunPaths(run).map(formatRunProgressBullet),
   ].join("\n");
+}
+
+function formatActiveLogPath(activityLog: string): string {
+  if (!path.isAbsolute(activityLog)) return toDisplayPath(activityLog);
+
+  const home = homedir();
+  if (!home) return toDisplayPath(activityLog);
+
+  const absoluteLog = path.resolve(activityLog);
+  const absoluteHome = path.resolve(home);
+  const relativeToHome = path.relative(absoluteHome, absoluteLog);
+  if (relativeToHome === "") return "~";
+  if (relativeToHome !== ".." && !relativeToHome.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeToHome)) {
+    return `~/${toDisplayPath(relativeToHome)}`;
+  }
+
+  return toDisplayPath(activityLog);
+}
+
+function toDisplayPath(filePath: string): string {
+  return filePath.split(path.sep).join("/");
 }
 
 function activeRunPaths(run: SubagentRunView): SubagentRunView[][] {
