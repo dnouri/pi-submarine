@@ -96,7 +96,7 @@ describe("pi-submarine extension registration", () => {
         agent: { description: expect.stringContaining("project agents from the effective `cwd`") },
         task: { description: expect.stringContaining("does not see the parent conversation") },
         context: { description: expect.stringContaining("Defaults to `fresh`") },
-        cwd: { description: expect.stringContaining("relative tool paths, bash") },
+        cwd: { description: expect.stringContaining("Omit to inherit the caller cwd") },
       },
     });
     expect(subagentResume?.description).toContain("Continue an existing child Pi session");

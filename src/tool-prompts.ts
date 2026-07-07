@@ -7,7 +7,7 @@ export const TOOL_PROMPTS = {
       agent: "Markdown agent name, i.e. its filename stem. Omit for default mode; project agents from the effective `cwd` override same-named user-defined agents.",
       task: "Prompt for the child. For `fresh` independent work, make sure to include needed context, paths, constraints, and desired output because the child does not see the parent conversation.",
       context: "Defaults to `fresh`. Use `fork` only when the child must inherit a copy of the current conversation; `cwd` is invalid with fork.",
-      cwd: "Usually omit. Set when another directory should be the child's workspace/project; relative tool paths, bash, agent discovery, context files, skills, and Pi resources follow that `cwd`.",
+      cwd: "Omit to inherit the caller cwd. Set only to run the child from a different workspace/project, with its tools, agents, context files, and skills.",
     },
     promptGuidelines: [
       "Common calls: subagent({ task: \"...\" }) for independent work, subagent({ agent: \"reviewer\", task: \"...\" }) to use a specialized named agent, or subagent({ context: \"fork\", task: \"...\" }) when the child should inherit a copy of the current conversation.",
