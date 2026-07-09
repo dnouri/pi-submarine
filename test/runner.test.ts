@@ -61,6 +61,22 @@ function expectNoModelVisiblePaths(text: string): void {
   expect(text).not.toMatch(/\.jsonl|\.subagents|Activity log|stack|runId|episodeId/i);
 }
 
+function expectedPromptEnvelope(context: "fresh" | "fork", task: string, options: { parentDepth?: number; agentName?: string; agentBody?: string } = {}): string {
+  const contextLine = context === "fresh"
+    ? "You are a child subagent. You start without the parent conversation."
+    : "You are a child subagent. You start from a copy of the parent conversation.";
+  const parentDepth = options.parentDepth ?? 0;
+  const depthLine = parentDepth === 0
+    ? "You are the first subagent in this tree."
+    : parentDepth === 1
+      ? "You have one parent subagent above you in this tree."
+      : `You have ${parentDepth} parent subagents above you in this tree.`;
+  const parts = [`<subagent-context>\n${contextLine}\n${depthLine}\n</subagent-context>`];
+  if (options.agentName !== undefined) parts.push(`<${options.agentName}-agent>\n${options.agentBody ?? ""}\n</${options.agentName}-agent>`);
+  parts.push(`<task>\n${task}\n</task>`);
+  return parts.join("\n\n");
+}
+
 function expectInterruptedCapsule(text: string, sessionId: string, heading = "## Subagent interrupted"): void {
   expect(text).toContain(heading);
   expect(text).toContain("No final answer was produced.");
@@ -779,16 +795,17 @@ describe("subagent runner", () => {
     const oldAgentPath = path.join(root, "old-agents", "reviewer.md");
     await writeChildSessionHeader(childSession, "named-fresh-session", cwd);
     await writeManifestRecord(parentSession, startedManifestRecord({ sessionId: "named-fresh-session", agent: "reviewer", cwd, context: "fresh", sessionFile: childSession, agentFile: oldAgentPath }));
-    const { deps } = fakeDeps(root);
+    const { deps, fakeSession } = fakeDeps(root);
 
     const result = await runSubagentResume({ sessionId: "named-fresh-session", message: "continue review" }, undefined, undefined, fakeContext(cwd, parentSession), { deps });
 
     expectSubagentResult(result, "## Subagent reviewer result");
     const loaderCalls = (deps.createResourceLoader as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
     const loaderOptions = loaderCalls[0]?.[0];
+    expect(fakeSession.promptedWith).toBe("continue review");
     expect(loaderOptions).toMatchObject({ cwd, agentDir: path.join(root, "agent"), noSkills: true });
     expect(loaderOptions?.noContextFiles).toBeUndefined();
-    expect((loaderOptions?.appendSystemPromptOverride as (base: string[]) => string[])(["base"])).toEqual(["base", "Fresh reviewer body."]);
+    expect(loaderOptions?.appendSystemPromptOverride).toBeUndefined();
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     expect(manifest).toContainEqual(expect.objectContaining({ type: "resume_started", episodeId: "run-1", sessionId: "named-fresh-session", agentFile: agentPath }));
     expect(manifest).not.toContainEqual(expect.objectContaining({ type: "resume_started", agentFile: oldAgentPath }));
@@ -1001,7 +1018,7 @@ describe("subagent runner", () => {
 
     const result = await runSubagent({ task: "answer briefly" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession), { deps });
 
-    expect(fakeSession.promptedWith).toBe("answer briefly");
+    expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fresh", "answer briefly"));
     expectSubagentResult(result);
     expect(result.content[0]?.text).not.toContain(".subagents.md");
     expect(result.content[0]?.text).not.toContain(".subagents");
@@ -1206,10 +1223,11 @@ describe("subagent runner", () => {
     await mkdir(path.dirname(agentPath), { recursive: true });
     await writeFile(agentPath, "---\ndescription: Literal named subagent\n---\n\nNamed body.\n", "utf8");
     const parentSession = path.join(root, "sessions", "parent.jsonl");
-    const { deps } = fakeDeps(root);
+    const { deps, fakeSession } = fakeDeps(root);
 
     const result = await runSubagent({ agent: "subagent", task: "use the named file" }, undefined, undefined, fakeContext(cwd, parentSession), { deps });
 
+    expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fresh", "use the named file", { agentName: "subagent", agentBody: "Named body." }));
     expectSubagentResult(result, "## Subagent subagent result");
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     expect(manifest[0]).toMatchObject({ type: "started", agent: "subagent", agentFile: agentPath });
@@ -1435,6 +1453,7 @@ describe("subagent runner", () => {
     const expectedActivityLog = expectedActivityLogForParentSession(parentSession);
     expect(manifest).toContainEqual(expect.objectContaining({ type: "started", episodeId: "run-2", parentEpisodeId: "run-1", activityLog: expectedActivityLog }));
     const activityText = await readFile(expectedActivityLog, "utf8");
+    expect(nested.fakeSession.promptedWith).toBe(expectedPromptEnvelope("fresh", "inner", { parentDepth: 1 }));
     expect(activityText).toContain("started subagent — episode run-1 — session:");
     expect(activityText).toContain("started subagent -> subagent — episode run-2 — session:");
     expect(activityText).toContain("completed subagent -> subagent — 0 turns — session:");
@@ -1591,14 +1610,14 @@ describe("subagent runner", () => {
     expect(deps.openSessionManager).toHaveBeenCalledWith(parentSession, `${parentSession}.subagents`);
     expect(forkManager.branchedFrom).toBe("leaf-current");
     expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
-    expect(fakeSession.promptedWith).toBe("continue from here");
+    expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fork", "continue from here"));
     expectSubagentResult(result);
 
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     expect(manifest[0]).toMatchObject({ type: "started", episodeId: "run-1", parentEpisodeId: null, agent: "subagent", agentFile: null, cwd, context: "fork", sessionFile: childSession });
   });
 
-  it("runs named-agent fork prompts as user text without fresh resource overrides or model overrides", async () => {
+  it("runs named-agent fork prompt envelopes without fresh resource overrides or model overrides", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     const agentPath = path.join(cwd, ".pi", "agents", "reviewer.md");
@@ -1612,7 +1631,7 @@ describe("subagent runner", () => {
 
     const result = await runSubagent({ agent: "reviewer", task: "inspect the branch", context: "fork" }, undefined, undefined, fakeContext(cwd, parentSession, { model: { id: "parent-model" } }), { deps });
 
-    expect(fakeSession.promptedWith).toBe("Subagent instructions from `reviewer`:\nReview body.\n\nTask:\ninspect the branch");
+    expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fork", "inspect the branch", { agentName: "reviewer", agentBody: "Review body." }));
     expectSubagentResult(result, "## Subagent reviewer result");
 
     const loaderCalls = (deps.createResourceLoader as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;

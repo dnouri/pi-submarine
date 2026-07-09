@@ -21,7 +21,7 @@ import { QueuedActivityLogWriter, appendActivityLogFinished, appendActivityLogSt
 import { appendManifestRecord, findLatestEpisodeStartedRecordBySessionFile, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
 import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult } from "./render.js";
 import { assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
-import { namedForkPrompt } from "./tool-prompts.js";
+import { buildSubagentPromptEnvelope } from "./tool-prompts.js";
 import { OMITTED_AGENT_LABEL, type AgentSelection, type MarkdownAgent, type SubagentContextMode, type SubagentContextUsage, type SubagentParams, type SubagentResumeParams, type SubagentToolDetails, type TextToolResult } from "./types.js";
 
 type DefaultResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
@@ -159,8 +159,6 @@ export function buildFreshResourceLoaderOptions(profile: SubagentPromptProfile, 
   if (options.settingsManager) loaderOptions.settingsManager = options.settingsManager;
   if (options.extensionFactories && options.extensionFactories.length > 0) loaderOptions.extensionFactories = options.extensionFactories;
   if (profile.agentsMd === "none") loaderOptions.noContextFiles = true;
-  if (profile.agentBody) loaderOptions.appendSystemPromptOverride = (base) => [...base, profile.agentBody ?? ""];
-
   if (profile.skills === "none") {
     loaderOptions.noSkills = true;
   } else if (typeof profile.skills === "object") {
@@ -199,9 +197,10 @@ function createProjectTrustedSettingsManager(cwd: string, agentDir: string): Pro
   return SettingsManager.create(cwd, agentDir, { projectTrusted: true });
 }
 
-export function buildForkPrompt(profile: SubagentPromptProfile, task: string): string {
-  if (profile.selection.kind === "omitted") return task;
-  return namedForkPrompt(profile.agentName, profile.agentBody, task);
+export function buildInitialSubagentPrompt(profile: SubagentPromptProfile, context: SubagentContextMode, task: string, parentDepth: number): string {
+  if (profile.selection.kind === "omitted") return buildSubagentPromptEnvelope({ context, task, parentDepth });
+  if (profile.agentBody === undefined) return buildSubagentPromptEnvelope({ context, task, parentDepth, agentName: profile.agentName });
+  return buildSubagentPromptEnvelope({ context, task, parentDepth, agentName: profile.agentName, agentBody: profile.agentBody });
 }
 
 export async function runSubagent(
@@ -498,7 +497,7 @@ async function prepareFreshRun(
     agentDir,
     settingsManager,
     resourceLoader,
-    userPrompt: params.task,
+    userPrompt: buildInitialSubagentPrompt(profile, "fresh", params.task, parentDepth),
     inheritParentModel: true,
   };
 }
@@ -546,7 +545,7 @@ async function prepareForkRun(
     agentDir,
     settingsManager,
     resourceLoader,
-    userPrompt: buildForkPrompt(profile, params.task),
+    userPrompt: buildInitialSubagentPrompt(profile, "fork", params.task, parentDepth),
     currentLeafId,
     sourceSessionManager,
     inheritParentModel: false,

@@ -128,9 +128,9 @@ child context is clearer than starting over.
 
 For original fresh runs, resume reloads current prompt resources from
 the recorded cwd, including named-agent `agentsMd` and `skills`
-controls. For original fork runs, resume uses fork-style resources and
-sends `message` as plain user text, because any named-agent body is
-already in the child transcript.
+controls. For original fork runs, resume uses fork-style resources.
+All resume calls send `message` as plain user text, because the
+initial `subagent` prompt envelope is already in the child transcript.
 
 ### `subagent_list({ cwd? })`
 
@@ -197,13 +197,16 @@ empty bodies are rejected.
 Discovery is non-recursive and ignores hidden files, nested
 directories, uppercase `.MD`, and `*.chain.md` files.
 
-Fresh default-mode runs do not load markdown agents, suppress
-`AGENTS.md` / `CLAUDE.md` context files, and keep normal skills. Named
-fresh runs append the agent body to the child system prompt;
-`agentsMd` controls context-file loading, and `skills` controls skill
-loading. Fork runs ignore those frontmatter resource controls and
-place any named-agent body in the user prompt instead of the system
-prompt.
+Every initial `subagent` call sends the child a single XML-style user
+prompt envelope with subagent context and the task. Named agents add a
+sanitized `<name-agent>` block containing the markdown body between
+that context and the task. Fresh default-mode runs do not load
+markdown agents, suppress `AGENTS.md` / `CLAUDE.md` context files, and
+keep normal skills. For named fresh runs, `agentsMd` controls
+context-file loading and `skills` controls skill loading; the agent
+body stays in the user prompt envelope rather than the child system
+prompt. Fork runs ignore those frontmatter resource controls but use
+the same user prompt envelope for omitted and named agents.
 
 ## Artifacts and progress
 
@@ -331,6 +334,6 @@ npm run smoke:registration
 ```
 
 The model-facing tool labels, descriptions, schema descriptions,
-guidelines, and fork prompt template live in
-`src/tool-prompts.ts`. Keep that file, `src/index.ts`, and this README
-in sync when the tool contract changes.
+guidelines, and prompt envelope helpers live in `src/tool-prompts.ts`.
+Keep that file, `src/index.ts`, and this README in sync when the tool
+contract changes.
