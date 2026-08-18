@@ -6,16 +6,18 @@ export const TOOL_PROMPTS = {
     parameterDescriptions: {
       agent: "Markdown agent name, i.e. its filename stem. Omit for default mode; project agents from the effective `cwd` override same-named user-defined agents.",
       task: "Prompt for the child. For `fresh` independent work, make sure to include needed context, paths, constraints, and desired output because the child does not see the parent conversation.",
+      model: "Optional model ID or provider/model ID for this call. Overrides the named agent's frontmatter default; omit it to use that default or normal model inheritance.",
       context: "Defaults to `fresh`. Use `fork` only when the child must inherit a copy of the current conversation; `cwd` is invalid with fork.",
       cwd: "Omit to inherit the caller cwd. Set only to run the child from a different workspace/project, with its tools, agents, context files, and skills.",
     },
     promptGuidelines: [
-      "Common calls: subagent({ task: \"...\" }) for independent work, subagent({ agent: \"reviewer\", task: \"...\" }) to use a specialized named agent, or subagent({ context: \"fork\", task: \"...\" }) when the child should inherit a copy of the current conversation.",
+      "Common calls: subagent({ task: \"...\" }) for independent work, subagent({ agent: \"vision\", task: \"Read any screenshots or images and return their contents\", model: \"glm-5v-turbo\" }) to select a model for a named agent, or subagent({ context: \"fork\", task: \"...\" }) when the child should inherit a copy of the current conversation.",
       "Fresh/default children do not see the parent conversation, so make sure you pass sufficient context in the task!",
       "One call runs one foreground child and waits for the final answer; it is not a background job or workflow engine.",
       "Omit `agent` for default mode; pass an agent name instead to use a specific agent. Role text inside `task` does not select an agent.",
       "Usually omit `cwd`. Use it only when another directory should be the child's workspace/project.",
       "Named `agent`s resolve from the effective cwd; project .pi/agents/*.md overrides same-named user agents.",
+      "A call-level `model` overrides a named agent's frontmatter model; omit it to use the agent default or the existing fresh/fork model behavior.",
     ],
   },
   subagentResume: {

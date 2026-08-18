@@ -10,6 +10,7 @@ const namedAgent: MarkdownAgent = {
   source: "project",
   filePath: "/repo/.pi/agents/reviewer.md",
   body: "Review carefully.",
+  model: "zai/glm-5v-turbo",
   agentsMd: "none",
   skills: { names: ["audit"] },
 };
@@ -33,6 +34,7 @@ describe("subagent prompt-resource profiles", () => {
     const options = buildFreshResourceLoaderOptions(profile, { cwd: "/repo", agentDir: "/agent" });
 
     expect(profile.selection).toEqual({ kind: "named", name: "reviewer", agentFile: namedAgent.filePath });
+    expect(profile.model).toBe("zai/glm-5v-turbo");
     expect(options.noContextFiles).toBe(true);
     expect(options.appendSystemPromptOverride).toBeUndefined();
   });

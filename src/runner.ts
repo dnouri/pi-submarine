@@ -1,5 +1,6 @@
 import { mkdir, open, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   DefaultResourceLoader,
   createAgentSession,
@@ -19,6 +20,7 @@ import { MissingMarkdownAgentError, resolveMarkdownAgent } from "./agents.js";
 import { cloneRunView, createActivityState, createInitialRunView, reduceActivityEvent } from "./activity.js";
 import { QueuedActivityLogWriter, appendActivityLogFinished, appendActivityLogStarted, ensureActivityLogHeader, type DegradedActivityLogOptions } from "./activity-log.js";
 import { appendManifestRecord, findLatestEpisodeStartedRecordBySessionFile, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
+import { resolveRecordedSubagentModel, resolveSubagentModel } from "./models.js";
 import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult } from "./render.js";
 import { assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
 import { buildSubagentPromptEnvelope } from "./tool-prompts.js";
@@ -27,7 +29,7 @@ import { OMITTED_AGENT_LABEL, type AgentSelection, type MarkdownAgent, type Suba
 type DefaultResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
 type ProjectTrustedSettingsManager = ReturnType<typeof SettingsManager.create>;
 type ChildAgentSession = Pick<AgentSession, "prompt" | "getLastAssistantText" | "getContextUsage" | "subscribe" | "bindExtensions" | "abort" | "dispose" | "messages">;
-type ChildSessionResult = Pick<CreateAgentSessionResult, "session">;
+type ChildSessionResult = Pick<CreateAgentSessionResult, "session" | "modelFallbackMessage">;
 type ManifestRecords = Awaited<ReturnType<typeof readManifestRecords>>;
 
 export interface SubagentPromptProfile {
@@ -35,6 +37,7 @@ export interface SubagentPromptProfile {
   agentName: string;
   agentFile?: string;
   agentBody?: string;
+  model?: string;
   agentsMd: "none" | "auto";
   skills: MarkdownAgent["skills"];
 }
@@ -70,6 +73,7 @@ interface BaseRunPlan {
   settingsManager: ProjectTrustedSettingsManager;
   resourceLoader: ResourceLoader;
   userPrompt: string;
+  selectedModel: Model<Api> | undefined;
 }
 
 interface FreshRunPlan extends BaseRunPlan {
@@ -86,7 +90,7 @@ interface ForkRunPlan extends BaseRunPlan {
 
 type RunPlan = FreshRunPlan | ForkRunPlan;
 
-type ChildSessionPlan = Pick<BaseRunPlan, "effectiveCwd" | "agentDir" | "settingsManager" | "resourceLoader"> & {
+type ChildSessionPlan = Pick<BaseRunPlan, "effectiveCwd" | "agentDir" | "settingsManager" | "resourceLoader" | "selectedModel"> & {
   inheritParentModel: boolean;
 };
 
@@ -145,6 +149,7 @@ export function namedSubagentProfile(agent: MarkdownAgent): SubagentPromptProfil
     agentName: agent.name,
     agentFile: agent.filePath,
     agentBody: agent.body,
+    ...(agent.model === undefined ? {} : { model: agent.model }),
     agentsMd: agent.agentsMd,
     skills: agent.skills,
   };
@@ -231,7 +236,9 @@ export async function runSubagent(
     throwIfInterrupted(signal);
     emitUpdate(onUpdate, run);
 
-    childSession = await createChildSession(plan, startedRun.childSessionManager, deps, ctx);
+    const created = await createChildSession(plan, startedRun.childSessionManager, deps, ctx);
+    childSession = created.session;
+    throwIfModelFallback(created.modelFallbackMessage);
     await bindChildExtensions(childSession);
     const activeChildSession = childSession;
     const abortState = attachAbortHandler(signal, activeChildSession);
@@ -262,6 +269,7 @@ export async function runSubagent(
     const interrupted = isSubagentInterruptedError(error);
     await activityLogWriter?.drain();
     if (run && childSession) refreshContextUsage(run, childSession);
+    if (startedRun && plan) preservePlannedModel(plan, startedRun.childSessionManager, ctx);
     if (startedRun) await materializeChildSessionFile(startedRun.childSessionManager);
     if (startedRun && plan) {
       if (interrupted) await abortRun(plan.manifestPath, startedRun, deps, onUpdate, activityLogWriter);
@@ -328,7 +336,9 @@ export async function runSubagentResume(
     emitUpdate(onUpdate, run);
     throwIfInterrupted(signal);
 
-    childSession = await createChildSession(plan, plan.childSessionManager, deps, ctx);
+    const created = await createChildSession(plan, plan.childSessionManager, deps, ctx);
+    childSession = created.session;
+    throwIfModelFallback(created.modelFallbackMessage);
     await bindChildExtensions(childSession);
     const activeChildSession = childSession;
     const abortState = attachAbortHandler(signal, activeChildSession);
@@ -431,6 +441,10 @@ async function prepareResumeRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveResumeProfile(startedRecord, effectiveCwd, userAgentsDir);
+  const recordedModel = childSessionManager.buildSessionContext().model;
+  const selectedModel = recordedModel
+    ? resolveRecordedSubagentModel(recordedModel.provider, recordedModel.modelId, ctx.modelRegistry)
+    : undefined;
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
@@ -455,6 +469,7 @@ async function prepareResumeRun(
     settingsManager,
     resourceLoader,
     userPrompt: params.message,
+    selectedModel,
     inheritParentModel: false,
   };
 }
@@ -479,6 +494,7 @@ async function prepareFreshRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, profileResolutionOptions(userAgentsDir, params, ctx));
+  const selectedModel = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, ctx.model?.provider);
   const { root, manifestPath, parentDepth, parentPath } = await resolveArtifactRoot(parentSessionFile);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
@@ -498,6 +514,7 @@ async function prepareFreshRun(
     settingsManager,
     resourceLoader,
     userPrompt: buildInitialSubagentPrompt(profile, "fresh", params.task, parentDepth),
+    selectedModel,
     inheritParentModel: true,
   };
 }
@@ -528,6 +545,7 @@ async function prepareForkRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, { userAgentsDir });
+  const selectedModel = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, ctx.model?.provider);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
@@ -546,6 +564,7 @@ async function prepareForkRun(
     settingsManager,
     resourceLoader,
     userPrompt: buildInitialSubagentPrompt(profile, "fork", params.task, parentDepth),
+    selectedModel,
     currentLeafId,
     sourceSessionManager,
     inheritParentModel: false,
@@ -726,6 +745,9 @@ async function startRunArtifacts(
   const activityLog = plan.root.activityLogPath;
   const activityPath = [...plan.parentPath, plan.profile.agentName];
   const childSessionManager = createChildSessionManager(plan, deps);
+  if (plan.context === "fork" && plan.selectedModel) {
+    childSessionManager.appendModelChange(plan.selectedModel.provider, plan.selectedModel.id);
+  }
   const childSessionFile = childSessionManager.getSessionFile();
   if (!childSessionFile) throw new Error("Could not create a persisted child subagent session.");
   const sessionId = childSessionManager.getSessionId();
@@ -793,17 +815,38 @@ async function createChildSession(
   childSessionManager: SessionManager,
   deps: RunnerDependencies,
   ctx: ExtensionContext,
-): Promise<ChildAgentSession> {
-  const created = await deps.createAgentSession({
+): Promise<ChildSessionResult> {
+  const model = plannedChildModel(plan, ctx);
+  return deps.createAgentSession({
     cwd: plan.effectiveCwd,
     agentDir: plan.agentDir,
     modelRegistry: ctx.modelRegistry,
-    ...(plan.inheritParentModel && ctx.model !== undefined ? { model: ctx.model } : {}),
+    ...(model === undefined ? {} : { model }),
     settingsManager: plan.settingsManager,
     resourceLoader: plan.resourceLoader,
     sessionManager: childSessionManager,
   });
-  return created.session;
+}
+
+function plannedChildModel(plan: ChildSessionPlan, ctx: ExtensionContext): Model<Api> | undefined {
+  return plan.selectedModel ?? (plan.inheritParentModel ? ctx.model : undefined);
+}
+
+function preservePlannedModel(plan: ChildSessionPlan, childSessionManager: SessionManager, ctx: ExtensionContext): void {
+  const model = plannedChildModel(plan, ctx);
+  if (!model) return;
+
+  try {
+    const recordedModel = childSessionManager.buildSessionContext().model;
+    if (recordedModel) return;
+    childSessionManager.appendModelChange(model.provider, model.id);
+  } catch (error: unknown) {
+    console.error("subagent child model persistence failed", error);
+  }
+}
+
+function throwIfModelFallback(modelFallbackMessage: string | undefined): void {
+  if (modelFallbackMessage) throw new Error(modelFallbackMessage);
 }
 
 async function bindChildExtensions(childSession: ChildAgentSession): Promise<void> {

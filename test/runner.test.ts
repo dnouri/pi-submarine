@@ -27,13 +27,29 @@ class FakeSessionManager {
   getLeafId() { return this.leafId; }
 }
 
-function fakeContext(cwd: string, sessionFile?: string, options: { leafId?: string | null; model?: unknown } = {}): ExtensionContext {
+function fakeContext(
+  cwd: string,
+  sessionFile?: string,
+  options: { leafId?: string | null; model?: unknown; modelRegistry?: unknown } = {},
+): ExtensionContext {
   return {
     cwd,
     sessionManager: new FakeSessionManager(sessionFile, cwd, options.leafId),
-    modelRegistry: {},
+    modelRegistry: options.modelRegistry ?? {},
     model: options.model,
   } as unknown as ExtensionContext;
+}
+
+function fakeModel(provider: string, id: string) {
+  return { provider, id, name: id };
+}
+
+function fakeModelRegistry(models: unknown[], authenticated: unknown[] = models) {
+  const authenticatedModels = new Set(authenticated);
+  return {
+    getAll: () => models,
+    hasConfiguredAuth: (candidate: unknown) => authenticatedModels.has(candidate),
+  };
 }
 
 function expectSubagentResult(
@@ -167,6 +183,7 @@ function event(value: Record<string, unknown>): AgentSessionEvent {
 
 class FakeForkSessionManager {
   public branchedFrom: string | undefined;
+  public modelChanges: Array<{ provider: string; modelId: string }> = [];
 
   constructor(
     private readonly cwd: string,
@@ -177,9 +194,13 @@ class FakeForkSessionManager {
 
   getSessionFile() { return this.sessionFile; }
   getCwd() { return this.cwd; }
-  getSessionId() { return `session:${path.basename(this.sessionFile)}`; }
+  getSessionId() { return "fork-session-id"; }
   getLeafId() { return this.branchedFrom ?? "fork-leaf"; }
   getBranch() { return []; }
+  appendModelChange(provider: string, modelId: string) {
+    this.modelChanges.push({ provider, modelId });
+    return "model-change";
+  }
 
   createBranchedSession(leafId: string) {
     this.branchedFrom = leafId;
@@ -789,7 +810,7 @@ describe("subagent runner", () => {
     const cwd = path.join(root, "project");
     const agentPath = path.join(cwd, ".pi", "agents", "reviewer.md");
     await mkdir(path.dirname(agentPath), { recursive: true });
-    await writeFile(agentPath, "---\ndescription: Reviews\nagentsMd: auto\nskills: none\n---\n\nFresh reviewer body.\n", "utf8");
+    await writeFile(agentPath, "---\ndescription: Reviews\nmodel: zai/new-reviewer-model\nagentsMd: auto\nskills: none\n---\n\nFresh reviewer body.\n", "utf8");
     const parentSession = path.join(root, "sessions", "parent.jsonl");
     const childSession = path.join(`${parentSession}.subagents`, "child.jsonl");
     const oldAgentPath = path.join(root, "old-agents", "reviewer.md");
@@ -806,6 +827,8 @@ describe("subagent runner", () => {
     expect(loaderOptions).toMatchObject({ cwd, agentDir: path.join(root, "agent"), noSkills: true });
     expect(loaderOptions?.noContextFiles).toBeUndefined();
     expect(loaderOptions?.appendSystemPromptOverride).toBeUndefined();
+    const sessionCalls = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    expect(sessionCalls[0]?.[0]).not.toHaveProperty("model");
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     expect(manifest).toContainEqual(expect.objectContaining({ type: "resume_started", episodeId: "run-1", sessionId: "named-fresh-session", agentFile: agentPath }));
     expect(manifest).not.toContainEqual(expect.objectContaining({ type: "resume_started", agentFile: oldAgentPath }));
@@ -1015,8 +1038,9 @@ describe("subagent runner", () => {
     const { deps, fakeSession } = fakeDeps(root);
     const updates: unknown[] = [];
     const createSettingsManager = vi.spyOn(SettingsManager, "create");
+    const parentModel = fakeModel("zai", "glm-5");
 
-    const result = await runSubagent({ task: "answer briefly" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession), { deps });
+    const result = await runSubagent({ task: "answer briefly" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession, { model: parentModel }), { deps });
 
     expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fresh", "answer briefly"));
     expectSubagentResult(result);
@@ -1039,6 +1063,92 @@ describe("subagent runner", () => {
     expect(createSettingsManager).toHaveBeenCalledWith(cwd, path.join(root, "agent"), { projectTrusted: true });
     expectProjectTrustedSettingsManager(loaderOptions?.settingsManager);
     expect(sessionOptions?.settingsManager).toBe(loaderOptions?.settingsManager);
+    expect(sessionOptions?.model).toBe(parentModel);
+  });
+
+  it("uses a named agent's default model for a fresh child", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    const agentPath = path.join(cwd, ".pi", "agents", "vision.md");
+    await mkdir(path.dirname(agentPath), { recursive: true });
+    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: zai/glm-5v-turbo\n---\n\nRead the image.\n", "utf8");
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const visionModel = fakeModel("zai", "glm-5v-turbo");
+    const { deps } = fakeDeps(root);
+
+    await runSubagent(
+      { agent: "vision", task: "read screenshot.png" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([visionModel]) }),
+      { deps },
+    );
+
+    const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
+    expect(sessionOptions?.model).toBe(visionModel);
+  });
+
+  it("lets a call-level model override a named agent default", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    const agentPath = path.join(cwd, ".pi", "agents", "vision.md");
+    await mkdir(path.dirname(agentPath), { recursive: true });
+    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: unavailable/default\n---\n\nRead the image.\n", "utf8");
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const overrideModel = fakeModel("zai", "glm-5v-turbo");
+    const { deps } = fakeDeps(root);
+
+    await runSubagent(
+      { agent: "vision", task: "read screenshot.png", model: "zai/glm-5v-turbo" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([overrideModel]) }),
+      { deps },
+    );
+
+    const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
+    expect(sessionOptions?.model).toBe(overrideModel);
+  });
+
+  it("supports a call-level model in omitted-agent mode", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const visionModel = fakeModel("zai", "glm-5v-turbo");
+    const { deps } = fakeDeps(root);
+
+    await runSubagent(
+      { task: "read screenshot.png", model: "glm-5v-turbo" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([visionModel]) }),
+      { deps },
+    );
+
+    const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
+    expect(sessionOptions?.model).toBe(visionModel);
+  });
+
+  it("rejects an unknown explicit model before creating child artifacts", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const { deps } = fakeDeps(root);
+
+    const message = await rejectedMessage(runSubagent(
+      { task: "read screenshot.png", model: "missing-model" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([]) }),
+      { deps },
+    ));
+
+    expect(message).toContain("Subagent model 'missing-model' not found");
+    expectNoRecoveryHandle(message);
+    expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+    await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
   });
 
   it("streams child activity as portable partial updates and append-only activity-log entries", async () => {
@@ -1332,6 +1442,98 @@ describe("subagent runner", () => {
     expect(result.details.run).toMatchObject({ episodeId: "resume-1", sessionId, status: "completed" });
   });
 
+  it("preserves the inherited model across an early fresh failure and resume", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const inheritedModel = fakeModel("zai", "glm-5v-turbo");
+    const failed = fakeDeps(root);
+    failed.deps.createAgentSession = vi.fn(async () => { throw new Error("sdk failed before recording model"); });
+
+    const message = await rejectedMessage(runSubagent(
+      { task: "fail early" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { model: inheritedModel }),
+      { deps: failed.deps },
+    ));
+
+    const manifestAfterFailure = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
+    const started = manifestAfterFailure[0]?.type === "started" ? manifestAfterFailure[0] : undefined;
+    expect(started).toBeDefined();
+    expectRecoverableFailure(message, started!.sessionId, "sdk failed before recording model");
+    const childEntries = (await readFile(started!.sessionFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(childEntries).toContainEqual(expect.objectContaining({
+      type: "model_change",
+      provider: "zai",
+      modelId: "glm-5v-turbo",
+    }));
+
+    const resumed = fakeDeps(root);
+    resumed.deps.createEpisodeId = vi.fn(() => "resume-1");
+    resumed.deps.createAgentSession = vi.fn(async (options: { sessionManager: SessionManager }) => ({
+      session: new FakeChildSession({
+        promptImpl: async (text) => {
+          options.sessionManager.appendMessage({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() } as Parameters<SessionManager["appendMessage"]>[0]);
+          options.sessionManager.appendMessage({ role: "assistant", content: [{ type: "text", text: "child answer" }], stopReason: "stop", timestamp: Date.now() } as Parameters<SessionManager["appendMessage"]>[0]);
+        },
+      }) as unknown as AgentSession,
+    }));
+    const result = await runSubagentResume(
+      { sessionId: started!.sessionId, message: "continue" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([inheritedModel]) }),
+      { deps: resumed.deps },
+    );
+
+    expectSubagentResult(result);
+    const sessionOptions = (resumed.deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
+    expect(sessionOptions?.model).toBe(inheritedModel);
+  });
+
+  it("does not overwrite a child's model change during failure cleanup", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const inheritedModel = fakeModel("zai", "glm-5v-turbo");
+    const { deps } = fakeDeps(root);
+    deps.createAgentSession = vi.fn(async (options: { sessionManager: SessionManager }) => {
+      options.sessionManager.appendModelChange("openai", "gpt-5");
+      return {
+        session: new FakeChildSession({
+          promptImpl: async () => { throw new Error("failed after model switch"); },
+        }) as unknown as AgentSession,
+      };
+    });
+
+    const message = await rejectedMessage(runSubagent(
+      { task: "switch then fail" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { model: inheritedModel }),
+      { deps },
+    ));
+
+    const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
+    const started = manifest[0]?.type === "started" ? manifest[0] : undefined;
+    expect(started).toBeDefined();
+    expectRecoverableFailure(message, started!.sessionId, "failed after model switch");
+    const modelChanges = (await readFile(started!.sessionFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((entry) => entry.type === "model_change");
+    expect(modelChanges).toEqual([
+      expect.objectContaining({ provider: "openai", modelId: "gpt-5" }),
+    ]);
+  });
+
   it("records a failed run when child session creation fails after artifacts start", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
@@ -1615,6 +1817,60 @@ describe("subagent runner", () => {
 
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     expect(manifest[0]).toMatchObject({ type: "started", episodeId: "run-1", parentEpisodeId: null, agent: "subagent", agentFile: null, cwd, context: "fork", sessionFile: childSession });
+  });
+
+  it("persists an explicit fork model for later resume", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const forkManager = new FakeForkSessionManager(cwd, parentSession);
+    const visionModel = fakeModel("zai", "glm-5v-turbo");
+    const { deps } = fakeDeps(root);
+    deps.openSessionManager = vi.fn(() => forkManager as unknown as SessionManager);
+
+    await runSubagent(
+      { task: "inspect the branch", context: "fork", model: "zai/glm-5v-turbo" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, {
+        leafId: "leaf-current",
+        modelRegistry: fakeModelRegistry([visionModel]),
+      }),
+      { deps },
+    );
+
+    const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
+    expect(sessionOptions?.model).toBe(visionModel);
+    expect(forkManager.modelChanges).toEqual([{ provider: "zai", modelId: "glm-5v-turbo" }]);
+  });
+
+  it("rejects an SDK model fallback before prompting the child", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const forkManager = new FakeForkSessionManager(cwd, parentSession);
+    const { deps, fakeSession } = fakeDeps(root);
+    deps.openSessionManager = vi.fn(() => forkManager as unknown as SessionManager);
+    deps.createAgentSession = vi.fn(async () => ({
+      session: fakeSession as unknown as AgentSession,
+      modelFallbackMessage: "Could not restore model zai/glm-5v-turbo. Using openai/gpt-5",
+    }));
+
+    const message = await rejectedMessage(runSubagent(
+      { task: "inspect the branch", context: "fork" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { leafId: "leaf-current" }),
+      { deps },
+    ));
+
+    const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
+    const sessionId = manifest[0]?.type === "started" ? manifest[0].sessionId : "";
+    expectRecoverableFailure(message, sessionId, "Could not restore model zai/glm-5v-turbo. Using openai/gpt-5");
+    expect(fakeSession.promptCount).toBe(0);
+    expect(fakeSession.disposeCount).toBe(1);
   });
 
   it("runs named-agent fork prompt envelopes without fresh resource overrides or model overrides", async () => {
