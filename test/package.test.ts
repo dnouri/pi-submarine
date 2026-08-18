@@ -22,7 +22,7 @@ describe("package metadata", () => {
     });
     expect(packageJson.homepage).toBe("https://github.com/dnouri/pi-submarine#readme");
     expect(packageJson.bugs).toEqual({ url: "https://github.com/dnouri/pi-submarine/issues" });
-    expect(packageJson.pi.video).toBe(`${galleryBaseUrl}.mp4`);
+    expect(packageJson.pi.video).toBeUndefined();
     expect(packageJson.pi.image).toBe(`${galleryBaseUrl}.jpg`);
   });
 
