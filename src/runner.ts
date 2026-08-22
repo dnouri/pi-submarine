@@ -28,7 +28,7 @@ import { OMITTED_AGENT_LABEL, type AgentSelection, type MarkdownAgent, type Suba
 
 type DefaultResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
 type ProjectTrustedSettingsManager = ReturnType<typeof SettingsManager.create>;
-type ChildAgentSession = Pick<AgentSession, "prompt" | "getLastAssistantText" | "getContextUsage" | "subscribe" | "bindExtensions" | "abort" | "dispose" | "messages">;
+type ChildAgentSession = Pick<AgentSession, "prompt" | "getLastAssistantText" | "getContextUsage" | "subscribe" | "bindExtensions" | "hasExtensionHandlers" | "extensionRunner" | "abort" | "dispose" | "messages">;
 type ChildSessionResult = Pick<CreateAgentSessionResult, "session" | "modelFallbackMessage">;
 type ManifestRecords = Awaited<ReturnType<typeof readManifestRecords>>;
 
@@ -221,6 +221,7 @@ export async function runSubagent(
   let run: SubagentToolDetails["run"] | undefined;
   let startedRun: StartedRun | undefined;
   let childSession: ChildAgentSession | undefined;
+  let childExtensionsBound = false;
   let unsubscribe: (() => void) | undefined;
   let detachAbortHandler: (() => void) | undefined;
   let reservedChildSessionFile: string | undefined;
@@ -239,6 +240,7 @@ export async function runSubagent(
     const created = await createChildSession(plan, startedRun.childSessionManager, deps, ctx);
     childSession = created.session;
     throwIfModelFallback(created.modelFallbackMessage);
+    childExtensionsBound = true;
     await bindChildExtensions(childSession);
     const activeChildSession = childSession;
     const abortState = attachAbortHandler(signal, activeChildSession);
@@ -284,7 +286,7 @@ export async function runSubagent(
     releaseActiveChildSession(reservedChildSessionFile);
     runCleanup("remove subagent abort listener", detachAbortHandler);
     runCleanup("unsubscribe subagent activity listener", unsubscribe);
-    runCleanup("dispose subagent child session", () => childSession?.dispose());
+    await disposeChildSession(childSession, childExtensionsBound, "subagent");
   }
 }
 
@@ -299,6 +301,7 @@ export async function runSubagentResume(
   let plan: ResumeRunPlan | undefined;
   let run: SubagentToolDetails["run"] | undefined;
   let childSession: ChildAgentSession | undefined;
+  let childExtensionsBound = false;
   let unsubscribe: (() => void) | undefined;
   let detachAbortHandler: (() => void) | undefined;
   let reservedChildSessionFile: string | undefined;
@@ -339,6 +342,7 @@ export async function runSubagentResume(
     const created = await createChildSession(plan, plan.childSessionManager, deps, ctx);
     childSession = created.session;
     throwIfModelFallback(created.modelFallbackMessage);
+    childExtensionsBound = true;
     await bindChildExtensions(childSession);
     const activeChildSession = childSession;
     const abortState = attachAbortHandler(signal, activeChildSession);
@@ -381,7 +385,7 @@ export async function runSubagentResume(
     releaseActiveChildSession(reservedChildSessionFile);
     runCleanup("remove subagent resume abort listener", detachAbortHandler);
     runCleanup("unsubscribe subagent resume activity listener", unsubscribe);
-    runCleanup("dispose resumed subagent child session", () => childSession?.dispose());
+    await disposeChildSession(childSession, childExtensionsBound, "resumed subagent");
   }
 }
 
@@ -851,6 +855,26 @@ function throwIfModelFallback(modelFallbackMessage: string | undefined): void {
 
 async function bindChildExtensions(childSession: ChildAgentSession): Promise<void> {
   await childSession.bindExtensions({ onError: (error: unknown) => console.error("subagent extension error", error) });
+}
+
+async function disposeChildSession(
+  childSession: ChildAgentSession | undefined,
+  extensionsBound: boolean,
+  label: string,
+): Promise<void> {
+  if (!childSession) return;
+
+  if (extensionsBound) {
+    try {
+      if (childSession.hasExtensionHandlers("session_shutdown")) {
+        await childSession.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      }
+    } catch (error: unknown) {
+      console.error(`Could not shut down ${label} child extensions`, error);
+    }
+  }
+
+  runCleanup(`dispose ${label} child session`, () => childSession.dispose());
 }
 
 function refreshContextUsage(run: SubagentToolDetails["run"], childSession: ChildAgentSession): void {

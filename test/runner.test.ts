@@ -216,6 +216,7 @@ interface FakeChildSessionOptions {
   messages?: unknown[];
   promptImpl?: (text: string) => Promise<void>;
   bindImpl?: () => Promise<void>;
+  shutdownImpl?: () => Promise<void>;
   abortImpl?: () => Promise<void>;
   unsubscribeImpl?: () => void;
   disposeImpl?: () => void;
@@ -260,12 +261,15 @@ class FakeChildSession {
   public promptCount = 0;
   public abortCount = 0;
   public disposeCount = 0;
+  public shutdownCount = 0;
+  public shutdownEvents: unknown[] = [];
   public unsubscribeCount = 0;
   public contextUsageCallCount = 0;
   public messages: unknown[] = [];
   private readonly lastAssistantText: string | undefined;
   private readonly promptImpl: (text: string) => Promise<void>;
   private readonly bindImpl: () => Promise<void>;
+  private readonly shutdownImpl: () => Promise<void>;
   private readonly abortImpl: () => Promise<void>;
   private readonly unsubscribeImpl: () => void;
   private readonly disposeImpl: () => void;
@@ -280,6 +284,7 @@ class FakeChildSession {
     this.messagesAfterPrompt = options.messages ?? [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: this.lastAssistantText }] }];
     this.promptImpl = options.promptImpl ?? (async () => undefined);
     this.bindImpl = options.bindImpl ?? (async () => undefined);
+    this.shutdownImpl = options.shutdownImpl ?? (async () => undefined);
     this.abortImpl = options.abortImpl ?? (async () => undefined);
     this.unsubscribeImpl = options.unsubscribeImpl ?? (() => undefined);
     this.disposeImpl = options.disposeImpl ?? (() => undefined);
@@ -322,6 +327,20 @@ class FakeChildSession {
     await this.bindImpl();
   }
 
+  hasExtensionHandlers(eventType: string) {
+    return eventType === "session_shutdown";
+  }
+
+  get extensionRunner() {
+    return {
+      emit: async (event: unknown) => {
+        this.shutdownCount += 1;
+        this.shutdownEvents.push(event);
+        await this.shutdownImpl();
+      },
+    };
+  }
+
   async abort() {
     this.abortCount += 1;
     this.aborted = true;
@@ -359,6 +378,7 @@ describe("subagent runner", () => {
     expect(deps.openSessionManager).toHaveBeenCalledWith(childSession, `${parentSession}.subagents`);
     expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
     expect(fakeSession.promptedWith).toBe("continue from there");
+    expect(fakeSession.shutdownEvents).toEqual([{ type: "session_shutdown", reason: "quit" }]);
     expectSubagentResult(result);
     expect(result.details.run).toMatchObject({ episodeId: "resume-1", sessionId: "child-session-1", agent: "subagent", status: "completed" });
     const activityText = await readFile(`${parentSession}.subagents.md`, "utf8");
@@ -1560,6 +1580,25 @@ describe("subagent runner", () => {
     expect(activityText).toContain("failed subagent — 0 turns — error: sdk session failed — session:");
   });
 
+  it("shuts down bound child extensions before disposing the session", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const lifecycle: string[] = [];
+    const { deps, fakeSession } = fakeDeps(root, {
+      bindImpl: async () => { lifecycle.push("bind"); },
+      shutdownImpl: async () => { lifecycle.push("shutdown"); },
+      disposeImpl: () => { lifecycle.push("dispose"); },
+    });
+
+    const result = await runSubagent({ task: "lifecycle" }, undefined, undefined, fakeContext(cwd, parentSession), { deps });
+
+    expectSubagentResult(result);
+    expect(lifecycle).toEqual(["bind", "shutdown", "dispose"]);
+    expect(fakeSession.shutdownEvents).toEqual([{ type: "session_shutdown", reason: "quit" }]);
+  });
+
   it("disposes a child session when extension binding fails", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
@@ -1586,6 +1625,7 @@ describe("subagent runner", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const { deps, fakeSession } = fakeDeps(root, {
       promptImpl: async () => { throw new Error("primary failure"); },
+      shutdownImpl: async () => { throw new Error("shutdown failed"); },
       unsubscribeImpl: () => { throw new Error("unsubscribe failed"); },
       disposeImpl: () => { throw new Error("dispose failed"); },
     });
@@ -1593,8 +1633,10 @@ describe("subagent runner", () => {
     await expect(runSubagent({ task: "cleanup failure" }, undefined, undefined, fakeContext(cwd, parentSession), { deps })).rejects.toThrow("primary failure");
 
     expect(fakeSession.unsubscribeCount).toBe(1);
+    expect(fakeSession.shutdownCount).toBe(1);
     expect(fakeSession.disposeCount).toBe(1);
     expect(consoleError).toHaveBeenCalledWith(expect.stringContaining("unsubscribe subagent activity listener"), expect.any(Error));
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining("shut down subagent child extensions"), expect.any(Error));
     expect(consoleError).toHaveBeenCalledWith(expect.stringContaining("dispose subagent child session"), expect.any(Error));
     consoleError.mockRestore();
   });
