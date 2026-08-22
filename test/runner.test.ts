@@ -1468,6 +1468,12 @@ describe("subagent runner", () => {
     await mkdir(cwd, { recursive: true });
     const parentSession = path.join(root, "sessions", "parent.jsonl");
     const inheritedModel = fakeModel("zai", "glm-5v-turbo");
+    const laterParentModel = fakeModel("openai", "gpt-5");
+    const readParentModel = vi.fn()
+      .mockReturnValueOnce(inheritedModel)
+      .mockReturnValue(laterParentModel);
+    const context = fakeContext(cwd, parentSession);
+    Object.defineProperty(context, "model", { get: readParentModel });
     const failed = fakeDeps(root);
     failed.deps.createAgentSession = vi.fn(async () => { throw new Error("sdk failed before recording model"); });
 
@@ -1475,9 +1481,11 @@ describe("subagent runner", () => {
       { task: "fail early" },
       undefined,
       undefined,
-      fakeContext(cwd, parentSession, { model: inheritedModel }),
+      context,
       { deps: failed.deps },
     ));
+
+    expect(readParentModel).toHaveBeenCalledTimes(1);
 
     const manifestAfterFailure = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     const started = manifestAfterFailure[0]?.type === "started" ? manifestAfterFailure[0] : undefined;
@@ -1597,6 +1605,35 @@ describe("subagent runner", () => {
     expectSubagentResult(result);
     expect(lifecycle).toEqual(["bind", "shutdown", "dispose"]);
     expect(fakeSession.shutdownEvents).toEqual([{ type: "session_shutdown", reason: "quit" }]);
+  });
+
+  it("keeps the child session reserved until extension shutdown finishes", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const resumed = fakeDeps(root);
+    let resumeAttempt: Promise<unknown> | undefined;
+    let sessionId = "";
+    const { deps } = fakeDeps(root, {
+      shutdownImpl: async () => {
+        const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
+        sessionId = manifest[0]?.type === "started" ? manifest[0].sessionId : "";
+        resumeAttempt = runSubagentResume(
+          { sessionId, message: "resume during shutdown" },
+          undefined,
+          undefined,
+          fakeContext(cwd, parentSession),
+          { deps: resumed.deps },
+        );
+        await resumeAttempt.catch(() => undefined);
+      },
+    });
+
+    await runSubagent({ task: "finish before shutdown" }, undefined, undefined, fakeContext(cwd, parentSession), { deps });
+
+    expect(resumeAttempt).toBeDefined();
+    await expect(resumeAttempt).rejects.toThrow(`Subagent session '${sessionId}' is already active`);
   });
 
   it("disposes a child session when extension binding fails", async () => {

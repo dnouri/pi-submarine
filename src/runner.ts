@@ -73,26 +73,22 @@ interface BaseRunPlan {
   settingsManager: ProjectTrustedSettingsManager;
   resourceLoader: ResourceLoader;
   userPrompt: string;
-  selectedModel: Model<Api> | undefined;
+  model: Model<Api> | undefined;
 }
 
 interface FreshRunPlan extends BaseRunPlan {
   context: "fresh";
-  inheritParentModel: true;
 }
 
 interface ForkRunPlan extends BaseRunPlan {
   context: "fork";
   currentLeafId: string;
   sourceSessionManager: SessionManager;
-  inheritParentModel: false;
 }
 
 type RunPlan = FreshRunPlan | ForkRunPlan;
 
-type ChildSessionPlan = Pick<BaseRunPlan, "effectiveCwd" | "agentDir" | "settingsManager" | "resourceLoader" | "selectedModel"> & {
-  inheritParentModel: boolean;
-};
+type ChildSessionPlan = Pick<BaseRunPlan, "effectiveCwd" | "agentDir" | "settingsManager" | "resourceLoader" | "model">;
 
 interface ResumeRunPlan extends ChildSessionPlan {
   profile: SubagentPromptProfile;
@@ -221,7 +217,7 @@ export async function runSubagent(
   let run: SubagentToolDetails["run"] | undefined;
   let startedRun: StartedRun | undefined;
   let childSession: ChildAgentSession | undefined;
-  let childExtensionsBound = false;
+  let childExtensionsStarted = false;
   let unsubscribe: (() => void) | undefined;
   let detachAbortHandler: (() => void) | undefined;
   let reservedChildSessionFile: string | undefined;
@@ -240,7 +236,7 @@ export async function runSubagent(
     const created = await createChildSession(plan, startedRun.childSessionManager, deps, ctx);
     childSession = created.session;
     throwIfModelFallback(created.modelFallbackMessage);
-    childExtensionsBound = true;
+    childExtensionsStarted = true;
     await bindChildExtensions(childSession);
     const activeChildSession = childSession;
     const abortState = attachAbortHandler(signal, activeChildSession);
@@ -271,7 +267,7 @@ export async function runSubagent(
     const interrupted = isSubagentInterruptedError(error);
     await activityLogWriter?.drain();
     if (run && childSession) refreshContextUsage(run, childSession);
-    if (startedRun && plan) preservePlannedModel(plan, startedRun.childSessionManager, ctx);
+    if (startedRun && plan) preservePlannedModel(plan, startedRun.childSessionManager);
     if (startedRun) await materializeChildSessionFile(startedRun.childSessionManager);
     if (startedRun && plan) {
       if (interrupted) await abortRun(plan.manifestPath, startedRun, deps, onUpdate, activityLogWriter);
@@ -283,10 +279,10 @@ export async function runSubagent(
     if (run) throw new Error(renderSubagentRecoverableError(selection, run.sessionId, message));
     throw new Error(`${errorHeading(selection)}\n\n${message}`);
   } finally {
-    releaseActiveChildSession(reservedChildSessionFile);
     runCleanup("remove subagent abort listener", detachAbortHandler);
     runCleanup("unsubscribe subagent activity listener", unsubscribe);
-    await disposeChildSession(childSession, childExtensionsBound, "subagent");
+    await closeChildSession(childSession, childExtensionsStarted, "subagent");
+    releaseActiveChildSession(reservedChildSessionFile);
   }
 }
 
@@ -301,7 +297,7 @@ export async function runSubagentResume(
   let plan: ResumeRunPlan | undefined;
   let run: SubagentToolDetails["run"] | undefined;
   let childSession: ChildAgentSession | undefined;
-  let childExtensionsBound = false;
+  let childExtensionsStarted = false;
   let unsubscribe: (() => void) | undefined;
   let detachAbortHandler: (() => void) | undefined;
   let reservedChildSessionFile: string | undefined;
@@ -342,7 +338,7 @@ export async function runSubagentResume(
     const created = await createChildSession(plan, plan.childSessionManager, deps, ctx);
     childSession = created.session;
     throwIfModelFallback(created.modelFallbackMessage);
-    childExtensionsBound = true;
+    childExtensionsStarted = true;
     await bindChildExtensions(childSession);
     const activeChildSession = childSession;
     const abortState = attachAbortHandler(signal, activeChildSession);
@@ -382,10 +378,10 @@ export async function runSubagentResume(
     throw new Error(`${heading}\n\n${message}`);
   } finally {
     if (run) forgetRuntimeEpisode(run.episodeId);
-    releaseActiveChildSession(reservedChildSessionFile);
     runCleanup("remove subagent resume abort listener", detachAbortHandler);
     runCleanup("unsubscribe subagent resume activity listener", unsubscribe);
-    await disposeChildSession(childSession, childExtensionsBound, "resumed subagent");
+    await closeChildSession(childSession, childExtensionsStarted, "resumed subagent");
+    releaseActiveChildSession(reservedChildSessionFile);
   }
 }
 
@@ -446,7 +442,7 @@ async function prepareResumeRun(
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveResumeProfile(startedRecord, effectiveCwd, userAgentsDir);
   const recordedModel = childSessionManager.buildSessionContext().model;
-  const selectedModel = recordedModel
+  const model = recordedModel
     ? resolveRecordedSubagentModel(recordedModel.provider, recordedModel.modelId, ctx.modelRegistry)
     : undefined;
   const loaderContext = extensionFactories === undefined
@@ -473,8 +469,7 @@ async function prepareResumeRun(
     settingsManager,
     resourceLoader,
     userPrompt: params.message,
-    selectedModel,
-    inheritParentModel: false,
+    model,
   };
 }
 
@@ -498,7 +493,8 @@ async function prepareFreshRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, profileResolutionOptions(userAgentsDir, params, ctx));
-  const selectedModel = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, ctx.model?.provider);
+  const parentModel = ctx.model;
+  const model = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, parentModel?.provider) ?? parentModel;
   const { root, manifestPath, parentDepth, parentPath } = await resolveArtifactRoot(parentSessionFile);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
@@ -518,8 +514,7 @@ async function prepareFreshRun(
     settingsManager,
     resourceLoader,
     userPrompt: buildInitialSubagentPrompt(profile, "fresh", params.task, parentDepth),
-    selectedModel,
-    inheritParentModel: true,
+    model,
   };
 }
 
@@ -549,7 +544,8 @@ async function prepareForkRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, { userAgentsDir });
-  const selectedModel = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, ctx.model?.provider);
+  const parentModel = ctx.model;
+  const model = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, parentModel?.provider);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
@@ -568,10 +564,9 @@ async function prepareForkRun(
     settingsManager,
     resourceLoader,
     userPrompt: buildInitialSubagentPrompt(profile, "fork", params.task, parentDepth),
-    selectedModel,
+    model,
     currentLeafId,
     sourceSessionManager,
-    inheritParentModel: false,
   };
 }
 
@@ -749,8 +744,8 @@ async function startRunArtifacts(
   const activityLog = plan.root.activityLogPath;
   const activityPath = [...plan.parentPath, plan.profile.agentName];
   const childSessionManager = createChildSessionManager(plan, deps);
-  if (plan.context === "fork" && plan.selectedModel) {
-    childSessionManager.appendModelChange(plan.selectedModel.provider, plan.selectedModel.id);
+  if (plan.context === "fork" && plan.model) {
+    childSessionManager.appendModelChange(plan.model.provider, plan.model.id);
   }
   const childSessionFile = childSessionManager.getSessionFile();
   if (!childSessionFile) throw new Error("Could not create a persisted child subagent session.");
@@ -820,30 +815,24 @@ async function createChildSession(
   deps: RunnerDependencies,
   ctx: ExtensionContext,
 ): Promise<ChildSessionResult> {
-  const model = plannedChildModel(plan, ctx);
   return deps.createAgentSession({
     cwd: plan.effectiveCwd,
     agentDir: plan.agentDir,
     modelRegistry: ctx.modelRegistry,
-    ...(model === undefined ? {} : { model }),
+    ...(plan.model === undefined ? {} : { model: plan.model }),
     settingsManager: plan.settingsManager,
     resourceLoader: plan.resourceLoader,
     sessionManager: childSessionManager,
   });
 }
 
-function plannedChildModel(plan: ChildSessionPlan, ctx: ExtensionContext): Model<Api> | undefined {
-  return plan.selectedModel ?? (plan.inheritParentModel ? ctx.model : undefined);
-}
-
-function preservePlannedModel(plan: ChildSessionPlan, childSessionManager: SessionManager, ctx: ExtensionContext): void {
-  const model = plannedChildModel(plan, ctx);
-  if (!model) return;
+function preservePlannedModel(plan: ChildSessionPlan, childSessionManager: SessionManager): void {
+  if (!plan.model) return;
 
   try {
     const recordedModel = childSessionManager.buildSessionContext().model;
     if (recordedModel) return;
-    childSessionManager.appendModelChange(model.provider, model.id);
+    childSessionManager.appendModelChange(plan.model.provider, plan.model.id);
   } catch (error: unknown) {
     console.error("subagent child model persistence failed", error);
   }
@@ -857,14 +846,14 @@ async function bindChildExtensions(childSession: ChildAgentSession): Promise<voi
   await childSession.bindExtensions({ onError: (error: unknown) => console.error("subagent extension error", error) });
 }
 
-async function disposeChildSession(
+async function closeChildSession(
   childSession: ChildAgentSession | undefined,
-  extensionsBound: boolean,
+  extensionsStarted: boolean,
   label: string,
 ): Promise<void> {
   if (!childSession) return;
 
-  if (extensionsBound) {
+  if (extensionsStarted) {
     try {
       if (childSession.hasExtensionHandlers("session_shutdown")) {
         await childSession.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
