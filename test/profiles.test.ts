@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildForkPrompt, buildForkResourceLoaderOptions, buildFreshResourceLoaderOptions, omittedSubagentProfile, namedSubagentProfile } from "../src/runner.js";
+import { buildForkResourceLoaderOptions, buildFreshResourceLoaderOptions, buildInitialSubagentPrompt, omittedSubagentProfile, namedSubagentProfile } from "../src/runner.js";
+import { subagentAgentTagName } from "../src/tool-prompts.js";
 import type { MarkdownAgent } from "../src/types.js";
 import type { Skill } from "@earendil-works/pi-coding-agent";
 
@@ -27,13 +28,13 @@ describe("subagent prompt-resource profiles", () => {
     expect(options.appendSystemPromptOverride).toBeUndefined();
   });
 
-  it("appends named agent bodies without discarding normal append-prompt resources", () => {
+  it("keeps named-agent fresh mode resource controls out of the system prompt", () => {
     const profile = namedSubagentProfile(namedAgent);
     const options = buildFreshResourceLoaderOptions(profile, { cwd: "/repo", agentDir: "/agent" });
 
     expect(profile.selection).toEqual({ kind: "named", name: "reviewer", agentFile: namedAgent.filePath });
     expect(options.noContextFiles).toBe(true);
-    expect(options.appendSystemPromptOverride?.(["base append"])).toEqual(["base append", "Review carefully."]);
+    expect(options.appendSystemPromptOverride).toBeUndefined();
   });
 
   it("leaves normal context-file discovery enabled for agentsMd auto", () => {
@@ -69,15 +70,56 @@ describe("subagent prompt-resource profiles", () => {
   });
 });
 
-describe("fork prompt/resource profiles", () => {
-  it("uses the raw task for omitted-agent fork prompts", () => {
-    expect(buildForkPrompt(omittedSubagentProfile(), "answer from history")).toBe("answer from history");
+describe("initial subagent prompt envelopes", () => {
+  it("wraps omitted-agent fresh prompts with root context", () => {
+    expect(buildInitialSubagentPrompt(omittedSubagentProfile(), "fresh", "answer from scratch", 0)).toBe(`<subagent-context>
+You are a child subagent. You start without the parent conversation.
+You are the first subagent in this tree.
+</subagent-context>
+
+<task>
+answer from scratch
+</task>`);
   });
 
-  it("prefixes named-agent fork prompts as user-message text", () => {
-    expect(buildForkPrompt(namedSubagentProfile(namedAgent), "inspect the branch")).toBe("Subagent instructions from `reviewer`:\nReview carefully.\n\nTask:\ninspect the branch");
+  it("wraps omitted-agent fork prompts with fork context", () => {
+    expect(buildInitialSubagentPrompt(omittedSubagentProfile(), "fork", "answer from history", 0)).toBe(`<subagent-context>
+You are a child subagent. You start from a copy of the parent conversation.
+You are the first subagent in this tree.
+</subagent-context>
+
+<task>
+answer from history
+</task>`);
   });
 
+  it("includes named-agent markdown bodies in a sanitized user-prompt block", () => {
+    expect(buildInitialSubagentPrompt(namedSubagentProfile(namedAgent), "fork", "inspect the branch", 1)).toBe(`<subagent-context>
+You are a child subagent. You start from a copy of the parent conversation.
+You have one parent subagent above you in this tree.
+</subagent-context>
+
+<reviewer-agent>
+Review carefully.
+</reviewer-agent>
+
+<task>
+inspect the branch
+</task>`);
+  });
+
+  it("sanitizes named-agent XML-style tags", () => {
+    expect(subagentAgentTagName("reviewer")).toBe("reviewer-agent");
+    expect(subagentAgentTagName("code.review")).toBe("code-review-agent");
+    expect(subagentAgentTagName("2nd-pass")).toBe("agent-2nd-pass-agent");
+  });
+
+  it("describes deeper nested subagents naturally", () => {
+    expect(buildInitialSubagentPrompt(omittedSubagentProfile(), "fresh", "deep task", 3)).toContain("You have 3 parent subagents above you in this tree.");
+  });
+});
+
+describe("fork resource profiles", () => {
   it("keeps fork resource loading free of subagent prompt-resource overrides", () => {
     const options = buildForkResourceLoaderOptions({ cwd: "/repo", agentDir: "/agent" });
 

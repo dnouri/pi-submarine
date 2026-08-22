@@ -49,6 +49,41 @@ export const TOOL_PROMPTS = {
   },
 } as const;
 
-export function namedForkPrompt(agentName: string, agentBody: string | undefined, task: string): string {
-  return `Subagent instructions from \`${agentName}\`:\n${agentBody ?? ""}\n\nTask:\n${task}`;
+export interface SubagentPromptEnvelopeOptions {
+  context: "fresh" | "fork";
+  task: string;
+  parentDepth: number;
+  agentName?: string;
+  agentBody?: string;
+}
+
+export function buildSubagentPromptEnvelope(options: SubagentPromptEnvelopeOptions): string {
+  const contextLine = options.context === "fresh"
+    ? "You are a child subagent. You start without the parent conversation."
+    : "You are a child subagent. You start from a copy of the parent conversation.";
+  const depthLine = subagentDepthLine(options.parentDepth);
+  const parts = [
+    `<subagent-context>\n${contextLine}\n${depthLine}\n</subagent-context>`,
+  ];
+
+  if (options.agentName !== undefined) {
+    const tag = subagentAgentTagName(options.agentName);
+    parts.push(`<${tag}>\n${options.agentBody ?? ""}\n</${tag}>`);
+  }
+
+  parts.push(`<task>\n${options.task}\n</task>`);
+  return parts.join("\n\n");
+}
+
+export function subagentAgentTagName(agentName: string): string {
+  let sanitized = agentName.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!sanitized) sanitized = "agent";
+  if (!/^[a-z]/.test(sanitized)) sanitized = `agent-${sanitized}`;
+  return `${sanitized}-agent`;
+}
+
+function subagentDepthLine(parentDepth: number): string {
+  if (parentDepth <= 0) return "You are the first subagent in this tree.";
+  if (parentDepth === 1) return "You have one parent subagent above you in this tree.";
+  return `You have ${parentDepth} parent subagents above you in this tree.`;
 }
