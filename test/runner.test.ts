@@ -1,7 +1,7 @@
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { SessionManager, SettingsManager, type AgentSession, type AgentSessionEvent, type ExtensionContext, type ResourceLoader } from "@earendil-works/pi-coding-agent";
+import { SessionManager, SettingsManager, type AgentSession, type AgentSessionEvent, type CreateAgentSessionOptions, type ExtensionContext, type ResourceLoader } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readManifestRecords } from "../src/manifest.js";
 import { runSubagent, runSubagentResume } from "../src/runner.js";
@@ -218,6 +218,7 @@ interface FakeChildSessionOptions {
   bindImpl?: () => Promise<void>;
   shutdownImpl?: () => Promise<void>;
   abortImpl?: () => Promise<void>;
+  persistPromptWithModel?: { provider: string; modelId: string };
   unsubscribeImpl?: () => void;
   disposeImpl?: () => void;
   events?: AgentSessionEvent[];
@@ -248,7 +249,10 @@ function fakeDeps(root: string, session?: FakeChildSessionOptions) {
         getAppendSystemPrompt: vi.fn(),
         extendResources: vi.fn(),
       } as unknown as ResourceLoader)),
-      createAgentSession: vi.fn(async () => ({ session: fakeSession as unknown as AgentSession })),
+      createAgentSession: vi.fn(async (options: CreateAgentSessionOptions) => {
+        fakeSession.setSessionManager(options.sessionManager);
+        return { session: fakeSession as unknown as AgentSession };
+      }),
     },
   };
 }
@@ -271,11 +275,13 @@ class FakeChildSession {
   private readonly bindImpl: () => Promise<void>;
   private readonly shutdownImpl: () => Promise<void>;
   private readonly abortImpl: () => Promise<void>;
+  private readonly persistPromptWithModel: { provider: string; modelId: string } | undefined;
   private readonly unsubscribeImpl: () => void;
   private readonly disposeImpl: () => void;
   private readonly getContextUsageImpl: () => SubagentContextUsage | undefined;
   private readonly events: AgentSessionEvent[];
   private readonly messagesAfterPrompt: unknown[];
+  private sessionManager: SessionManager | undefined;
   private listeners: Array<(event: AgentSessionEvent) => void> = [];
 
   constructor(options: FakeChildSessionOptions = {}) {
@@ -286,6 +292,7 @@ class FakeChildSession {
     this.bindImpl = options.bindImpl ?? (async () => undefined);
     this.shutdownImpl = options.shutdownImpl ?? (async () => undefined);
     this.abortImpl = options.abortImpl ?? (async () => undefined);
+    this.persistPromptWithModel = options.persistPromptWithModel;
     this.unsubscribeImpl = options.unsubscribeImpl ?? (() => undefined);
     this.disposeImpl = options.disposeImpl ?? (() => undefined);
     this.getContextUsageImpl = options.getContextUsageImpl ?? (() => options.contextUsage);
@@ -297,7 +304,21 @@ class FakeChildSession {
     this.promptedWith = text;
     for (const event of this.events) this.emit(event);
     await this.promptImpl(text);
+    if (this.persistPromptWithModel && this.sessionManager) {
+      this.sessionManager.appendMessage({ role: "user", content: text } as Parameters<SessionManager["appendMessage"]>[0]);
+      this.sessionManager.appendMessage({
+        role: "assistant",
+        provider: this.persistPromptWithModel.provider,
+        model: this.persistPromptWithModel.modelId,
+        content: [{ type: "text", text: this.lastAssistantText }],
+        stopReason: "stop",
+      } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+    }
     this.messages.push(...this.messagesAfterPrompt);
+  }
+
+  setSessionManager(sessionManager: SessionManager | undefined) {
+    this.sessionManager = sessionManager;
   }
 
   emit(event: AgentSessionEvent) {
@@ -902,8 +923,14 @@ describe("subagent runner", () => {
     await writeChildSessionHeader(childSession, "abort-resume-session", cwd);
     await writeManifestRecord(parentSession, startedManifestRecord({ sessionId: "abort-resume-session", cwd, sessionFile: childSession }));
     const abortController = new AbortController();
+    const lifecycle: string[] = [];
     const { deps, fakeSession } = fakeDeps(root, {
       promptImpl: async () => new Promise<void>(() => undefined),
+      abortImpl: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        lifecycle.push("abort");
+      },
+      disposeImpl: () => { lifecycle.push("dispose"); },
     });
     deps.createEpisodeId = vi.fn(() => "resume-1");
     const updates: unknown[] = [];
@@ -917,6 +944,7 @@ describe("subagent runner", () => {
     expect(fakeSession.abortCount).toBe(1);
     expect(fakeSession.unsubscribeCount).toBe(1);
     expect(fakeSession.disposeCount).toBe(1);
+    expect(lifecycle).toEqual(["abort", "dispose"]);
     expect(updates.at(-1)).toMatchObject({ details: { run: { episodeId: "resume-1", sessionId: "abort-resume-session", status: "aborted", activity: "interrupted" } } });
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     expect(manifest.at(-1)).toMatchObject({ type: "resume_finished", episodeId: "resume-1", sessionId: "abort-resume-session", status: "aborted", error: "Interrupted by parent abort." });
@@ -1746,7 +1774,15 @@ describe("subagent runner", () => {
     await mkdir(cwd, { recursive: true });
     const parentSession = path.join(root, "sessions", "parent.jsonl");
     const abortController = new AbortController();
-    const { deps, fakeSession } = fakeDeps(root, { promptImpl: async () => { abortController.abort(); } });
+    const lifecycle: string[] = [];
+    const { deps, fakeSession } = fakeDeps(root, {
+      promptImpl: async () => { abortController.abort(); },
+      abortImpl: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        lifecycle.push("abort");
+      },
+      disposeImpl: () => { lifecycle.push("dispose"); },
+    });
 
     const message = await rejectedMessage(runSubagent({ task: "abortable" }, abortController.signal, undefined, fakeContext(cwd, parentSession), { deps }));
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
@@ -1756,6 +1792,7 @@ describe("subagent runner", () => {
     expect(fakeSession.abortCount).toBe(1);
     expect(fakeSession.unsubscribeCount).toBe(1);
     expect(fakeSession.disposeCount).toBe(1);
+    expect(lifecycle).toEqual(["abort", "dispose"]);
   });
 
   it("does not prompt a child if the parent aborts after session creation but before prompting", async () => {
@@ -1898,30 +1935,57 @@ describe("subagent runner", () => {
     expect(manifest[0]).toMatchObject({ type: "started", episodeId: "run-1", parentEpisodeId: null, agent: "subagent", agentFile: null, cwd, context: "fork", sessionFile: childSession });
   });
 
-  it("persists an explicit fork model for later resume", async () => {
+  it("persists a named fork model and restores it on resume after the agent default changes", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
-    await mkdir(cwd, { recursive: true });
-    const parentSession = path.join(root, "sessions", "parent.jsonl");
-    const forkManager = new FakeForkSessionManager(cwd, parentSession);
+    const agentPath = path.join(cwd, ".pi", "agents", "vision.md");
+    await mkdir(path.dirname(agentPath), { recursive: true });
+    await writeFile(agentPath, "---\ndescription: Inspects images\nmodel: zai/glm-5v-turbo\nagentsMd: none\nskills: none\n---\n\nInspect carefully.\n", "utf8");
+    const parentManager = SessionManager.create(cwd, path.join(root, "sessions"));
+    parentManager.appendMessage({ role: "user", content: "Inspect this branch." } as Parameters<SessionManager["appendMessage"]>[0]);
+    parentManager.appendMessage({ role: "assistant", content: [{ type: "text", text: "Ready." }], stopReason: "stop" } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+    const parentSession = parentManager.getSessionFile();
+    if (!parentSession) throw new Error("expected persisted parent session");
     const visionModel = fakeModel("zai", "glm-5v-turbo");
-    const { deps } = fakeDeps(root);
-    deps.openSessionManager = vi.fn(() => forkManager as unknown as SessionManager);
+    const laterDefault = fakeModel("openai", "gpt-5");
+    const registry = fakeModelRegistry([visionModel, laterDefault]);
+    const initial = fakeDeps(root, {
+      persistPromptWithModel: { provider: "zai", modelId: "glm-5v-turbo" },
+    });
 
     await runSubagent(
-      { task: "inspect the branch", context: "fork", model: "zai/glm-5v-turbo" },
+      { agent: "vision", task: "inspect the branch", context: "fork" },
       undefined,
       undefined,
       fakeContext(cwd, parentSession, {
-        leafId: "leaf-current",
-        modelRegistry: fakeModelRegistry([visionModel]),
+        leafId: parentManager.getLeafId(),
+        modelRegistry: registry,
       }),
-      { deps },
+      { deps: initial.deps },
     );
 
-    const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
+    const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
+    const started = manifest[0]?.type === "started" ? manifest[0] : undefined;
+    expect(started).toBeDefined();
+    const persisted = SessionManager.open(started!.sessionFile, `${parentSession}.subagents`).buildSessionContext().model;
+    expect(persisted).toEqual({ provider: "zai", modelId: "glm-5v-turbo" });
+
+    await writeFile(agentPath, "---\ndescription: Inspects images\nmodel: openai/gpt-5\nagentsMd: none\nskills: none\n---\n\nInspect carefully.\n", "utf8");
+    const resumed = fakeDeps(root, {
+      persistPromptWithModel: { provider: "zai", modelId: "glm-5v-turbo" },
+    });
+    resumed.deps.createEpisodeId = vi.fn(() => "resume-1");
+    const result = await runSubagentResume(
+      { sessionId: started!.sessionId, message: "continue the inspection" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { modelRegistry: registry }),
+      { deps: resumed.deps },
+    );
+
+    expectSubagentResult(result, "## Subagent vision result");
+    const sessionOptions = (resumed.deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
     expect(sessionOptions?.model).toBe(visionModel);
-    expect(forkManager.modelChanges).toEqual([{ provider: "zai", modelId: "glm-5v-turbo" }]);
   });
 
   it("rejects an SDK model fallback before prompting the child", async () => {

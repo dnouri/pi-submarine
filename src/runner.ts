@@ -892,18 +892,33 @@ function copyContextUsage(contextUsage: SubagentContextUsage): SubagentContextUs
   };
 }
 
-function attachAbortHandler(signal: AbortSignal | undefined, childSession: ChildAgentSession): { wasAborted: () => boolean; aborted: Promise<void>; detach: () => void } {
+interface ChildAbortState {
+  wasAborted: () => boolean;
+  aborted: Promise<void>;
+  settled: Promise<void>;
+  detach: () => void;
+}
+
+function attachAbortHandler(signal: AbortSignal | undefined, childSession: ChildAgentSession): ChildAbortState {
   let abortRequested = false;
   let resolveAbort!: () => void;
+  let resolveSettled!: () => void;
   const aborted = new Promise<void>((resolve) => {
     resolveAbort = resolve;
   });
+  const settled = new Promise<void>((resolve) => {
+    resolveSettled = resolve;
+  });
   const abortChild = () => {
+    if (abortRequested) return;
     abortRequested = true;
     resolveAbort();
-    void childSession.abort().catch((error: unknown) => {
-      console.error("subagent child abort failed", error);
-    });
+    void Promise.resolve()
+      .then(() => childSession.abort())
+      .catch((error: unknown) => {
+        console.error("subagent child abort failed", error);
+      })
+      .finally(resolveSettled);
   };
 
   signal?.addEventListener("abort", abortChild, { once: true });
@@ -912,14 +927,18 @@ function attachAbortHandler(signal: AbortSignal | undefined, childSession: Child
   return {
     wasAborted: () => abortRequested,
     aborted,
+    settled,
     detach: () => {
       if (signal) signal.removeEventListener("abort", abortChild);
     },
   };
 }
 
-async function promptChildAndExtractAnswer(childSession: ChildAgentSession, childSessionManager: SessionManager, task: string, abortState: { wasAborted: () => boolean; aborted: Promise<void> }): Promise<string> {
-  if (abortState.wasAborted()) throw new SubagentInterruptedError();
+async function promptChildAndExtractAnswer(childSession: ChildAgentSession, childSessionManager: SessionManager, task: string, abortState: ChildAbortState): Promise<string> {
+  if (abortState.wasAborted()) {
+    await abortState.settled;
+    throw new SubagentInterruptedError();
+  }
   const leafBeforePrompt = childSessionManager.getLeafId();
   const assistantCountBeforePrompt = assistantMessages(childSession.messages ?? []).length;
   const promptPromise = childSession.prompt(task);
@@ -929,10 +948,14 @@ async function promptChildAndExtractAnswer(childSession: ChildAgentSession, chil
   ]);
   if (winner === "abort") {
     void promptPromise.catch((error: unknown) => console.error("subagent child prompt failed after abort", error));
+    await abortState.settled;
     throw new SubagentInterruptedError();
   }
 
-  if (abortState.wasAborted()) throw new SubagentInterruptedError();
+  if (abortState.wasAborted()) {
+    await abortState.settled;
+    throw new SubagentInterruptedError();
+  }
   const newAssistantMessages = assistantMessagesAfterLeaf(childSessionManager, leafBeforePrompt)
     ?? assistantMessages(childSession.messages ?? []).slice(assistantCountBeforePrompt);
   const modelError = finalAssistantFailure(newAssistantMessages);
