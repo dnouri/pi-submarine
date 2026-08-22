@@ -1,5 +1,6 @@
 import { mkdir, open, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   DefaultResourceLoader,
   createAgentSession,
@@ -19,6 +20,7 @@ import { MissingMarkdownAgentError, resolveMarkdownAgent } from "./agents.js";
 import { cloneRunView, createActivityState, createInitialRunView, reduceActivityEvent } from "./activity.js";
 import { QueuedActivityLogWriter, appendActivityLogFinished, appendActivityLogStarted, ensureActivityLogHeader, type DegradedActivityLogOptions } from "./activity-log.js";
 import { appendManifestRecord, findLatestEpisodeStartedRecordBySessionFile, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
+import { resolveRecordedSubagentModel, resolveSubagentModel } from "./models.js";
 import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult } from "./render.js";
 import { assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
 import { buildSubagentPromptEnvelope } from "./tool-prompts.js";
@@ -26,8 +28,8 @@ import { OMITTED_AGENT_LABEL, type AgentSelection, type MarkdownAgent, type Suba
 
 type DefaultResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
 type ProjectTrustedSettingsManager = ReturnType<typeof SettingsManager.create>;
-type ChildAgentSession = Pick<AgentSession, "prompt" | "getLastAssistantText" | "getContextUsage" | "subscribe" | "bindExtensions" | "abort" | "dispose" | "messages">;
-type ChildSessionResult = Pick<CreateAgentSessionResult, "session">;
+type ChildAgentSession = Pick<AgentSession, "prompt" | "getLastAssistantText" | "getContextUsage" | "subscribe" | "bindExtensions" | "hasExtensionHandlers" | "extensionRunner" | "abort" | "dispose" | "messages">;
+type ChildSessionResult = Pick<CreateAgentSessionResult, "session" | "modelFallbackMessage">;
 type ManifestRecords = Awaited<ReturnType<typeof readManifestRecords>>;
 
 export interface SubagentPromptProfile {
@@ -35,6 +37,7 @@ export interface SubagentPromptProfile {
   agentName: string;
   agentFile?: string;
   agentBody?: string;
+  model?: string;
   agentsMd: "none" | "auto";
   skills: MarkdownAgent["skills"];
 }
@@ -70,25 +73,22 @@ interface BaseRunPlan {
   settingsManager: ProjectTrustedSettingsManager;
   resourceLoader: ResourceLoader;
   userPrompt: string;
+  model: Model<Api> | undefined;
 }
 
 interface FreshRunPlan extends BaseRunPlan {
   context: "fresh";
-  inheritParentModel: true;
 }
 
 interface ForkRunPlan extends BaseRunPlan {
   context: "fork";
   currentLeafId: string;
   sourceSessionManager: SessionManager;
-  inheritParentModel: false;
 }
 
 type RunPlan = FreshRunPlan | ForkRunPlan;
 
-type ChildSessionPlan = Pick<BaseRunPlan, "effectiveCwd" | "agentDir" | "settingsManager" | "resourceLoader"> & {
-  inheritParentModel: boolean;
-};
+type ChildSessionPlan = Pick<BaseRunPlan, "effectiveCwd" | "agentDir" | "settingsManager" | "resourceLoader" | "model">;
 
 interface ResumeRunPlan extends ChildSessionPlan {
   profile: SubagentPromptProfile;
@@ -145,6 +145,7 @@ export function namedSubagentProfile(agent: MarkdownAgent): SubagentPromptProfil
     agentName: agent.name,
     agentFile: agent.filePath,
     agentBody: agent.body,
+    ...(agent.model === undefined ? {} : { model: agent.model }),
     agentsMd: agent.agentsMd,
     skills: agent.skills,
   };
@@ -216,6 +217,7 @@ export async function runSubagent(
   let run: SubagentToolDetails["run"] | undefined;
   let startedRun: StartedRun | undefined;
   let childSession: ChildAgentSession | undefined;
+  let childExtensionsStarted = false;
   let unsubscribe: (() => void) | undefined;
   let detachAbortHandler: (() => void) | undefined;
   let reservedChildSessionFile: string | undefined;
@@ -231,7 +233,10 @@ export async function runSubagent(
     throwIfInterrupted(signal);
     emitUpdate(onUpdate, run);
 
-    childSession = await createChildSession(plan, startedRun.childSessionManager, deps, ctx);
+    const created = await createChildSession(plan, startedRun.childSessionManager, deps, ctx);
+    childSession = created.session;
+    throwIfModelFallback(created.modelFallbackMessage);
+    childExtensionsStarted = true;
     await bindChildExtensions(childSession);
     const activeChildSession = childSession;
     const abortState = attachAbortHandler(signal, activeChildSession);
@@ -262,6 +267,7 @@ export async function runSubagent(
     const interrupted = isSubagentInterruptedError(error);
     await activityLogWriter?.drain();
     if (run && childSession) refreshContextUsage(run, childSession);
+    if (startedRun && plan) preservePlannedModel(plan, startedRun.childSessionManager);
     if (startedRun) await materializeChildSessionFile(startedRun.childSessionManager);
     if (startedRun && plan) {
       if (interrupted) await abortRun(plan.manifestPath, startedRun, deps, onUpdate, activityLogWriter);
@@ -273,10 +279,10 @@ export async function runSubagent(
     if (run) throw new Error(renderSubagentRecoverableError(selection, run.sessionId, message));
     throw new Error(`${errorHeading(selection)}\n\n${message}`);
   } finally {
-    releaseActiveChildSession(reservedChildSessionFile);
     runCleanup("remove subagent abort listener", detachAbortHandler);
     runCleanup("unsubscribe subagent activity listener", unsubscribe);
-    runCleanup("dispose subagent child session", () => childSession?.dispose());
+    await closeChildSession(childSession, childExtensionsStarted, "subagent");
+    releaseActiveChildSession(reservedChildSessionFile);
   }
 }
 
@@ -291,6 +297,7 @@ export async function runSubagentResume(
   let plan: ResumeRunPlan | undefined;
   let run: SubagentToolDetails["run"] | undefined;
   let childSession: ChildAgentSession | undefined;
+  let childExtensionsStarted = false;
   let unsubscribe: (() => void) | undefined;
   let detachAbortHandler: (() => void) | undefined;
   let reservedChildSessionFile: string | undefined;
@@ -328,7 +335,10 @@ export async function runSubagentResume(
     emitUpdate(onUpdate, run);
     throwIfInterrupted(signal);
 
-    childSession = await createChildSession(plan, plan.childSessionManager, deps, ctx);
+    const created = await createChildSession(plan, plan.childSessionManager, deps, ctx);
+    childSession = created.session;
+    throwIfModelFallback(created.modelFallbackMessage);
+    childExtensionsStarted = true;
     await bindChildExtensions(childSession);
     const activeChildSession = childSession;
     const abortState = attachAbortHandler(signal, activeChildSession);
@@ -368,10 +378,10 @@ export async function runSubagentResume(
     throw new Error(`${heading}\n\n${message}`);
   } finally {
     if (run) forgetRuntimeEpisode(run.episodeId);
-    releaseActiveChildSession(reservedChildSessionFile);
     runCleanup("remove subagent resume abort listener", detachAbortHandler);
     runCleanup("unsubscribe subagent resume activity listener", unsubscribe);
-    runCleanup("dispose resumed subagent child session", () => childSession?.dispose());
+    await closeChildSession(childSession, childExtensionsStarted, "resumed subagent");
+    releaseActiveChildSession(reservedChildSessionFile);
   }
 }
 
@@ -431,6 +441,10 @@ async function prepareResumeRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveResumeProfile(startedRecord, effectiveCwd, userAgentsDir);
+  const recordedModel = childSessionManager.buildSessionContext().model;
+  const model = recordedModel
+    ? resolveRecordedSubagentModel(recordedModel.provider, recordedModel.modelId, ctx.modelRegistry)
+    : undefined;
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
@@ -455,7 +469,7 @@ async function prepareResumeRun(
     settingsManager,
     resourceLoader,
     userPrompt: params.message,
-    inheritParentModel: false,
+    model,
   };
 }
 
@@ -479,6 +493,8 @@ async function prepareFreshRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, profileResolutionOptions(userAgentsDir, params, ctx));
+  const parentModel = ctx.model;
+  const model = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, parentModel?.provider) ?? parentModel;
   const { root, manifestPath, parentDepth, parentPath } = await resolveArtifactRoot(parentSessionFile);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
@@ -498,7 +514,7 @@ async function prepareFreshRun(
     settingsManager,
     resourceLoader,
     userPrompt: buildInitialSubagentPrompt(profile, "fresh", params.task, parentDepth),
-    inheritParentModel: true,
+    model,
   };
 }
 
@@ -528,6 +544,8 @@ async function prepareForkRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, { userAgentsDir });
+  const parentModel = ctx.model;
+  const model = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, parentModel?.provider);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
@@ -546,9 +564,9 @@ async function prepareForkRun(
     settingsManager,
     resourceLoader,
     userPrompt: buildInitialSubagentPrompt(profile, "fork", params.task, parentDepth),
+    model,
     currentLeafId,
     sourceSessionManager,
-    inheritParentModel: false,
   };
 }
 
@@ -726,6 +744,9 @@ async function startRunArtifacts(
   const activityLog = plan.root.activityLogPath;
   const activityPath = [...plan.parentPath, plan.profile.agentName];
   const childSessionManager = createChildSessionManager(plan, deps);
+  if (plan.context === "fork" && plan.model) {
+    childSessionManager.appendModelChange(plan.model.provider, plan.model.id);
+  }
   const childSessionFile = childSessionManager.getSessionFile();
   if (!childSessionFile) throw new Error("Could not create a persisted child subagent session.");
   const sessionId = childSessionManager.getSessionId();
@@ -793,21 +814,56 @@ async function createChildSession(
   childSessionManager: SessionManager,
   deps: RunnerDependencies,
   ctx: ExtensionContext,
-): Promise<ChildAgentSession> {
-  const created = await deps.createAgentSession({
+): Promise<ChildSessionResult> {
+  return deps.createAgentSession({
     cwd: plan.effectiveCwd,
     agentDir: plan.agentDir,
     modelRegistry: ctx.modelRegistry,
-    ...(plan.inheritParentModel && ctx.model !== undefined ? { model: ctx.model } : {}),
+    ...(plan.model === undefined ? {} : { model: plan.model }),
     settingsManager: plan.settingsManager,
     resourceLoader: plan.resourceLoader,
     sessionManager: childSessionManager,
   });
-  return created.session;
+}
+
+function preservePlannedModel(plan: ChildSessionPlan, childSessionManager: SessionManager): void {
+  if (!plan.model) return;
+
+  try {
+    const recordedModel = childSessionManager.buildSessionContext().model;
+    if (recordedModel) return;
+    childSessionManager.appendModelChange(plan.model.provider, plan.model.id);
+  } catch (error: unknown) {
+    console.error("subagent child model persistence failed", error);
+  }
+}
+
+function throwIfModelFallback(modelFallbackMessage: string | undefined): void {
+  if (modelFallbackMessage) throw new Error(modelFallbackMessage);
 }
 
 async function bindChildExtensions(childSession: ChildAgentSession): Promise<void> {
   await childSession.bindExtensions({ onError: (error: unknown) => console.error("subagent extension error", error) });
+}
+
+async function closeChildSession(
+  childSession: ChildAgentSession | undefined,
+  extensionsStarted: boolean,
+  label: string,
+): Promise<void> {
+  if (!childSession) return;
+
+  if (extensionsStarted) {
+    try {
+      if (childSession.hasExtensionHandlers("session_shutdown")) {
+        await childSession.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      }
+    } catch (error: unknown) {
+      console.error(`Could not shut down ${label} child extensions`, error);
+    }
+  }
+
+  runCleanup(`dispose ${label} child session`, () => childSession.dispose());
 }
 
 function refreshContextUsage(run: SubagentToolDetails["run"], childSession: ChildAgentSession): void {
@@ -836,18 +892,33 @@ function copyContextUsage(contextUsage: SubagentContextUsage): SubagentContextUs
   };
 }
 
-function attachAbortHandler(signal: AbortSignal | undefined, childSession: ChildAgentSession): { wasAborted: () => boolean; aborted: Promise<void>; detach: () => void } {
+interface ChildAbortState {
+  wasAborted: () => boolean;
+  aborted: Promise<void>;
+  settled: Promise<void>;
+  detach: () => void;
+}
+
+function attachAbortHandler(signal: AbortSignal | undefined, childSession: ChildAgentSession): ChildAbortState {
   let abortRequested = false;
   let resolveAbort!: () => void;
+  let resolveSettled!: () => void;
   const aborted = new Promise<void>((resolve) => {
     resolveAbort = resolve;
   });
+  const settled = new Promise<void>((resolve) => {
+    resolveSettled = resolve;
+  });
   const abortChild = () => {
+    if (abortRequested) return;
     abortRequested = true;
     resolveAbort();
-    void childSession.abort().catch((error: unknown) => {
-      console.error("subagent child abort failed", error);
-    });
+    void Promise.resolve()
+      .then(() => childSession.abort())
+      .catch((error: unknown) => {
+        console.error("subagent child abort failed", error);
+      })
+      .finally(resolveSettled);
   };
 
   signal?.addEventListener("abort", abortChild, { once: true });
@@ -856,14 +927,18 @@ function attachAbortHandler(signal: AbortSignal | undefined, childSession: Child
   return {
     wasAborted: () => abortRequested,
     aborted,
+    settled,
     detach: () => {
       if (signal) signal.removeEventListener("abort", abortChild);
     },
   };
 }
 
-async function promptChildAndExtractAnswer(childSession: ChildAgentSession, childSessionManager: SessionManager, task: string, abortState: { wasAborted: () => boolean; aborted: Promise<void> }): Promise<string> {
-  if (abortState.wasAborted()) throw new SubagentInterruptedError();
+async function promptChildAndExtractAnswer(childSession: ChildAgentSession, childSessionManager: SessionManager, task: string, abortState: ChildAbortState): Promise<string> {
+  if (abortState.wasAborted()) {
+    await abortState.settled;
+    throw new SubagentInterruptedError();
+  }
   const leafBeforePrompt = childSessionManager.getLeafId();
   const assistantCountBeforePrompt = assistantMessages(childSession.messages ?? []).length;
   const promptPromise = childSession.prompt(task);
@@ -873,10 +948,14 @@ async function promptChildAndExtractAnswer(childSession: ChildAgentSession, chil
   ]);
   if (winner === "abort") {
     void promptPromise.catch((error: unknown) => console.error("subagent child prompt failed after abort", error));
+    await abortState.settled;
     throw new SubagentInterruptedError();
   }
 
-  if (abortState.wasAborted()) throw new SubagentInterruptedError();
+  if (abortState.wasAborted()) {
+    await abortState.settled;
+    throw new SubagentInterruptedError();
+  }
   const newAssistantMessages = assistantMessagesAfterLeaf(childSessionManager, leafBeforePrompt)
     ?? assistantMessages(childSession.messages ?? []).slice(assistantCountBeforePrompt);
   const modelError = finalAssistantFailure(newAssistantMessages);

@@ -5,7 +5,7 @@ import type { AgentResourceMode, AgentSelection, MarkdownAgent, MarkdownAgentSou
 import { namedAgentSelection, omittedAgentSelection } from "./render.js";
 
 const FRONTMATTER_DELIMITER = "---";
-const VALID_FRONTMATTER_KEYS = new Set(["description", "agentsMd", "skills"]);
+const VALID_FRONTMATTER_KEYS = new Set(["description", "model", "agentsMd", "skills"]);
 
 export interface AgentDiscoveryResult {
   agents: MarkdownAgent[];
@@ -108,6 +108,9 @@ export function parseMarkdownAgent(content: string, options: ParseMarkdownAgentO
   const description = fields.get("description")?.trim() ?? "";
   if (description === "") fail("description is required and must be non-empty");
 
+  const rawModel = fields.get("model");
+  const model = rawModel === undefined ? undefined : rawModel || fail("model must be non-empty");
+
   const rawAgentsMd = fields.get("agentsMd") ?? "none";
   const agentsMd: AgentResourceMode = rawAgentsMd === "none" ? "none" : rawAgentsMd === "auto" ? "auto" : fail("agentsMd must be 'none' or 'auto'");
 
@@ -121,6 +124,7 @@ export function parseMarkdownAgent(content: string, options: ParseMarkdownAgentO
     source: options.source,
     filePath: options.filePath,
     body,
+    ...(model === undefined ? {} : { model }),
     agentsMd,
     skills,
   };

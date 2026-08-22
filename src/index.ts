@@ -10,6 +10,7 @@ export const subagentParameters = Type.Object(
   {
     agent: Type.Optional(Type.String({ description: TOOL_PROMPTS.subagent.parameterDescriptions.agent })),
     task: Type.String({ minLength: 1, description: TOOL_PROMPTS.subagent.parameterDescriptions.task }),
+    model: Type.Optional(Type.String({ minLength: 1, description: TOOL_PROMPTS.subagent.parameterDescriptions.model })),
     context: Type.Optional(
       StringEnum(["fresh", "fork"] as const, {
         default: "fresh",
