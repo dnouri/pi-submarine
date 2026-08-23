@@ -21,20 +21,26 @@ describe("strict markdown agent parsing", () => {
       source: "project",
       filePath: FILE_PATH,
       body: "You review code.",
+      model: undefined,
       agentsMd: "none",
       skills: "auto",
     });
   });
 
-  it("parses optional agentsMd and skills controls", () => {
-    expect(parse(validAgent("description: Researches\nagentsMd: auto\nskills: none")).agentsMd).toBe("auto");
+  it("parses optional model, agentsMd, and skills controls", () => {
+    const agent = parse(validAgent("description: Researches\nmodel: openrouter/z-ai/glm-5v-turbo:free\nagentsMd: auto\nskills: none"));
+
+    expect(agent.model).toBe("openrouter/z-ai/glm-5v-turbo:free");
+    expect(agent.agentsMd).toBe("auto");
+    expect(agent.skills).toBe("none");
     expect(parse(validAgent("description: Researches\nskills: research, audit")).skills).toEqual({ names: ["research", "audit"] });
   });
 
   it("splits frontmatter values after the first colon only", () => {
-    const agent = parse(validAgent("description: Reviews code: tests: docs"));
+    const agent = parse(validAgent("description: Reviews code: tests: docs\nmodel: provider/model:variant"));
 
     expect(agent.description).toBe("Reviews code: tests: docs");
+    expect(agent.model).toBe("provider/model:variant");
   });
 
   it("accepts CRLF line endings without relaxing delimiter text", () => {
@@ -50,10 +56,11 @@ describe("strict markdown agent parsing", () => {
     ["missing closing delimiter", "---\ndescription: Reviews\nBody", "missing closing delimiter"],
     ["blank frontmatter line", "---\ndescription: Reviews\n\n---\nBody", "blank frontmatter lines are not allowed"],
     ["comment line", "---\ndescription: Reviews\n# no\n---\nBody", "comments are not allowed"],
-    ["unknown key", "---\ndescription: Reviews\nmodel: x\n---\nBody", "unknown key 'model'"],
+    ["unknown key", "---\ndescription: Reviews\ntemperature: 0\n---\nBody", "unknown key 'temperature'"],
     ["duplicate key", "---\ndescription: Reviews\ndescription: Again\n---\nBody", "duplicate key 'description'"],
     ["missing colon", "---\ndescription Reviews\n---\nBody", "must be in key: value form"],
     ["empty description", "---\ndescription:   \n---\nBody", "description is required"],
+    ["empty model", "---\ndescription: Reviews\nmodel:   \n---\nBody", "model must be non-empty"],
     ["quoted double value", "---\ndescription: \"Reviews\"\n---\nBody", "quoted values are invalid"],
     ["quoted single value", "---\ndescription: 'Reviews'\n---\nBody", "quoted values are invalid"],
     ["invalid agentsMd", "---\ndescription: Reviews\nagentsMd: yes\n---\nBody", "agentsMd must be 'none' or 'auto'"],

@@ -8,6 +8,7 @@ export type SubagentContextMode = "fresh" | "fork";
 export interface SubagentParams {
   agent?: string;
   task: string;
+  model?: string;
   context?: SubagentContextMode;
   cwd?: string;
 }
@@ -36,6 +37,7 @@ export interface MarkdownAgent {
   source: MarkdownAgentSource;
   filePath: string;
   body: string;
+  model?: string;
   agentsMd: AgentResourceMode;
   skills: SkillResourceMode;
 }

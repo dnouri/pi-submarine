@@ -48,6 +48,7 @@ describe("pi-submarine extension registration", () => {
       properties: {
         agent: { type: "string" },
         task: { type: "string", minLength: 1 },
+        model: { type: "string", minLength: 1 },
         context: { type: "string", enum: ["fresh", "fork"], default: "fresh" },
         cwd: { type: "string" },
       },
@@ -81,7 +82,7 @@ describe("pi-submarine extension registration", () => {
     const guidelines = subagent?.promptGuidelines?.join("\n") ?? "";
     expect(guidelines).toContain("Common calls");
     expect(guidelines).toContain("subagent({ task: \"...\" })");
-    expect(guidelines).toContain("subagent({ agent: \"reviewer\", task: \"...\" })");
+    expect(guidelines).toContain("subagent({ agent: \"vision\", task: \"Read any screenshots or images and return their contents\", model: \"glm-5v-turbo\" })");
     expect(guidelines).toContain("subagent({ context: \"fork\", task: \"...\" })");
     expect(guidelines).toContain("do not see the parent conversation");
     expect(guidelines).toContain("foreground child");
@@ -90,11 +91,13 @@ describe("pi-submarine extension registration", () => {
     expect(guidelines).toContain("Omit `agent` for default mode");
     expect(guidelines).toContain("Role text inside `task` does not select an agent");
     expect(guidelines).toContain("Usually omit `cwd`");
+    expect(guidelines).toContain("call-level `model` overrides");
 
     expect(subagent?.parameters).toMatchObject({
       properties: {
         agent: { description: expect.stringContaining("project agents from the effective `cwd`") },
         task: { description: expect.stringContaining("does not see the parent conversation") },
+        model: { description: expect.stringContaining("frontmatter default") },
         context: { description: expect.stringContaining("Defaults to `fresh`") },
         cwd: { description: expect.stringContaining("Omit to inherit the caller cwd") },
       },
