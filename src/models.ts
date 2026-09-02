@@ -1,7 +1,7 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 
-type SubagentModelRegistry = Pick<ModelRegistry, "getAll" | "hasConfiguredAuth">;
+export type SubagentModelRegistry = Pick<ModelRegistry, "getAll" | "hasConfiguredAuth">;
 
 export function resolveRecordedSubagentModel(
   provider: string,

@@ -38,15 +38,16 @@ export const TOOL_PROMPTS = {
   },
   subagentList: {
     label: "List subagents",
-    description: "List specialized markdown `agent`s visible from the caller `cwd`, or from an explicit cwd override, plus the special omitted-agent `default` mode.",
-    promptSnippet: "Inspect visible subagents for a working directory",
+    description: "List specialized markdown `agent`s visible from the caller `cwd`, or from an explicit cwd override, plus the special omitted-agent `default` mode, and the callable models with their supported thinking levels.",
+    promptSnippet: "Inspect visible subagents and callable models for a working directory",
     parameterDescriptions: {
       cwd: "Optional directory override. Usually omit to list agents visible from the caller project context. Set only when intentionally inspecting another directory; relative paths resolve from caller `cwd`.",
     },
     promptGuidelines: [
       "Common call forms: subagent_list({}) for the caller cwd; subagent_list({ cwd: \"/path\" }) only when inspecting another project context.",
       "subagent_list lists markdown `agent`s visible from the effective cwd, plus the special `default` mode used when agent is omitted.",
-      "Use subagent_list when you need to discover available markdown `agent`s; do not call it first if you already know the agent name.",
+      "subagent_list also lists callable models (authenticated only) with their supported `thinkingLevel` values, marking the current model; use it to pick valid model and thinkingLevel values for subagent calls.",
+      "Use subagent_list when you need to discover available markdown `agent`s or valid model/thinkingLevel values; do not call it first if you already know the agent name.",
     ],
   },
 } as const;

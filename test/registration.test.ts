@@ -139,7 +139,10 @@ describe("pi-submarine extension registration", () => {
     process.env.PI_CODING_AGENT_DIR = agentDir;
     const listResult = await (async () => {
       try {
-        return await subagentListTool.execute("tool-call-2", {}, undefined, undefined, { cwd } as ExtensionContext);
+        return await subagentListTool.execute("tool-call-2", {}, undefined, undefined, {
+          cwd,
+          modelRegistry: { getAll: () => [], hasConfiguredAuth: () => false },
+        } as unknown as ExtensionContext);
       } finally {
         if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -168,6 +171,8 @@ describe("pi-submarine extension registration", () => {
       cwd,
       sourceCounts: { user: 0, project: 0 },
       agentDirectories: { user: path.join(agentDir, "agents"), project: null },
+      models: [],
+      currentModel: null,
     });
   });
 });
