@@ -159,9 +159,12 @@ Arguments:
   caller cwd.
 
 The text result shows each markdown agent's name, source label (`user`
-or `project`), description, and path. The structured details include
-the resolved cwd, source counts, and user/project agent
-directories. If an explicit `cwd` hides project agents visible from
+or `project`), description, and path, plus a `Callable models` section
+listing one line per model with configured authentication and its
+supported thinking levels, marking the current session model. The
+structured details include the resolved cwd, source counts,
+user/project agent directories, the callable model catalog, and the
+current model. If an explicit `cwd` hides project agents visible from
 the caller cwd, the result includes a warning.
 
 ## Markdown agents

@@ -1,22 +1,38 @@
 import { stat } from "node:fs/promises";
 import path from "node:path";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import { discoverMarkdownAgents, findNearestProjectAgentsDir, type AgentDiscoveryOptions } from "./agents.js";
+import type { SubagentModelRegistry } from "./models.js";
 import type { MarkdownAgent, SubagentListParams, TextToolResult } from "./types.js";
+
+export interface CallableModelInfo {
+  provider: string;
+  id: string;
+  name: string;
+  reasoning: boolean;
+  thinkingLevels: string[];
+}
 
 export interface ListingInput {
   cwd: string;
   agents: MarkdownAgent[];
   warnings?: string[];
+  models?: CallableModelInfo[];
+  currentModel?: string | null;
 }
 
-export type ListingContext = Pick<ExtensionContext, "cwd"> | { cwd?: string };
+export interface ListingContext {
+  cwd?: string;
+  modelRegistry: SubagentModelRegistry;
+  model?: Model<Api> | null | undefined;
+}
 
 export interface ListSubagentsOptions {
   userAgentsDir?: string;
 }
 
-export function formatSubagentList({ cwd, agents, warnings = [] }: ListingInput): string {
+export function formatSubagentList({ cwd, agents, warnings = [], models = [], currentModel = null }: ListingInput): string {
   const lines = [
     `Available subagents for ${cwd}:`,
     "",
@@ -32,6 +48,17 @@ export function formatSubagentList({ cwd, agents, warnings = [] }: ListingInput)
     for (const agent of agents) {
       lines.push(`- ${agent.name} (${agent.source}) — ${agent.description}`);
       lines.push(`  path: ${agent.filePath}`);
+    }
+  }
+
+  lines.push("", "Callable models:");
+  if (models.length === 0) {
+    lines.push("- none authenticated");
+  } else {
+    for (const model of models) {
+      const currentSuffix =
+        currentModel !== null && currentModel === `${model.provider}/${model.id}` ? " — current" : "";
+      lines.push(`- ${model.provider}/${model.id} — thinking: ${model.thinkingLevels.join(", ")}${currentSuffix}`);
     }
   }
 
@@ -63,17 +90,35 @@ export async function listSubagents(params: SubagentListParams, ctx: ListingCont
     ...result.warnings,
     ...await explicitCwdProjectAgentWarnings(params, ctx, cwd, result.agentDirectories.project),
   ];
+  const models = listCallableModels(ctx);
+  const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
 
   return {
-    content: [{ type: "text", text: formatSubagentList({ cwd, agents: result.agents, warnings }) }],
+    content: [{ type: "text", text: formatSubagentList({ cwd, agents: result.agents, warnings, models, currentModel }) }],
     details: {
       status: "listed",
       count: result.agents.length,
       cwd,
       sourceCounts: result.sourceCounts,
       agentDirectories: result.agentDirectories,
+      models,
+      currentModel,
     },
   };
+}
+
+function listCallableModels(ctx: ListingContext): CallableModelInfo[] {
+  return ctx.modelRegistry
+    .getAll()
+    .filter((model) => ctx.modelRegistry.hasConfiguredAuth(model))
+    .sort((left, right) => `${left.provider}/${left.id}`.localeCompare(`${right.provider}/${right.id}`))
+    .map((model) => ({
+      provider: model.provider,
+      id: model.id,
+      name: model.name,
+      reasoning: model.reasoning,
+      thinkingLevels: getSupportedThinkingLevels(model),
+    }));
 }
 
 function discoveryOptions(cwd: string, options: ListSubagentsOptions): AgentDiscoveryOptions {
