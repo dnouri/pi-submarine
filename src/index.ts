@@ -4,13 +4,18 @@ import { Type } from "typebox";
 import { listSubagents } from "./listing.js";
 import { runSubagent, runSubagentResume } from "./runner.js";
 import { TOOL_PROMPTS } from "./tool-prompts.js";
-import { SUBAGENT_LIST_TOOL_NAME, SUBAGENT_RESUME_TOOL_NAME, SUBAGENT_TOOL_NAME } from "./types.js";
+import { SUBAGENT_LIST_TOOL_NAME, SUBAGENT_RESUME_TOOL_NAME, SUBAGENT_TOOL_NAME, THINKING_LEVELS } from "./types.js";
 
 export const subagentParameters = Type.Object(
   {
     agent: Type.Optional(Type.String({ description: TOOL_PROMPTS.subagent.parameterDescriptions.agent })),
     task: Type.String({ minLength: 1, description: TOOL_PROMPTS.subagent.parameterDescriptions.task }),
     model: Type.Optional(Type.String({ minLength: 1, description: TOOL_PROMPTS.subagent.parameterDescriptions.model })),
+    thinkingLevel: Type.Optional(
+      StringEnum(THINKING_LEVELS, {
+        description: TOOL_PROMPTS.subagent.parameterDescriptions.thinkingLevel,
+      }),
+    ),
     context: Type.Optional(
       StringEnum(["fresh", "fork"] as const, {
         default: "fresh",

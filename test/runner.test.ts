@@ -44,6 +44,10 @@ function fakeModel(provider: string, id: string) {
   return { provider, id, name: id };
 }
 
+function thinkingModel(provider: string, id: string) {
+  return { provider, id, name: id, reasoning: true, thinkingLevelMap: { low: "low", high: "high" } };
+}
+
 function fakeModelRegistry(models: unknown[], authenticated: unknown[] = models) {
   const authenticatedModels = new Set(authenticated);
   return {
@@ -1176,6 +1180,92 @@ describe("subagent runner", () => {
 
     const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
     expect(sessionOptions?.model).toBe(visionModel);
+  });
+
+  it("uses a named agent's default thinkingLevel for a fresh child", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    const agentPath = path.join(cwd, ".pi", "agents", "vision.md");
+    await mkdir(path.dirname(agentPath), { recursive: true });
+    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: zai/glm-5.3\nthinkingLevel: low\n---\n\nRead the image.\n", "utf8");
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const flash = thinkingModel("zai", "glm-5.3");
+    const { deps } = fakeDeps(root);
+
+    await runSubagent(
+      { agent: "vision", task: "read screenshot.png" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([flash]) }),
+      { deps },
+    );
+
+    const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
+    expect(sessionOptions?.thinkingLevel).toBe("low");
+  });
+
+  it("lets a call-level thinkingLevel override a named agent default", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    const agentPath = path.join(cwd, ".pi", "agents", "vision.md");
+    await mkdir(path.dirname(agentPath), { recursive: true });
+    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: zai/glm-5.3\nthinkingLevel: low\n---\n\nRead the image.\n", "utf8");
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const flash = thinkingModel("zai", "glm-5.3");
+    const { deps } = fakeDeps(root);
+
+    await runSubagent(
+      { agent: "vision", task: "read screenshot.png", thinkingLevel: "high" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([flash]) }),
+      { deps },
+    );
+
+    const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
+    expect(sessionOptions?.thinkingLevel).toBe("high");
+  });
+
+  it("omits thinkingLevel when neither call nor agent provides one", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const { deps } = fakeDeps(root);
+
+    await runSubagent(
+      { task: "read screenshot.png" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession),
+      { deps },
+    );
+
+    const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
+    expect(sessionOptions?.thinkingLevel).toBeUndefined();
+  });
+
+  it("rejects an unsupported thinkingLevel before creating child artifacts", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const flash = fakeModel("zai", "glm-5.3-flash");
+    const { deps } = fakeDeps(root);
+
+    const message = await rejectedMessage(runSubagent(
+      { task: "read screenshot.png", model: "zai/glm-5.3-flash", thinkingLevel: "high" },
+      undefined,
+      undefined,
+      fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([flash]) }),
+      { deps },
+    ));
+
+    expect(message).toContain("Subagent thinking level 'high' is not supported by model 'zai/glm-5.3-flash'");
+    expect(message).toContain("Supported levels: off");
+    expectNoRecoveryHandle(message);
+    expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+    await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
   });
 
   it("rejects an unknown explicit model before creating child artifacts", async () => {

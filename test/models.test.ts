@@ -1,7 +1,7 @@
 import type { Model } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { resolveRecordedSubagentModel, resolveSubagentModel } from "../src/models.js";
+import { resolveRecordedSubagentModel, resolveSubagentModel, resolveSubagentThinkingLevel } from "../src/models.js";
 
 function model(provider: string, id: string): Model<any> {
   return { provider, id, name: id } as Model<any>;
@@ -17,6 +17,36 @@ function registry(
     hasConfiguredAuth: (candidate) => authenticatedModels.has(candidate),
   } as Pick<ModelRegistry, "getAll" | "hasConfiguredAuth">;
 }
+
+describe("subagent thinking-level resolution", () => {
+  const reasoningModel = {
+    provider: "zai",
+    id: "glm-5.3",
+    name: "GLM-5.3",
+    reasoning: true,
+    thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" },
+  } as unknown as Model<any>;
+
+  it("passes through a level supported by the resolved model", () => {
+    expect(resolveSubagentThinkingLevel("high", reasoningModel)).toBe("high");
+  });
+
+  it("returns undefined when no level was requested", () => {
+    expect(resolveSubagentThinkingLevel(undefined, reasoningModel)).toBeUndefined();
+  });
+
+  it("skips model validation when no model was resolved", () => {
+    expect(resolveSubagentThinkingLevel("high", undefined)).toBe("high");
+  });
+
+  it("rejects an unsupported level with the supported list", () => {
+    const plainModel = model("zai", "glm-5.3-flash");
+
+    expect(() => resolveSubagentThinkingLevel("high", plainModel)).toThrow(
+      "Subagent thinking level 'high' is not supported by model 'zai/glm-5.3-flash'. Supported levels: off.",
+    );
+  });
+});
 
 describe("subagent model resolution", () => {
   it("resolves canonical references without splitting slashes or colons in the model ID", () => {

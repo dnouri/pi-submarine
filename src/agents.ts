@@ -2,10 +2,11 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { AgentResourceMode, AgentSelection, MarkdownAgent, MarkdownAgentSource, SkillResourceMode } from "./types.js";
+import { THINKING_LEVELS } from "./types.js";
 import { namedAgentSelection, omittedAgentSelection } from "./render.js";
 
 const FRONTMATTER_DELIMITER = "---";
-const VALID_FRONTMATTER_KEYS = new Set(["description", "model", "agentsMd", "skills"]);
+const VALID_FRONTMATTER_KEYS = new Set(["description", "model", "thinkingLevel", "agentsMd", "skills"]);
 
 export interface AgentDiscoveryResult {
   agents: MarkdownAgent[];
@@ -111,6 +112,13 @@ export function parseMarkdownAgent(content: string, options: ParseMarkdownAgentO
   const rawModel = fields.get("model");
   const model = rawModel === undefined ? undefined : rawModel || fail("model must be non-empty");
 
+  const rawThinkingLevel = fields.get("thinkingLevel");
+  const thinkingLevel = rawThinkingLevel === undefined
+    ? undefined
+    : (THINKING_LEVELS as readonly string[]).includes(rawThinkingLevel)
+      ? rawThinkingLevel
+      : fail(`thinkingLevel must be one of: ${THINKING_LEVELS.join(", ")}`);
+
   const rawAgentsMd = fields.get("agentsMd") ?? "none";
   const agentsMd: AgentResourceMode = rawAgentsMd === "none" ? "none" : rawAgentsMd === "auto" ? "auto" : fail("agentsMd must be 'none' or 'auto'");
 
@@ -125,6 +133,7 @@ export function parseMarkdownAgent(content: string, options: ParseMarkdownAgentO
     filePath: options.filePath,
     body,
     ...(model === undefined ? {} : { model }),
+    ...(thinkingLevel === undefined ? {} : { thinkingLevel }),
     agentsMd,
     skills,
   };

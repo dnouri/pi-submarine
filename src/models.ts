@@ -1,4 +1,4 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 type SubagentModelRegistry = Pick<ModelRegistry, "getAll" | "hasConfiguredAuth">;
@@ -62,6 +62,24 @@ export function resolveSubagentModel(
   throw new Error(
     `Subagent model '${reference}' is ambiguous. Use a provider/model ID: ${formatCandidates(authenticatedMatches)}.`,
   );
+}
+
+export function resolveSubagentThinkingLevel(
+  rawLevel: string | undefined,
+  model: Model<Api> | undefined,
+): string | undefined {
+  if (rawLevel === undefined) return undefined;
+
+  if (model !== undefined) {
+    const supportedLevels = getSupportedThinkingLevels(model);
+    if (!supportedLevels.includes(rawLevel as ModelThinkingLevel)) {
+      throw new Error(
+        `Subagent thinking level '${rawLevel}' is not supported by model '${model.provider}/${model.id}'. Supported levels: ${supportedLevels.join(", ")}.`,
+      );
+    }
+  }
+
+  return rawLevel;
 }
 
 function requireSingleAuthenticatedModel(

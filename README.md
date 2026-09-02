@@ -12,10 +12,11 @@ run metadata, the child session ID, and the child's final answer.
 
 - Fresh child sessions for isolated work, or forked child sessions
   when the child should inherit the current conversation branch.
-- Named agents defined by simple markdown files with four frontmatter
-  knobs: `description`, `model`, `agentsMd`, and `skills`.
-- Per-agent model defaults with an optional model override on each
-  `subagent` call.
+- Named agents defined by simple markdown files with five frontmatter
+  knobs: `description`, `model`, `thinkingLevel`, `agentsMd`, and
+  `skills`.
+- Per-agent model and thinking-level defaults with optional model and
+  thinking-level overrides on each `subagent` call.
 - Agent discovery for user-level and project-level markdown agents,
   including `subagent_list` for showing what is visible from a cwd.
 - Runtime status updates that report activity, turn counts, nested
@@ -40,7 +41,7 @@ workflow engine.
 The extension registers three tools:
 
 ```ts
-subagent({ agent?, task, model?, context?, cwd? })
+subagent({ agent?, task, model?, thinkingLevel?, context?, cwd? })
 subagent_resume({ sessionId, message })
 subagent_list({ cwd? })
 ```
@@ -67,7 +68,7 @@ to the parent turn; include child-readable image paths in `task`.
 Use `context: "fork"` only when the child should inherit a copy of the
 current conversation, including images already present on that branch.
 
-### `subagent({ agent?, task, model?, context?, cwd? })`
+### `subagent({ agent?, task, model?, thinkingLevel?, context?, cwd? })`
 
 Runs one focused task in a child Pi session and returns compact session metadata plus the child's final answer.
 
@@ -81,6 +82,9 @@ Arguments:
 - `model` is optional. Pass a model ID such as `"glm-5v-turbo"` or a
   canonical `provider/model-id` reference. It overrides the named
   agent's frontmatter model for this call.
+- `thinkingLevel` is optional. Pass one of Pi's thinking levels
+  (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). It
+  overrides the named agent's frontmatter level for this call.
 - `context` is optional and defaults to `"fresh"`. Use `"fresh"` for a
   new child session. Use `"fork"` only when the child must inherit the
   current conversation branch.
@@ -97,6 +101,11 @@ prefers a matching model from the parent's provider, then the only
 authenticated match; otherwise it asks for a canonical reference. If
 neither the call nor the agent chooses a model, fresh runs inherit the
 parent model and fork runs restore the model from the copied branch.
+An explicit thinking level must be supported by the resolved model:
+if it is not, the run fails before child artifacts are created and the
+error lists the supported levels rather than silently clamping. When
+no level is requested, fresh runs use Pi's default for the model and
+fork runs restore the level recorded on the copied branch.
 
 Fresh runs create a new child session below the current root session's
 `.subagents/` directory; nested subagents share that directory. The
@@ -183,6 +192,7 @@ example, create `.pi/agents/vision.md`:
 ---
 description: Reads screenshots, diagrams, and other images.
 model: glm-5v-turbo
+thinkingLevel: low
 agentsMd: auto
 skills: none
 ---
@@ -210,7 +220,10 @@ child's project context.
 
 Agent files use the small frontmatter block shown above, not YAML.
 `description` is required. `model` is optional and uses the same model
-reference rules as the call-level argument. `agentsMd` is optional and
+reference rules as the call-level argument. `thinkingLevel` is
+optional and may be one of `off`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, or `max`; it uses the same call-level override and validation
+rules as `model`. `agentsMd` is optional and
 may be `none` or `auto`; it defaults to `none`. `skills` is optional
 and may be `auto`, `none`, or a comma-separated list of skill names;
 it defaults to `auto`. Unknown keys, blank frontmatter lines,
@@ -230,9 +243,10 @@ context-file loading and `skills` controls skill loading; the agent
 body stays in the user prompt envelope rather than the child system
 prompt. Fork runs ignore those frontmatter resource controls but use
 the same user prompt envelope for omitted and named agents. A
-frontmatter model applies to both fresh and forked initial runs.
-Resuming restores the model recorded in the child session rather than
-reapplying the current agent-file default.
+frontmatter model or thinking level applies to both fresh and forked
+initial runs. Resuming restores the model and thinking level recorded
+in the child session rather than reapplying the current agent-file
+defaults.
 
 ## Artifacts and progress
 
@@ -312,6 +326,9 @@ is required for correctness.
   prompted. If a model is unavailable or unauthenticated, or Pi
   reports that it would fall back, the run fails instead of silently
   using a substitute.
+- Requested thinking levels are validated against the resolved model
+  before child artifacts are created. Unsupported levels fail with the
+  supported list instead of silently clamping to a neighboring level.
 - `pi-submarine`'s wrapper text does not add session-file paths,
   activity-log paths, stack traces, child transcripts, or the Markdown
   activity log to model-visible success, interruption, or recovery

@@ -39,6 +39,18 @@ describe("subagent prompt-resource profiles", () => {
     expect(options.appendSystemPromptOverride).toBeUndefined();
   });
 
+  it("carries a named agent's thinkingLevel through the profile", () => {
+    const profile = namedSubagentProfile({ ...namedAgent, thinkingLevel: "low" });
+
+    expect(profile.thinkingLevel).toBe("low");
+  });
+
+  it("omits thinkingLevel when the agent does not set one", () => {
+    const profile = namedSubagentProfile(namedAgent);
+
+    expect("thinkingLevel" in profile).toBe(false);
+  });
+
   it("leaves normal context-file discovery enabled for agentsMd auto", () => {
     const profile = namedSubagentProfile({ ...namedAgent, agentsMd: "auto", skills: "auto" });
     const options = buildFreshResourceLoaderOptions(profile, { cwd: "/repo", agentDir: "/agent" });

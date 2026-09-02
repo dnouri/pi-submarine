@@ -5,10 +5,14 @@ export const OMITTED_AGENT_LABEL = "subagent";
 
 export type SubagentContextMode = "fresh" | "fork";
 
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevelValue = (typeof THINKING_LEVELS)[number];
+
 export interface SubagentParams {
   agent?: string;
   task: string;
   model?: string;
+  thinkingLevel?: string;
   context?: SubagentContextMode;
   cwd?: string;
 }
@@ -38,6 +42,7 @@ export interface MarkdownAgent {
   filePath: string;
   body: string;
   model?: string;
+  thinkingLevel?: string;
   agentsMd: AgentResourceMode;
   skills: SkillResourceMode;
 }
