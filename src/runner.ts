@@ -20,7 +20,7 @@ import { MissingMarkdownAgentError, resolveMarkdownAgent } from "./agents.js";
 import { cloneRunView, createActivityState, createInitialRunView, reduceActivityEvent } from "./activity.js";
 import { QueuedActivityLogWriter, appendActivityLogFinished, appendActivityLogStarted, ensureActivityLogHeader, type DegradedActivityLogOptions } from "./activity-log.js";
 import { appendManifestRecord, findLatestEpisodeStartedRecordBySessionFile, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
-import { resolveRecordedSubagentModel, resolveSubagentModel } from "./models.js";
+import { resolveRecordedSubagentModel, resolveSubagentModel, resolveSubagentThinkingLevel } from "./models.js";
 import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult } from "./render.js";
 import { assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
 import { buildSubagentPromptEnvelope } from "./tool-prompts.js";
@@ -38,6 +38,7 @@ export interface SubagentPromptProfile {
   agentFile?: string;
   agentBody?: string;
   model?: string;
+  thinkingLevel?: string;
   agentsMd: "none" | "auto";
   skills: MarkdownAgent["skills"];
 }
@@ -74,6 +75,7 @@ interface BaseRunPlan {
   resourceLoader: ResourceLoader;
   userPrompt: string;
   model: Model<Api> | undefined;
+  thinkingLevel: string | undefined;
 }
 
 interface FreshRunPlan extends BaseRunPlan {
@@ -88,7 +90,7 @@ interface ForkRunPlan extends BaseRunPlan {
 
 type RunPlan = FreshRunPlan | ForkRunPlan;
 
-type ChildSessionPlan = Pick<BaseRunPlan, "effectiveCwd" | "agentDir" | "settingsManager" | "resourceLoader" | "model">;
+type ChildSessionPlan = Pick<BaseRunPlan, "effectiveCwd" | "agentDir" | "settingsManager" | "resourceLoader" | "model" | "thinkingLevel">;
 
 interface ResumeRunPlan extends ChildSessionPlan {
   profile: SubagentPromptProfile;
@@ -146,6 +148,7 @@ export function namedSubagentProfile(agent: MarkdownAgent): SubagentPromptProfil
     agentFile: agent.filePath,
     agentBody: agent.body,
     ...(agent.model === undefined ? {} : { model: agent.model }),
+    ...(agent.thinkingLevel === undefined ? {} : { thinkingLevel: agent.thinkingLevel }),
     agentsMd: agent.agentsMd,
     skills: agent.skills,
   };
@@ -470,6 +473,7 @@ async function prepareResumeRun(
     resourceLoader,
     userPrompt: params.message,
     model,
+    thinkingLevel: undefined,
   };
 }
 
@@ -495,6 +499,7 @@ async function prepareFreshRun(
   const profile = await resolveAgentProfile(params, effectiveCwd, profileResolutionOptions(userAgentsDir, params, ctx));
   const parentModel = ctx.model;
   const model = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, parentModel?.provider) ?? parentModel;
+  const thinkingLevel = resolveSubagentThinkingLevel(params.thinkingLevel ?? profile.thinkingLevel, model);
   const { root, manifestPath, parentDepth, parentPath } = await resolveArtifactRoot(parentSessionFile);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
@@ -515,6 +520,7 @@ async function prepareFreshRun(
     resourceLoader,
     userPrompt: buildInitialSubagentPrompt(profile, "fresh", params.task, parentDepth),
     model,
+    thinkingLevel,
   };
 }
 
@@ -546,6 +552,7 @@ async function prepareForkRun(
   const profile = await resolveAgentProfile(params, effectiveCwd, { userAgentsDir });
   const parentModel = ctx.model;
   const model = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, parentModel?.provider);
+  const thinkingLevel = resolveSubagentThinkingLevel(params.thinkingLevel ?? profile.thinkingLevel, model);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
@@ -565,6 +572,7 @@ async function prepareForkRun(
     resourceLoader,
     userPrompt: buildInitialSubagentPrompt(profile, "fork", params.task, parentDepth),
     model,
+    thinkingLevel,
     currentLeafId,
     sourceSessionManager,
   };
@@ -820,6 +828,7 @@ async function createChildSession(
     agentDir: plan.agentDir,
     modelRegistry: ctx.modelRegistry,
     ...(plan.model === undefined ? {} : { model: plan.model }),
+    ...(plan.thinkingLevel === undefined ? {} : { thinkingLevel: plan.thinkingLevel as NonNullable<CreateAgentSessionOptions["thinkingLevel"]> }),
     settingsManager: plan.settingsManager,
     resourceLoader: plan.resourceLoader,
     sessionManager: childSessionManager,

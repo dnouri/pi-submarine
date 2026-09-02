@@ -49,6 +49,7 @@ describe("pi-submarine extension registration", () => {
         agent: { type: "string" },
         task: { type: "string", minLength: 1 },
         model: { type: "string", minLength: 1 },
+        thinkingLevel: { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
         context: { type: "string", enum: ["fresh", "fork"], default: "fresh" },
         cwd: { type: "string" },
       },
@@ -92,12 +93,14 @@ describe("pi-submarine extension registration", () => {
     expect(guidelines).toContain("Role text inside `task` does not select an agent");
     expect(guidelines).toContain("Usually omit `cwd`");
     expect(guidelines).toContain("call-level `model` overrides");
+    expect(guidelines).toContain("A call-level `thinkingLevel` overrides a named agent's frontmatter `thinkingLevel`");
 
     expect(subagent?.parameters).toMatchObject({
       properties: {
         agent: { description: expect.stringContaining("project agents from the effective `cwd`") },
         task: { description: expect.stringContaining("does not see the parent conversation") },
         model: { description: expect.stringContaining("frontmatter default") },
+        thinkingLevel: { description: expect.stringContaining("thinking level for this call") },
         context: { description: expect.stringContaining("Defaults to `fresh`") },
         cwd: { description: expect.stringContaining("Omit to inherit the caller cwd") },
       },

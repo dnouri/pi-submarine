@@ -27,13 +27,20 @@ describe("strict markdown agent parsing", () => {
     });
   });
 
-  it("parses optional model, agentsMd, and skills controls", () => {
-    const agent = parse(validAgent("description: Researches\nmodel: openrouter/z-ai/glm-5v-turbo:free\nagentsMd: auto\nskills: none"));
+  it("parses optional model, agentsMd, skills, and thinkingLevel controls", () => {
+    const agent = parse(validAgent("description: Researches\nmodel: openrouter/z-ai/glm-5v-turbo:free\nthinkingLevel: high\nagentsMd: auto\nskills: none"));
 
     expect(agent.model).toBe("openrouter/z-ai/glm-5v-turbo:free");
+    expect(agent.thinkingLevel).toBe("high");
     expect(agent.agentsMd).toBe("auto");
     expect(agent.skills).toBe("none");
     expect(parse(validAgent("description: Researches\nskills: research, audit")).skills).toEqual({ names: ["research", "audit"] });
+  });
+
+  it("omits thinkingLevel when the key is absent", () => {
+    const agent = parse(validAgent());
+
+    expect("thinkingLevel" in agent).toBe(false);
   });
 
   it("splits frontmatter values after the first colon only", () => {
@@ -61,6 +68,8 @@ describe("strict markdown agent parsing", () => {
     ["missing colon", "---\ndescription Reviews\n---\nBody", "must be in key: value form"],
     ["empty description", "---\ndescription:   \n---\nBody", "description is required"],
     ["empty model", "---\ndescription: Reviews\nmodel:   \n---\nBody", "model must be non-empty"],
+    ["invalid thinkingLevel", "---\ndescription: Reviews\nthinkingLevel: turbo\n---\nBody", "thinkingLevel must be one of: off, minimal, low, medium, high, xhigh, max"],
+    ["duplicate thinkingLevel key", "---\ndescription: Reviews\nthinkingLevel: high\nthinkingLevel: low\n---\nBody", "duplicate key 'thinkingLevel'"],
     ["quoted double value", "---\ndescription: \"Reviews\"\n---\nBody", "quoted values are invalid"],
     ["quoted single value", "---\ndescription: 'Reviews'\n---\nBody", "quoted values are invalid"],
     ["invalid agentsMd", "---\ndescription: Reviews\nagentsMd: yes\n---\nBody", "agentsMd must be 'none' or 'auto'"],
