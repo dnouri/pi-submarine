@@ -2,6 +2,7 @@ export const SUBAGENT_TOOL_NAME = "subagent";
 export const SUBAGENT_RESUME_TOOL_NAME = "subagent_resume";
 export const SUBAGENT_LIST_TOOL_NAME = "subagent_list";
 export const OMITTED_AGENT_LABEL = "subagent";
+export const DEFAULT_AGENT_ALIAS = "default";
 
 export type SubagentContextMode = "fresh" | "fork";
 

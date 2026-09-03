@@ -78,7 +78,9 @@ Arguments:
 - `agent` is optional. Omit it for the generic default mode. Pass a
   filename stem such as `"vision"` to use a markdown agent named
   `vision.md`. A literal `agent: "subagent"` means the markdown file
-  `subagent.md`; omission is the only way to request the default mode.
+  `subagent.md`; omission is the only way to request the default mode,
+  although a literal `agent: "default"` is tolerated and resolves to
+  the default mode whenever no `default.md` is visible.
 - `model` is optional. Pass a model ID such as `"glm-5v-turbo"` or a
   canonical `provider/model-id` reference. It overrides the named
   agent's frontmatter model for this call.
