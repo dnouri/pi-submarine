@@ -24,7 +24,7 @@ import { resolveRecordedSubagentModel, resolveSubagentModel, resolveSubagentThin
 import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult } from "./render.js";
 import { assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
 import { buildSubagentPromptEnvelope } from "./tool-prompts.js";
-import { OMITTED_AGENT_LABEL, type AgentSelection, type MarkdownAgent, type SubagentContextMode, type SubagentContextUsage, type SubagentParams, type SubagentResumeParams, type SubagentToolDetails, type TextToolResult } from "./types.js";
+import { DEFAULT_AGENT_ALIAS, OMITTED_AGENT_LABEL, type AgentSelection, type MarkdownAgent, type SubagentContextMode, type SubagentContextUsage, type SubagentParams, type SubagentResumeParams, type SubagentToolDetails, type TextToolResult } from "./types.js";
 
 type DefaultResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
 type ProjectTrustedSettingsManager = ReturnType<typeof SettingsManager.create>;
@@ -277,7 +277,8 @@ export async function runSubagent(
       else await failRun(plan.manifestPath, startedRun, message, deps, onUpdate, activityLogWriter);
     }
     if (run) forgetRuntimeEpisode(run.episodeId);
-    const selection = run ? agentSelectionFromRun(run, requestedSelection) : requestedSelection;
+    const fallbackSelection = plan?.profile.selection ?? requestedSelection;
+    const selection = run ? agentSelectionFromRun(run, fallbackSelection) : fallbackSelection;
     if (interrupted && run) throw new Error(renderSubagentInterrupted(selection, run.sessionId));
     if (run) throw new Error(renderSubagentRecoverableError(selection, run.sessionId, message));
     throw new Error(`${errorHeading(selection)}\n\n${message}`);
@@ -594,6 +595,7 @@ async function resolveAgentProfile(params: SubagentParams, cwd: string, options:
   try {
     return namedSubagentProfile(await resolveMarkdownAgent(params.agent, { cwd, userAgentsDir: options.userAgentsDir }));
   } catch (error: unknown) {
+    if (isMissingDefaultAgentAlias(error)) return omittedSubagentProfile();
     if (!(error instanceof MissingMarkdownAgentError) || !options.callerCwdHint) throw error;
     if (path.resolve(cwd) === options.callerCwdHint) throw error;
 
@@ -621,6 +623,12 @@ async function resolveResumeProfile(record: StartedManifestRecord, cwd: string, 
     agentsMd: "none",
     skills: "auto",
   };
+}
+
+// Confused callers pass the reserved name "default" for the omitted mode; when no
+// default.md is visible, that request means the omitted profile, not a missing agent.
+function isMissingDefaultAgentAlias(error: unknown): boolean {
+  return error instanceof MissingMarkdownAgentError && error.agentName === DEFAULT_AGENT_ALIAS;
 }
 
 function formatExplicitCwdMissingAgentHint(error: MissingMarkdownAgentError, fallbackAgent: MarkdownAgent): string {

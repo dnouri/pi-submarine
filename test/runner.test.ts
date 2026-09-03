@@ -1481,6 +1481,67 @@ describe("subagent runner", () => {
     expect(manifest[0]).toMatchObject({ type: "started", agent: "subagent", agentFile: agentPath });
   });
 
+  it("treats agent 'default' as the omitted mode when no default.md exists", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const { deps, fakeSession } = fakeDeps(root);
+
+    const result = await runSubagent({ agent: "default", task: "answer briefly" }, undefined, undefined, fakeContext(cwd, parentSession), { deps });
+
+    expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fresh", "answer briefly"));
+    expectSubagentResult(result);
+    expect(result.details.run).toMatchObject({ agent: "subagent" });
+    const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
+    expect(manifest[0]).toMatchObject({ type: "started", agent: "subagent", agentFile: null });
+  });
+
+  it("matches the default-mode fallback after trimming surrounding whitespace", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const { deps, fakeSession } = fakeDeps(root);
+
+    const result = await runSubagent({ agent: " default ", task: "answer briefly" }, undefined, undefined, fakeContext(cwd, parentSession), { deps });
+
+    expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fresh", "answer briefly"));
+    expectSubagentResult(result);
+  });
+
+  it("uses a real default.md agent instead of the omitted-mode fallback", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    const agentPath = path.join(cwd, ".pi", "agents", "default.md");
+    await mkdir(path.dirname(agentPath), { recursive: true });
+    await writeFile(agentPath, "---\ndescription: Literal default agent\n---\n\nNamed body.\n", "utf8");
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const { deps, fakeSession } = fakeDeps(root);
+
+    const result = await runSubagent({ agent: "default", task: "use the named file" }, undefined, undefined, fakeContext(cwd, parentSession), { deps });
+
+    expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fresh", "use the named file", { agentName: "default", agentBody: "Named body." }));
+    expectSubagentResult(result, "## Subagent default result");
+    const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
+    expect(manifest[0]).toMatchObject({ type: "started", agent: "default", agentFile: agentPath });
+  });
+
+  it("fails loudly on an invalid default.md instead of falling back", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    const agentPath = path.join(cwd, ".pi", "agents", "default.md");
+    await mkdir(path.dirname(agentPath), { recursive: true });
+    await writeFile(agentPath, "---\ndescription:\n---\n\nBody.\n", "utf8");
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    const { deps } = fakeDeps(root);
+
+    await expect(runSubagent({ agent: "default", task: "anything" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }))
+      .rejects.toThrow("Invalid agent file");
+
+    expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+  });
+
   it("treats a final assistant stopReason aborted as a failed subagent run", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
