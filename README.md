@@ -8,6 +8,14 @@ run metadata, the child session ID, and the child's final answer.
   <img src="https://raw.githubusercontent.com/dnouri/pi-submarine/0.2.0/media/pi-submarine.gif" alt="pi-submarine animation" width="480">
 </p>
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/dnouri/pi-submarine/main/media/overview.png" alt="pi-submarine delegation overview: a parent session issues subagent() calls that run as parallel child sessions, each returning a compact result">
+</p>
+
+The diagram shows the delegation model: each `subagent()` call runs one
+focused child Pi session, calls in the same turn run in parallel, and each
+call returns a compact result without the child transcript.
+
 ## Features
 
 - Fresh child sessions for isolated work, or forked child sessions
