@@ -5,7 +5,7 @@ Pi sessions, also known as *subagents*. The parent receives compact
 run metadata, the child session ID, and the child's final answer.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/dnouri/pi-submarine/0.2.0/media/pi-submarine.gif" alt="pi-submarine animation" width="480">
+  <img src="https://raw.githubusercontent.com/dnouri/pi-submarine/0.3.0/media/pi-submarine.gif" alt="pi-submarine animation" width="480">
 </p>
 
 <p align="center">
