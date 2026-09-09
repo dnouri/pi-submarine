@@ -168,13 +168,16 @@ export function buildFreshResourceLoaderOptions(profile: SubagentPromptProfile, 
   } else if (typeof profile.skills === "object") {
     const requestedNames = profile.skills.names;
     loaderOptions.skillsOverride = (base) => {
-      const visibleByName = new Map(base.skills.filter((skill) => !skill.disableModelInvocation).map((skill) => [skill.name, skill]));
-      const missing = requestedNames.filter((name) => !visibleByName.has(name));
+      const skillsByName = new Map(base.skills.map((skill) => [skill.name, skill]));
+      const missing = requestedNames.filter((name) => !skillsByName.has(name));
       if (missing.length > 0) {
         throw new Error(`Unavailable skill(s) for subagent '${profile.agentName}': ${missing.join(", ")}`);
       }
       return {
-        skills: requestedNames.map((name) => visibleByName.get(name)).filter((skill): skill is Skill => skill !== undefined),
+        skills: requestedNames
+          .map((name) => skillsByName.get(name))
+          .filter((skill): skill is Skill => skill !== undefined)
+          .map((skill) => skill.disableModelInvocation ? { ...skill, disableModelInvocation: false } : skill),
         diagnostics: base.diagnostics,
       };
     };
