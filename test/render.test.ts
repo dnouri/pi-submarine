@@ -57,12 +57,10 @@ describe("subagent display helpers", () => {
       "",
       "Subagent session ID: session-123",
       "",
-      "To continue this exact child session, call `subagent_resume` with this session ID and a message.",
+      "If the interrupted task should continue, call `subagent_resume` with this session ID and a message. Otherwise start a new `subagent`.",
       "",
-      "Examples for `message`:",
-      "- You were interrupted. Continue work exactly where you left off.",
-      "- Good. Now also check the edge cases you mentioned and update your recommendation.",
-      "- Please summarize what you did so far for a handoff so we can continue later.",
+      "Example for `message`:",
+      "- You were interrupted. Continue the original task from where you left off.",
     ].join("\n"));
     expect(text).not.toMatch(/\.jsonl|\.subagents|Activity log|stack|runId|episodeId/i);
   });
@@ -78,7 +76,7 @@ describe("subagent display helpers", () => {
       "",
       "Subagent session ID: session-123",
       "",
-      "This child session may be resumable. To continue this exact child session, call `subagent_resume` with this session ID and a message.",
+      "This child session may be recoverable. If the same task should continue after a transient failure, call `subagent_resume` with this session ID and a message. Otherwise start a new `subagent`.",
     ].join("\n"));
     expect(text).not.toContain("interrupted");
     expect(text).not.toMatch(/\.jsonl|\.subagents|Activity log|stack|runId|episodeId/i);

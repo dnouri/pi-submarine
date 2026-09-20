@@ -77,7 +77,7 @@ describe("pi-submarine extension registration", () => {
   it("presents the subagent contract in model-facing metadata", () => {
     const [subagent, subagentResume, subagentList] = registeredToolsFromFactory();
 
-    expect(subagent?.description).toContain("Delegate one focused task");
+    expect(subagent?.description).toContain("Delegate one focused task to a new subagent");
     expect(subagent?.description).toContain("compact session metadata");
     expect(subagent?.promptSnippet).toContain("synchronous subagent");
     const guidelines = subagent?.promptGuidelines?.join("\n") ?? "";
@@ -94,6 +94,7 @@ describe("pi-submarine extension registration", () => {
     expect(guidelines).toContain("Usually omit `cwd`");
     expect(guidelines).toContain("call-level `model` overrides");
     expect(guidelines).toContain("A call-level `thinkingLevel` overrides a named agent's frontmatter `thinkingLevel`");
+    expect(guidelines).toContain("Prefer a new `subagent` for follow-up or related work");
 
     expect(subagent?.parameters).toMatchObject({
       properties: {
@@ -106,19 +107,21 @@ describe("pi-submarine extension registration", () => {
       },
     });
     expect(subagentResume?.description).toContain("Continue an existing child Pi session");
-    expect(subagentResume?.description).toContain("session ID");
-    expect(subagentResume?.description).toContain("compact session metadata");
-    expect(subagentResume?.promptSnippet).toContain("Continue an existing subagent child session");
+    expect(subagentResume?.description).toContain("recover an interrupted or failed child");
+    expect(subagentResume?.description).toContain("user explicitly asks to resume that exact child session");
+    expect(subagentResume?.description).toContain("otherwise use a new `subagent`");
+    expect(subagentResume?.promptSnippet).toContain("Recover an interrupted or failed child");
+    expect(subagentResume?.promptSnippet).toContain("explicit request");
     const resumeGuidelines = subagentResume?.promptGuidelines?.join("\n") ?? "";
     expect(resumeGuidelines).toContain("subagent_resume({ sessionId: \"...\", message: \"...\" })");
-    expect(resumeGuidelines).toContain("continuing the same child context");
-    expect(resumeGuidelines).toContain("information only in the parent conversation");
+    expect(resumeGuidelines).toContain("recover an interrupted or failed child when its result includes a session ID");
+    expect(resumeGuidelines).toContain("user explicitly asks to resume that exact child session");
     expect(resumeGuidelines).toContain("`subagent_resume` continues an existing child subagent session");
-    expect(resumeGuidelines).toContain("current parent/root session");
-    expect(resumeGuidelines).toContain("Use `subagent` instead for new work");
+    expect(resumeGuidelines).toContain("does not create a new child context");
+    expect(resumeGuidelines).not.toContain("completed result that needs a follow-up");
     expect(subagentResume?.parameters).toMatchObject({
       properties: {
-        sessionId: { description: expect.stringContaining("child subagent session ID from an earlier subagent or subagent_resume result") },
+        sessionId: { description: expect.stringContaining("from an earlier `subagent` or `subagent_resume` result") },
         message: { description: expect.stringContaining("existing child conversation") },
       },
     });

@@ -1,7 +1,7 @@
 export const TOOL_PROMPTS = {
   subagent: {
     label: "Subagent",
-    description: "Delegate one focused task to a subagent, and return compact session metadata plus that child's final answer.",
+    description: "Delegate one focused task to a new subagent, and return compact session metadata plus that child's final answer.",
     promptSnippet: "Run one synchronous subagent to delegate a focused task",
     parameterDescriptions: {
       agent: "Markdown agent name, i.e. its filename stem. Omit for default mode; project agents from the effective `cwd` override same-named user-defined agents.",
@@ -20,22 +20,21 @@ export const TOOL_PROMPTS = {
       "Named `agent`s resolve from the effective cwd; project .pi/agents/*.md overrides same-named user agents.",
       "A call-level `model` overrides a named agent's frontmatter model; omit it to use the agent default or the existing fresh/fork model behavior.",
       "A call-level `thinkingLevel` overrides a named agent's frontmatter `thinkingLevel`; omit both to use the fresh/fork default. The level must be supported by the resolved child model.",
+      "Prefer a new `subagent` for follow-up or related work, even when an earlier child already knows the topic.",
     ],
   },
   subagentResume: {
     label: "Resume subagent",
-    description: "Continue an existing child Pi session by its subagent session ID and return compact session metadata plus that child's next final answer.",
-    promptSnippet: "Continue an existing subagent child session by session ID",
+    description: "Continue an existing child Pi session by its subagent session ID and return compact session metadata plus that child's next final answer. Use `subagent_resume` to recover an interrupted or failed child when its result includes a session ID, or when the user explicitly asks to resume that exact child session; otherwise use a new `subagent`.",
+    promptSnippet: "Recover an interrupted or failed child, or honor an explicit request to resume one by session ID",
     parameterDescriptions: {
-      sessionId: "The child subagent session ID from an earlier subagent or subagent_resume result, or from recovery text in the current parent/root session.",
+      sessionId: "The child subagent session ID from an earlier `subagent` or `subagent_resume` result, including recovery text after an interrupted or failed run.",
       message: "Message to append to the existing child conversation before waiting for its next answer.",
     },
     promptGuidelines: [
       "Common call form: subagent_resume({ sessionId: \"...\", message: \"...\" }).",
-      "Use `subagent_resume` when continuing the same child context is better than starting a new `subagent`, including after interruption, failure, or a completed result that needs a follow-up.",
-      "If the follow-up depends on information only in the parent conversation, include that information in message.",
-      "`subagent_resume` continues an existing child subagent session in the current parent/root session; it appends message to that same child conversation instead of starting over.",
-      "Use `subagent` instead for new work, independent investigations, or a fresh child context.",
+      "Use `subagent_resume` to recover an interrupted or failed child when its result includes a session ID, or when the user explicitly asks to resume that exact child session.",
+      "`subagent_resume` continues an existing child subagent session in the current parent/root session; it appends `message` to that conversation and does not create a new child context.",
     ],
   },
   subagentList: {
