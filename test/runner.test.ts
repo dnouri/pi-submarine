@@ -101,10 +101,12 @@ function expectInterruptedCapsule(text: string, sessionId: string, heading = "##
   expect(text).toContain(heading);
   expect(text).toContain("No final answer was produced.");
   expect(text).toContain(`Subagent session ID: ${sessionId}`);
+  expect(text).toContain("If the interrupted task should continue");
   expect(text).toContain("call `subagent_resume` with this session ID");
-  expect(text).toContain("You were interrupted. Continue work exactly where you left off.");
-  expect(text).toContain("Good. Now also check the edge cases you mentioned and update your recommendation.");
-  expect(text).toContain("Please summarize what you did so far for a handoff so we can continue later.");
+  expect(text).toContain("Otherwise start a new `subagent`.");
+  expect(text).toContain("You were interrupted. Continue the original task from where you left off.");
+  expect(text).not.toContain("Good. Now also check the edge cases");
+  expect(text).not.toContain("handoff so we can continue later");
   expectNoModelVisiblePaths(text);
 }
 
@@ -112,10 +114,12 @@ function expectRecoverableFailure(text: string, sessionId: string, originalMessa
   expect(text).toContain(heading);
   expect(text).toContain(originalMessage);
   expect(text).toContain(`Subagent session ID: ${sessionId}`);
-  expect(text).toContain("This child session may be resumable.");
+  expect(text).toContain("This child session may be recoverable.");
+  expect(text).toContain("same task should continue after a transient failure");
   expect(text).toContain("call `subagent_resume` with this session ID and a message.");
+  expect(text).toContain("Otherwise start a new `subagent`.");
   expect(text).not.toContain("No final answer was produced.");
-  expect(text).not.toContain("Examples for `message`:");
+  expect(text).not.toContain("Example for `message`:");
   expectNoModelVisiblePaths(text);
 }
 

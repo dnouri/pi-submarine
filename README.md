@@ -35,9 +35,9 @@ call returns a compact result without the child transcript.
   delegation.
 - Support for parallel subagents through Pi's native multi tool
   calling.
-- Resumable child sessions through `subagent_resume` when continuing
-  the same child context is useful after an abort, failure, or
-  deliberate follow-up.
+- Resumable child sessions through `subagent_resume` for recovery
+  after an interruption or failure, or when the user explicitly asks
+  to resume that exact child session.
 
 The package is deliberately narrow: one `subagent` call runs one
 foreground child Pi session and waits for it.  It does not provide
@@ -136,7 +136,10 @@ Subagent session ID: 019...
 <child assistant answer>
 ```
 
-Use the `Subagent session ID` for later continuation.
+The `Subagent session ID` identifies the child for recovery or an
+explicit request to resume that exact child session. Prefer a new
+`subagent` for follow-up or related work, even when an earlier child
+already knows the topic.
 
 ### `subagent_resume({ sessionId, message })`
 
@@ -149,15 +152,17 @@ returns the same compact result shape.
 Arguments:
 
 - `sessionId` is required. Use the child Pi session ID from an earlier
-  `subagent` or `subagent_resume` result, or from recovery text after
+  `subagent` or `subagent_resume` result, including recovery text after
   an interrupted or failed child run.
 - `message` is required. It is appended to that same child
   conversation.
 
 Resume lookup is scoped to the current parent/root manifest. It does
-not search globally, fork, or copy the child session. Use `subagent`
-for unrelated work; use `subagent_resume` when continuing the same
-child context is clearer than starting over.
+not search globally, fork, or copy the child session. Prefer a new
+`subagent` for follow-up or related work, even when an earlier child
+already knows the topic. Use `subagent_resume` to recover an
+interrupted or failed child when its result includes a session ID, or
+when the user explicitly asks to resume that exact child session.
 
 For original fresh runs, resume reloads current prompt resources from
 the recorded cwd, including named-agent `agentsMd` and `skills`
@@ -328,13 +333,13 @@ is required for correctness.
   tool results.
 - Parent abort signals are forwarded to the child session. If a child
   session already exists, the durable status is `aborted` and the
-  model-visible error text includes the `Subagent session ID` and
-  examples for `subagent_resume`.
+  model-visible error text includes the `Subagent session ID` and a
+  recovery example for `subagent_resume`.
 - Non-abort child failures after a trusted child session exists stay
-  durable `failed`; the error text includes the public session ID only
-  as a cautious “may be resumable” handle. Preflight and lookup
-  failures before a trusted child session exists do not invent a
-  continuation handle.
+  durable `failed`; the error text includes the public session ID with
+  cautious “may be recoverable” wording. Preflight and lookup failures
+  before a trusted child session exists do not invent a continuation
+  handle.
 - Requested and recorded models are checked before the child is
   prompted. If a model is unavailable or unauthenticated, or Pi
   reports that it would fall back, the run fails instead of silently
