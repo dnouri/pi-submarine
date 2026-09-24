@@ -39,6 +39,12 @@ describe("subagent thinking-level resolution", () => {
     expect(resolveSubagentThinkingLevel("high", undefined)).toBe("high");
   });
 
+  it("rejects max on SDK 0.79.1 rather than clamping even when a model map advertises it", () => {
+    expect(() => resolveSubagentThinkingLevel("max", reasoningModel)).toThrow(
+      "Subagent thinking level 'max' is not supported by model 'zai/glm-5.3'. Supported levels: low, high.",
+    );
+  });
+
   it("rejects an unsupported level with the supported list", () => {
     const plainModel = model("zai", "glm-5.3-flash");
 

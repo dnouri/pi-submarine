@@ -111,6 +111,7 @@ export function parseMarkdownAgent(content: string, options: ParseMarkdownAgentO
 
   const rawModel = fields.get("model");
   const model = rawModel === undefined ? undefined : rawModel || fail("model must be non-empty");
+  if (model !== undefined) parseMarkdownModelChain(model, fail);
 
   const rawThinkingLevel = fields.get("thinkingLevel");
   const thinkingLevel = rawThinkingLevel === undefined
@@ -137,6 +138,25 @@ export function parseMarkdownAgent(content: string, options: ParseMarkdownAgentO
     agentsMd,
     skills,
   };
+}
+
+export interface MarkdownModelCandidate {
+  reference: string;
+  level?: string;
+}
+
+/** Frontmatter is a small key/value format, not YAML. Model references may contain slashes and colons. */
+export function parseMarkdownModelChain(raw: string, fail: (reason: string) => never = (reason) => { throw new Error(reason); }): MarkdownModelCandidate[] {
+  const parts = raw.split(",");
+  if (parts.length > 2) fail("model chain must contain at most two candidates");
+  return parts.map((part) => {
+    const [reference, level, extra] = part.trim().split("@");
+    if (!reference?.trim() || extra !== undefined) fail("model chain contains an empty or invalid candidate");
+    if (level !== undefined && !(THINKING_LEVELS as readonly string[]).includes(level.trim())) {
+      fail(`model candidate thinking level '${level?.trim()}' must be one of: ${THINKING_LEVELS.join(", ")}`);
+    }
+    return { reference: reference.trim(), ...(level === undefined ? {} : { level: level.trim() }) };
+  });
 }
 
 export async function parseMarkdownAgentFile(filePath: string, options: ParseMarkdownAgentFileOptions): Promise<MarkdownAgent> {
