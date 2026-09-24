@@ -23,8 +23,8 @@ call returns a compact result without the child transcript.
 - Named agents defined by simple markdown files with five frontmatter
   knobs: `description`, `model`, `thinkingLevel`, `agentsMd`, and
   `skills`.
-- Per-agent model and thinking-level defaults, with optional two-model
-  first-turn fallback and call-level overrides.
+- Per-agent model and thinking-level defaults, with optional first-turn
+  fallback across up to three models and call-level overrides.
 - Agent discovery for user-level and project-level markdown agents,
   including `subagent_list` for showing what is visible from a cwd.
 - Runtime status updates that report activity, turn counts, nested
@@ -239,20 +239,20 @@ child's project context.
 
 Agent files use the small frontmatter block shown above, not YAML.
 `description` is required. `model` is optional and accepts one model
-reference or a comma-separated chain of at most two references, each
+reference or a comma-separated chain of at most three references, each
 optionally suffixed with `@level`. For example:
 
 ```md
 ---
-description: Reviews code
-model: zai/glm-5.3-flash@max,openai-codex/gpt-6-luna@xhigh
+description: Completes bounded development tasks
+model: openai-codex/gpt-6-sol@max,kimi-coding/k3@max,zai/glm-5.3@max
 ---
 
-Review the task and report findings.
+Complete the task and report the result.
 ```
 
-Both models must be in Pi's catalog, authenticated, and support their
-effective thinking levels *before* any child artifacts are created.
+Every candidate must be in Pi's catalog, authenticated, and support its
+effective thinking level *before* any child artifacts are created.
 The precedence for each candidate is call-level `thinkingLevel`, then
 its `@level`, then frontmatter `thinkingLevel`. `thinkingLevel` is
 optional and may be one of `off`, `minimal`, `low`, `medium`, `high`,
@@ -278,15 +278,15 @@ body stays in the user prompt envelope rather than the child system
 prompt. Fork runs ignore those frontmatter resource controls but use
 the same user prompt envelope for omitted and named agents. A
 frontmatter model or thinking level applies to both fresh and forked
-initial runs. A chained agent retries the same initial task on its
-second candidate only when the first provider turn ends with assistant
-`stopReason: "error"` and no assistant success or tool progress occurred.
-Prompt rejections, aborts, later errors, and failures of the second
-candidate are not retried. The retry creates a new AgentSession on a
-clean branch of the *same* child session ID and lifecycle episode: the
-failed branch stays in the JSONL file but is excluded from the active
-conversation. Resuming restores the model and thinking level recorded
-on that active branch rather than reapplying the current agent-file
+initial runs. A chained agent tries the next model only when the current
+model's initial provider turn ends with assistant `stopReason: "error"`
+and no assistant success or tool progress occurred. Prompt rejections,
+aborts, later errors, and failures of the last candidate are not retried.
+Each retry creates a new AgentSession on a clean branch of the *same*
+child session ID and lifecycle episode: failed branches stay in the JSONL
+file but are excluded from the active conversation. Resuming restores the
+model and thinking level recorded on that active branch rather than
+reapplying the current agent-file
 defaults. The available levels are determined by the installed Pi SDK;
 for example, SDK 0.79.1 does not support `max`, so requesting it fails
 validation rather than silently downgrading it.

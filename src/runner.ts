@@ -77,7 +77,7 @@ interface BaseRunPlan {
   userPrompt: string;
   model: Model<Api> | undefined;
   thinkingLevel: string | undefined;
-  fallback?: ModelChoice;
+  fallbacks: ModelChoice[];
 }
 
 interface FreshRunPlan extends BaseRunPlan {
@@ -267,40 +267,43 @@ export async function runSubagent(
 
     const prePromptLeaf = startedRun.childSessionManager.getLeafId();
     let answer: string;
-    try {
-      answer = await promptChildAndExtractAnswer(activeChildSession, startedRun.childSessionManager, plan.userPrompt, abortState,
-        plan.fallback ? () => toolProgress : undefined);
-    } catch (error: unknown) {
-      if (!(error instanceof FirstTurnProviderError) || !plan.fallback) throw error;
-      throwIfInterrupted(signal);
-      // A fresh AgentSession must see the new branch: setModel() would also change
-      // Pi's global default and leave the failed request in the active context.
-      runCleanup("remove subagent abort listener", detachAbortHandler);
-      detachAbortHandler = undefined;
-      runCleanup("unsubscribe subagent activity listener", unsubscribe);
-      unsubscribe = undefined;
-      await closeChildSession(childSession, childExtensionsStarted, "subagent first attempt");
-      childSession = undefined;
-      childExtensionsStarted = false;
-      throwIfInterrupted(signal);
-      if (prePromptLeaf === null) startedRun.childSessionManager.resetLeaf();
-      else startedRun.childSessionManager.branch(prePromptLeaf);
-      startedRun.childSessionManager.appendModelChange(plan.fallback.model.provider, plan.fallback.model.id);
-      if (plan.fallback.thinkingLevel !== undefined) startedRun.childSessionManager.appendThinkingLevelChange(plan.fallback.thinkingLevel);
-      // Disposing the first session invalidates its extension runtime. Reload before
-      // binding another session so extension APIs do not retain a stale context.
-      await plan.resourceLoader.reload();
-      throwIfInterrupted(signal);
-      const createdFallback = await createChildSession({ ...plan, ...plan.fallback }, startedRun.childSessionManager, deps, ctx);
-      childSession = createdFallback.session;
-      throwIfModelFallback(createdFallback.modelFallbackMessage);
-      childExtensionsStarted = true;
-      await bindChildExtensions(childSession);
-      activeChildSession = childSession;
-      abortState = attachAbortHandler(signal, activeChildSession);
-      detachAbortHandler = abortState.detach;
-      unsubscribe = subscribe(activeChildSession);
-      answer = await promptChildAndExtractAnswer(activeChildSession, startedRun.childSessionManager, plan.userPrompt, abortState);
+    for (let attempt = 0; ; attempt++) {
+      const next = plan.fallbacks[attempt];
+      try {
+        answer = await promptChildAndExtractAnswer(activeChildSession, startedRun.childSessionManager, plan.userPrompt, abortState,
+          next ? () => toolProgress : undefined);
+        break;
+      } catch (error: unknown) {
+        if (!(error instanceof FirstTurnProviderError) || !next) throw error;
+        throwIfInterrupted(signal);
+        // Recreate the AgentSession on the pre-prompt branch so failed requests
+        // remain inspectable but do not enter the next model's context.
+        runCleanup("remove subagent abort listener", detachAbortHandler);
+        detachAbortHandler = undefined;
+        runCleanup("unsubscribe subagent activity listener", unsubscribe);
+        unsubscribe = undefined;
+        await closeChildSession(childSession, childExtensionsStarted, "subagent failed attempt");
+        childSession = undefined;
+        childExtensionsStarted = false;
+        throwIfInterrupted(signal);
+        if (prePromptLeaf === null) startedRun.childSessionManager.resetLeaf();
+        else startedRun.childSessionManager.branch(prePromptLeaf);
+        startedRun.childSessionManager.appendModelChange(next.model.provider, next.model.id);
+        if (next.thinkingLevel !== undefined) startedRun.childSessionManager.appendThinkingLevelChange(next.thinkingLevel);
+        // Disposing an AgentSession invalidates its extension runtime.
+        await plan.resourceLoader.reload();
+        throwIfInterrupted(signal);
+        const createdFallback = await createChildSession({ ...plan, ...next }, startedRun.childSessionManager, deps, ctx);
+        childSession = createdFallback.session;
+        throwIfModelFallback(createdFallback.modelFallbackMessage);
+        childExtensionsStarted = true;
+        await bindChildExtensions(childSession);
+        activeChildSession = childSession;
+        abortState = attachAbortHandler(signal, activeChildSession);
+        detachAbortHandler = abortState.detach;
+        toolProgress = false;
+        unsubscribe = subscribe(activeChildSession);
+      }
     }
     refreshContextUsage(run, activeChildSession);
     await activityLogWriter.drain();
@@ -545,7 +548,7 @@ async function prepareFreshRun(
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, profileResolutionOptions(userAgentsDir, params, ctx));
   const parentModel = ctx.model;
-  const { model, thinkingLevel, fallback } = resolveRunModelChoices(params, profile, ctx, parentModel, "fresh");
+  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, parentModel, "fresh");
   const { root, manifestPath, parentDepth, parentPath } = await resolveArtifactRoot(parentSessionFile);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
@@ -567,7 +570,7 @@ async function prepareFreshRun(
     userPrompt: buildInitialSubagentPrompt(profile, "fresh", params.task, parentDepth),
     model,
     thinkingLevel,
-    ...(fallback === undefined ? {} : { fallback }),
+    fallbacks,
   };
 }
 
@@ -605,7 +608,7 @@ async function prepareForkRun(
   const inheritedModel = recorded
     ? resolveRecordedSubagentModel(recorded.provider, recorded.modelId, ctx.modelRegistry)
     : ctx.model;
-  const { model, thinkingLevel, fallback } = resolveRunModelChoices(params, profile, ctx, ctx.model, "fork", inheritedModel);
+  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, ctx.model, "fork", inheritedModel);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
@@ -626,7 +629,7 @@ async function prepareForkRun(
     userPrompt: buildInitialSubagentPrompt(profile, "fork", params.task, parentDepth),
     model,
     thinkingLevel,
-    ...(fallback === undefined ? {} : { fallback }),
+    fallbacks,
     currentLeafId,
     sourceSessionManager,
   };
@@ -639,7 +642,7 @@ function resolveRunModelChoices(
   parentModel: Model<Api> | undefined,
   context: SubagentContextMode,
   forkInheritedModel?: Model<Api>,
-): { model: Model<Api> | undefined; thinkingLevel: string | undefined; fallback?: ModelChoice } {
+): { model: Model<Api> | undefined; thinkingLevel: string | undefined; fallbacks: ModelChoice[] } {
   // A call-level model replaces the chain, not just its first candidate.
   const candidates = params.model !== undefined
     ? [{ reference: params.model }]
@@ -654,7 +657,7 @@ function resolveRunModelChoices(
     throw new Error(`Cannot validate subagent thinking level '${requestedLevel}' without a resolved model. Specify a model first.`);
   }
   const thinkingLevel = choices[0]?.thinkingLevel ?? resolveSubagentThinkingLevel(requestedLevel, model ?? forkInheritedModel);
-  return { model, thinkingLevel, ...(choices[1] === undefined ? {} : { fallback: choices[1] }) };
+  return { model, thinkingLevel, fallbacks: choices.slice(1) };
 }
 
 interface ResolveAgentProfileOptions {

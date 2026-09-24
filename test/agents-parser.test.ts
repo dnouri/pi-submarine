@@ -37,7 +37,9 @@ describe("strict markdown agent parsing", () => {
     expect(parse(validAgent("description: Researches\nskills: research, audit")).skills).toEqual({ names: ["research", "audit"] });
   });
 
-  it("accepts one or two model candidates with optional per-candidate thinking levels", () => {
+  it("accepts up to three model candidates with optional per-candidate thinking levels", () => {
+    expect(parse(validAgent("description: Reviews\nmodel: provider/a@low, provider/b@high, provider/c@low")).model)
+      .toBe("provider/a@low, provider/b@high, provider/c@low");
     expect(parse(validAgent("description: Reviews\nmodel: provider/a@low, provider/b@high")).model).toBe("provider/a@low, provider/b@high");
     expect(parse(validAgent("description: Reviews\nmodel: provider/a@low")).model).toBe("provider/a@low");
   });
@@ -73,9 +75,9 @@ describe("strict markdown agent parsing", () => {
     ["missing colon", "---\ndescription Reviews\n---\nBody", "must be in key: value form"],
     ["empty description", "---\ndescription:   \n---\nBody", "description is required"],
     ["empty model", "---\ndescription: Reviews\nmodel:   \n---\nBody", "model must be non-empty"],
-    ["empty model candidate", "---\ndescription: Reviews\nmodel: provider/a,,provider/b\n---\nBody", "model chain must contain at most two candidates"],
+    ["empty model candidate", "---\ndescription: Reviews\nmodel: provider/a,,provider/b\n---\nBody", "empty or invalid candidate"],
     ["trailing comma", "---\ndescription: Reviews\nmodel: provider/a,\n---\nBody", "empty or invalid candidate"],
-    ["third model", "---\ndescription: Reviews\nmodel: a,b,c\n---\nBody", "at most two candidates"],
+    ["fourth model", "---\ndescription: Reviews\nmodel: a,b,c,d\n---\nBody", "at most three candidates"],
     ["unknown candidate level", "---\ndescription: Reviews\nmodel: provider/a@turbo\n---\nBody", "thinking level 'turbo'"],
     ["missing candidate level", "---\ndescription: Reviews\nmodel: provider/a@\n---\nBody", "thinking level ''"],
     ["extra level separator", "---\ndescription: Reviews\nmodel: provider/a@low@high\n---\nBody", "empty or invalid candidate"],

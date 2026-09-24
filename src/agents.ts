@@ -148,7 +148,7 @@ export interface MarkdownModelCandidate {
 /** Frontmatter is a small key/value format, not YAML. Model references may contain slashes and colons. */
 export function parseMarkdownModelChain(raw: string, fail: (reason: string) => never = (reason) => { throw new Error(reason); }): MarkdownModelCandidate[] {
   const parts = raw.split(",");
-  if (parts.length > 2) fail("model chain must contain at most two candidates");
+  if (parts.length > 3) fail("model chain must contain at most three candidates");
   return parts.map((part) => {
     const [reference, level, extra] = part.trim().split("@");
     if (!reference?.trim() || extra !== undefined) fail("model chain contains an empty or invalid candidate");
