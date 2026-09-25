@@ -23,8 +23,8 @@ call returns a compact result without the child transcript.
 - Named agents defined by simple markdown files with five frontmatter
   knobs: `description`, `model`, `thinkingLevel`, `agentsMd`, and
   `skills`.
-- Per-agent model and thinking-level defaults with optional model and
-  thinking-level overrides on each `subagent` call.
+- Per-agent model and thinking-level defaults, with optional first-turn
+  fallback across up to three models and call-level overrides.
 - Agent discovery for user-level and project-level markdown agents,
   including `subagent_list` for showing what is visible from a cwd.
 - Runtime status updates that report activity, turn counts, nested
@@ -90,11 +90,12 @@ Arguments:
   although a literal `agent: "default"` is tolerated and resolves to
   the default mode whenever no `default.md` is visible.
 - `model` is optional. Pass a model ID such as `"glm-5v-turbo"` or a
-  canonical `provider/model-id` reference. It overrides the named
-  agent's frontmatter model for this call.
+  canonical `provider/model-id` reference. It replaces the named
+  agent's entire frontmatter model chain for this call (no fallback).
 - `thinkingLevel` is optional. Pass one of Pi's thinking levels
   (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). It
-  overrides the named agent's frontmatter level for this call.
+  overrides every candidate's `@level` and the named agent's
+  frontmatter level for this call.
 - `context` is optional and defaults to `"fresh"`. Use `"fresh"` for a
   new child session. Use `"fork"` only when the child must inherit the
   current conversation branch.
@@ -132,6 +133,7 @@ A successful result looks like this:
 ```md
 ## Subagent vision result
 Subagent session ID: 019...
+Model: zai/glm-5.3 — after failed attempts: openai-codex/gpt-6-sol (Codex error: The usage limit has been reached)
 
 <child assistant answer>
 ```
@@ -139,7 +141,9 @@ Subagent session ID: 019...
 The `Subagent session ID` identifies the child for recovery or an
 explicit request to resume that exact child session. Prefer a new
 `subagent` for follow-up or related work, even when an earlier child
-already knows the topic.
+already knows the topic. The `Model` line names the model that produced
+the answer and, when earlier chain candidates failed on their first
+turn, lists each with a truncated provider error.
 
 ### `subagent_resume({ sessionId, message })`
 
@@ -237,8 +241,23 @@ unless you intentionally want the external directory to define the
 child's project context.
 
 Agent files use the small frontmatter block shown above, not YAML.
-`description` is required. `model` is optional and uses the same model
-reference rules as the call-level argument. `thinkingLevel` is
+`description` is required. `model` is optional and accepts one model
+reference or a comma-separated chain of at most three references, each
+optionally suffixed with `@level`. For example:
+
+```md
+---
+description: Completes bounded development tasks
+model: openai-codex/gpt-6-sol@max,kimi-coding/k3@max,zai/glm-5.3@max
+---
+
+Complete the task and report the result.
+```
+
+Every candidate must be in Pi's catalog, authenticated, and support its
+effective thinking level *before* any child artifacts are created.
+The precedence for each candidate is call-level `thinkingLevel`, then
+its `@level`, then frontmatter `thinkingLevel`. `thinkingLevel` is
 optional and may be one of `off`, `minimal`, `low`, `medium`, `high`,
 `xhigh`, or `max`; it uses the same call-level override and validation
 rules as `model`. `agentsMd` is optional and
@@ -262,9 +281,21 @@ body stays in the user prompt envelope rather than the child system
 prompt. Fork runs ignore those frontmatter resource controls but use
 the same user prompt envelope for omitted and named agents. A
 frontmatter model or thinking level applies to both fresh and forked
-initial runs. Resuming restores the model and thinking level recorded
-in the child session rather than reapplying the current agent-file
-defaults.
+initial runs. A chained agent tries the next model only when the current
+model's initial provider turn ends with assistant `stopReason: "error"`
+and no assistant success or tool progress occurred. Prompt rejections,
+aborts, later errors, and failures of the last candidate are not retried.
+Each failed attempt appends a `model <provider>/<id> failed (<reason>);
+retrying on <provider>/<id>` breadcrumb to the `.subagents.md` activity
+log, so quota and auth failures stay visible even when a later candidate
+succeeds. Each retry creates a new AgentSession on a clean branch of the *same*
+child session ID and lifecycle episode: failed branches stay in the JSONL
+file but are excluded from the active conversation. Resuming restores the
+model and thinking level recorded on that active branch rather than
+reapplying the current agent-file
+defaults. The available levels come from the model catalog of the
+running Pi; unsupported levels fail validation rather than silently
+downgrading.
 
 ## Artifacts and progress
 

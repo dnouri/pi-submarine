@@ -3,6 +3,7 @@ import path from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   DefaultResourceLoader,
+  buildSessionContext,
   createAgentSession,
   getAgentDir,
   SessionManager,
@@ -16,7 +17,7 @@ import {
   type ResourceLoader,
   type Skill,
 } from "@earendil-works/pi-coding-agent";
-import { MissingMarkdownAgentError, resolveMarkdownAgent } from "./agents.js";
+import { MissingMarkdownAgentError, parseMarkdownModelChain, resolveMarkdownAgent } from "./agents.js";
 import { cloneRunView, createActivityState, createInitialRunView, reduceActivityEvent } from "./activity.js";
 import { QueuedActivityLogWriter, appendActivityLogFinished, appendActivityLogStarted, ensureActivityLogHeader, type DegradedActivityLogOptions } from "./activity-log.js";
 import { appendManifestRecord, findLatestEpisodeStartedRecordBySessionFile, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
@@ -76,6 +77,7 @@ interface BaseRunPlan {
   userPrompt: string;
   model: Model<Api> | undefined;
   thinkingLevel: string | undefined;
+  fallbacks: ModelChoice[];
 }
 
 interface FreshRunPlan extends BaseRunPlan {
@@ -91,6 +93,7 @@ interface ForkRunPlan extends BaseRunPlan {
 type RunPlan = FreshRunPlan | ForkRunPlan;
 
 type ChildSessionPlan = Pick<BaseRunPlan, "effectiveCwd" | "agentDir" | "settingsManager" | "resourceLoader" | "model" | "thinkingLevel">;
+type ModelChoice = { model: Model<Api>; thinkingLevel: string | undefined };
 
 interface ResumeRunPlan extends ChildSessionPlan {
   profile: SubagentPromptProfile;
@@ -126,6 +129,29 @@ class SubagentInterruptedError extends Error {
     super(PARENT_ABORT_ERROR);
     this.name = "SubagentInterruptedError";
   }
+}
+
+class FirstTurnProviderError extends Error {}
+
+// The model that served attempt `n`: the planned first choice, then each fallback in order.
+function attemptModel(plan: { model: Model<Api> | undefined; fallbacks: readonly ModelChoice[] }, attempt: number): Model<Api> | undefined {
+  return attempt === 0 ? plan.model : plan.fallbacks[attempt - 1]?.model;
+}
+
+function describeModel(model: Model<Api>): string {
+  return `${model.provider}/${model.id}`;
+}
+
+function summarizeProviderError(message: string): string {
+  const summary = message.replace(/\s+/g, " ").trim();
+  return summary.length > 120 ? `${summary.slice(0, 117)}…` : summary;
+}
+
+function formatModelNote(model: Model<Api> | undefined, failedAttempts: readonly string[]): string | undefined {
+  if (model === undefined) return undefined;
+  return failedAttempts.length === 0
+    ? `Model: ${describeModel(model)}`
+    : `Model: ${describeModel(model)} — after failed attempts: ${failedAttempts.join(", ")}`;
 }
 
 function isSubagentInterruptedError(error: unknown): error is SubagentInterruptedError {
@@ -241,28 +267,78 @@ export async function runSubagent(
     throwIfModelFallback(created.modelFallbackMessage);
     childExtensionsStarted = true;
     await bindChildExtensions(childSession);
-    const activeChildSession = childSession;
-    const abortState = attachAbortHandler(signal, activeChildSession);
+    let activeChildSession = childSession;
+    let abortState = attachAbortHandler(signal, activeChildSession);
     detachAbortHandler = abortState.detach;
     activityLogWriter = new QueuedActivityLogWriter(run.activityLog, startedRun.activityPath, startedRun.childSessionFile, deps.artifactOptions?.activityLog);
     const activityState = createActivityState(run);
-    unsubscribe = activeChildSession.subscribe((event) => {
+    let toolProgress = false;
+    const subscribe = (session: ChildAgentSession) => session.subscribe((event) => {
+      if (event.type === "tool_execution_start" || event.type === "tool_execution_end"
+        || (event.type === "turn_end" && event.toolResults.length > 0)
+        || (event.type === "message_end" && event.message.role === "toolResult")) toolProgress = true;
       const reduction = reduceActivityEvent(activityState, event, deps.now());
       if (reduction.changed) {
-        refreshContextUsage(activityState.run, activeChildSession);
+        refreshContextUsage(activityState.run, session);
         activityLogWriter?.appendStatus(activityState.run.lastActivityAt, activityState.run.activity);
         emitUpdate(onUpdate, activityState.run);
       }
     });
+    unsubscribe = subscribe(activeChildSession);
 
-    const answer = await promptChildAndExtractAnswer(activeChildSession, startedRun.childSessionManager, plan.userPrompt, abortState);
+    const prePromptLeaf = startedRun.childSessionManager.getLeafId();
+    const failedAttempts: string[] = [];
+    let answer: string;
+    for (let attempt = 0; ; attempt++) {
+      const next = plan.fallbacks[attempt];
+      try {
+        answer = await promptChildAndExtractAnswer(activeChildSession, startedRun.childSessionManager, plan.userPrompt, abortState,
+          next ? () => toolProgress : undefined);
+        break;
+      } catch (error: unknown) {
+        if (!(error instanceof FirstTurnProviderError) || !next) throw error;
+        throwIfInterrupted(signal);
+        const failed = describeModel(attemptModel(plan, attempt)!);
+        const reason = summarizeProviderError(error instanceof Error ? error.message : String(error));
+        failedAttempts.push(`${failed} (${reason})`);
+        activityLogWriter?.appendStatus(deps.now(), `model ${failed} failed (${reason}); retrying on ${describeModel(next.model)}`);
+        // Recreate the AgentSession on the pre-prompt branch so failed requests
+        // remain inspectable but do not enter the next model's context.
+        runCleanup("remove subagent abort listener", detachAbortHandler);
+        detachAbortHandler = undefined;
+        runCleanup("unsubscribe subagent activity listener", unsubscribe);
+        unsubscribe = undefined;
+        await closeChildSession(childSession, childExtensionsStarted, "subagent failed attempt");
+        childSession = undefined;
+        childExtensionsStarted = false;
+        throwIfInterrupted(signal);
+        if (prePromptLeaf === null) startedRun.childSessionManager.resetLeaf();
+        else startedRun.childSessionManager.branch(prePromptLeaf);
+        startedRun.childSessionManager.appendModelChange(next.model.provider, next.model.id);
+        if (next.thinkingLevel !== undefined) startedRun.childSessionManager.appendThinkingLevelChange(next.thinkingLevel);
+        // Disposing an AgentSession invalidates its extension runtime.
+        await plan.resourceLoader.reload();
+        throwIfInterrupted(signal);
+        const createdFallback = await createChildSession({ ...plan, ...next }, startedRun.childSessionManager, deps, ctx);
+        childSession = createdFallback.session;
+        throwIfModelFallback(createdFallback.modelFallbackMessage);
+        childExtensionsStarted = true;
+        await bindChildExtensions(childSession);
+        activeChildSession = childSession;
+        abortState = attachAbortHandler(signal, activeChildSession);
+        detachAbortHandler = abortState.detach;
+        toolProgress = false;
+        unsubscribe = subscribe(activeChildSession);
+      }
+    }
     refreshContextUsage(run, activeChildSession);
     await activityLogWriter.drain();
     await completeRun(plan.manifestPath, startedRun, deps, onUpdate, activityLogWriter);
     forgetRuntimeEpisode(startedRun.run.episodeId);
 
     return {
-      content: [{ type: "text", text: renderSubagentResult(plan.profile.selection, run.sessionId, answer) }],
+      content: [{ type: "text", text: renderSubagentResult(plan.profile.selection, run.sessionId, answer,
+        formatModelNote(attemptModel(plan, failedAttempts.length), failedAttempts)) }],
       details: { run: cloneRunView(run) },
     };
   } catch (error: unknown) {
@@ -499,8 +575,7 @@ async function prepareFreshRun(
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, profileResolutionOptions(userAgentsDir, params, ctx));
   const parentModel = ctx.model;
-  const model = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, parentModel?.provider) ?? parentModel;
-  const thinkingLevel = resolveSubagentThinkingLevel(params.thinkingLevel ?? profile.thinkingLevel, model);
+  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, parentModel, "fresh");
   const { root, manifestPath, parentDepth, parentPath } = await resolveArtifactRoot(parentSessionFile);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
@@ -522,6 +597,7 @@ async function prepareFreshRun(
     userPrompt: buildInitialSubagentPrompt(profile, "fresh", params.task, parentDepth),
     model,
     thinkingLevel,
+    fallbacks,
   };
 }
 
@@ -551,9 +627,15 @@ async function prepareForkRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, { userAgentsDir });
-  const parentModel = ctx.model;
-  const model = resolveSubagentModel(params.model ?? profile.model, ctx.modelRegistry, parentModel?.provider);
-  const thinkingLevel = resolveSubagentThinkingLevel(params.thinkingLevel ?? profile.thinkingLevel, model);
+  // A fork with no explicit model still has a model on its copied branch.
+  // Validate requested thinking against that model before SDK clamping can occur.
+  const needsInheritedModel = params.model === undefined && profile.model === undefined
+    && (params.thinkingLevel ?? profile.thinkingLevel) !== undefined;
+  const recorded = needsInheritedModel ? buildSessionContext(sourceSessionManager.getBranch(currentLeafId)).model : undefined;
+  const inheritedModel = recorded
+    ? resolveRecordedSubagentModel(recorded.provider, recorded.modelId, ctx.modelRegistry)
+    : ctx.model;
+  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, ctx.model, "fork", inheritedModel);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
@@ -574,9 +656,35 @@ async function prepareForkRun(
     userPrompt: buildInitialSubagentPrompt(profile, "fork", params.task, parentDepth),
     model,
     thinkingLevel,
+    fallbacks,
     currentLeafId,
     sourceSessionManager,
   };
+}
+
+function resolveRunModelChoices(
+  params: SubagentParams,
+  profile: SubagentPromptProfile,
+  ctx: ExtensionContext,
+  parentModel: Model<Api> | undefined,
+  context: SubagentContextMode,
+  forkInheritedModel?: Model<Api>,
+): { model: Model<Api> | undefined; thinkingLevel: string | undefined; fallbacks: ModelChoice[] } {
+  // A call-level model replaces the chain, not just its first candidate.
+  const candidates = params.model !== undefined
+    ? [{ reference: params.model }]
+    : profile.model !== undefined ? parseMarkdownModelChain(profile.model) : [];
+  const choices = candidates.map(({ reference, level }) => {
+    const model = resolveSubagentModel(reference, ctx.modelRegistry, parentModel?.provider)!;
+    return { model, thinkingLevel: resolveSubagentThinkingLevel(params.thinkingLevel ?? level ?? profile.thinkingLevel, model) };
+  });
+  const model = choices[0]?.model ?? (context === "fresh" ? parentModel : undefined);
+  const requestedLevel = params.thinkingLevel ?? profile.thinkingLevel;
+  if (requestedLevel !== undefined && !model && !forkInheritedModel) {
+    throw new Error(`Cannot validate subagent thinking level '${requestedLevel}' without a resolved model. Specify a model first.`);
+  }
+  const thinkingLevel = choices[0]?.thinkingLevel ?? resolveSubagentThinkingLevel(requestedLevel, model ?? forkInheritedModel);
+  return { model, thinkingLevel, fallbacks: choices.slice(1) };
 }
 
 interface ResolveAgentProfileOptions {
@@ -951,13 +1059,19 @@ function attachAbortHandler(signal: AbortSignal | undefined, childSession: Child
   };
 }
 
-async function promptChildAndExtractAnswer(childSession: ChildAgentSession, childSessionManager: SessionManager, task: string, abortState: ChildAbortState): Promise<string> {
+async function promptChildAndExtractAnswer(
+  childSession: ChildAgentSession,
+  childSessionManager: SessionManager,
+  task: string,
+  abortState: ChildAbortState,
+  hasToolProgress?: () => boolean,
+): Promise<string> {
   if (abortState.wasAborted()) {
     await abortState.settled;
     throw new SubagentInterruptedError();
   }
   const leafBeforePrompt = childSessionManager.getLeafId();
-  const assistantCountBeforePrompt = assistantMessages(childSession.messages ?? []).length;
+  const messageCountBeforePrompt = (childSession.messages ?? []).length;
   const promptPromise = childSession.prompt(task);
   const winner = await Promise.race([
     promptPromise.then(() => "prompt" as const),
@@ -973,10 +1087,18 @@ async function promptChildAndExtractAnswer(childSession: ChildAgentSession, chil
     await abortState.settled;
     throw new SubagentInterruptedError();
   }
-  const newAssistantMessages = assistantMessagesAfterLeaf(childSessionManager, leafBeforePrompt)
-    ?? assistantMessages(childSession.messages ?? []).slice(assistantCountBeforePrompt);
+  const newMessages = messagesAfterLeaf(childSessionManager, leafBeforePrompt)
+    ?? (childSession.messages ?? []).slice(messageCountBeforePrompt);
+  const newAssistantMessages = assistantMessages(newMessages);
   const modelError = finalAssistantFailure(newAssistantMessages);
-  if (modelError) throw new Error(modelError);
+  if (modelError) {
+    const firstTurnProviderError = hasToolProgress !== undefined && !hasToolProgress()
+      && newAssistantMessages.length > 0
+      && newAssistantMessages.every((message) => message.stopReason === "error" && !hasToolCall(message.content))
+      && !newMessages.some((message) => isToolResult(message));
+    if (firstTurnProviderError) throw new FirstTurnProviderError(modelError);
+    throw new Error(modelError);
+  }
   if (newAssistantMessages.length === 0) throw new Error("Child subagent finished without a new assistant response.");
 
   const answer = childSession.getLastAssistantText()?.trim();
@@ -1239,7 +1361,7 @@ function finalAssistantFailure(messages: readonly unknown[]): string | undefined
   return finalAssistant.errorMessage ?? extractText(finalAssistant.content) ?? "Child subagent ended with a model error.";
 }
 
-function assistantMessagesAfterLeaf(childSessionManager: SessionManager, leafBeforePrompt: string | null): unknown[] | undefined {
+function messagesAfterLeaf(childSessionManager: SessionManager, leafBeforePrompt: string | null): unknown[] | undefined {
   const branch = childSessionManager.getBranch();
   if (branch.length === 0 && leafBeforePrompt === null) return undefined;
 
@@ -1248,13 +1370,21 @@ function assistantMessagesAfterLeaf(childSessionManager: SessionManager, leafBef
 
   return branch
     .slice(leafIndex + 1)
-    .flatMap((entry) => entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : []);
+    .flatMap((entry) => entry.type === "message" ? [entry.message] : []);
 }
 
 function assistantMessages(messages: readonly unknown[]): Array<{ role?: string; stopReason?: string; errorMessage?: string; content?: unknown }> {
   return messages.filter((message): message is { role?: string; stopReason?: string; errorMessage?: string; content?: unknown } => {
     return typeof message === "object" && message !== null && (message as { role?: string }).role === "assistant";
   });
+}
+
+function isToolResult(message: unknown): boolean {
+  return isObject(message) && message.role === "toolResult";
+}
+
+function hasToolCall(content: unknown): boolean {
+  return Array.isArray(content) && content.some((part) => isObject(part) && part.type === "toolCall");
 }
 
 function extractText(content: unknown): string | undefined {

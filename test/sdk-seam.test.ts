@@ -82,6 +82,90 @@ export default function(pi) {
     }
   });
 
+  it.each([
+    { name: "rebinds an inline extension after reloading the resource loader", reloadBeforeSecond: true },
+    { name: "reports a stale inline extension when the resource loader is not reloaded", reloadBeforeSecond: false },
+  ])("$name", async ({ reloadBeforeSecond }) => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    const agentDir = path.join(root, "agent-dir");
+    const sessionsDir = path.join(root, "sessions");
+    const errors: Array<{ event: string; error: string }> = [];
+    let factoryLoads = 0;
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      noContextFiles: true,
+      extensionFactories: [(pi) => {
+        const load = ++factoryLoads;
+        pi.on("session_start", (event, ctx) => {
+          pi.appendEntry("sdk-seam-start", {
+            load,
+            reason: event.reason,
+            sessionId: ctx.sessionManager.getSessionId(),
+          });
+        });
+      }],
+    });
+
+    await resourceLoader.reload();
+    const firstManager = SessionManager.create(cwd, sessionsDir);
+    const { session: first } = await createAgentSession({
+      cwd, agentDir, resourceLoader, sessionManager: firstManager, noTools: "all",
+    });
+    try {
+      await first.bindExtensions({ onError: (error) => { errors.push(error); } });
+      expect(errors).toEqual([]);
+      expect(firstManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([
+        expect.objectContaining({
+          customType: "sdk-seam-start",
+          data: { load: 1, reason: "startup", sessionId: firstManager.getSessionId() },
+        }),
+      ]);
+    } finally {
+      first.dispose();
+    }
+
+    const originalRuntime = resourceLoader.getExtensions().runtime;
+    if (reloadBeforeSecond) await resourceLoader.reload();
+    expect(resourceLoader.getExtensions().runtime === originalRuntime).toBe(!reloadBeforeSecond);
+    expect(resourceLoader.getExtensions().errors).toEqual([]);
+    expect(factoryLoads).toBe(reloadBeforeSecond ? 2 : 1);
+
+    const secondManager = SessionManager.create(cwd, sessionsDir);
+    const { session: second } = await createAgentSession({
+      cwd, agentDir, resourceLoader, sessionManager: secondManager, noTools: "all",
+    });
+    try {
+      await second.bindExtensions({ onError: (error) => { errors.push(error); } });
+      expect(secondManager.getSessionId()).not.toBe(firstManager.getSessionId());
+      expect(secondManager.getSessionFile()).not.toBe(firstManager.getSessionFile());
+      const secondStarts = secondManager.getEntries().filter((entry) => entry.type === "custom");
+      if (reloadBeforeSecond) {
+        expect(errors).toEqual([]);
+        expect(secondStarts).toEqual([
+          expect.objectContaining({
+            customType: "sdk-seam-start",
+            data: { load: 2, reason: "startup", sessionId: secondManager.getSessionId() },
+          }),
+        ]);
+      } else {
+        // dispose() invalidates the loader's current extension runtime. A new
+        // AgentSession cannot reuse its captured pi API without loader.reload().
+        expect(secondStarts).toEqual([]);
+        expect(errors).toEqual([
+          expect.objectContaining({
+            event: "session_start",
+            error: expect.stringContaining("stale after session replacement or reload"),
+          }),
+        ]);
+      }
+      expect(firstManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(1);
+    } finally {
+      second.dispose();
+    }
+  });
+
   it("branches a reopened parent session into the parent-local .subagents directory", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project with spaces");
