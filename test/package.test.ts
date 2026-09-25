@@ -13,7 +13,8 @@ describe("package metadata", () => {
 
   it("declares npm provenance and package gallery metadata", async () => {
     const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-    const galleryBaseUrl = `https://raw.githubusercontent.com/dnouri/pi-submarine/${packageJson.version}/media/pi-submarine`;
+    const releaseTag = packageJson.version.replace(/\.0$/, "");
+    const galleryBaseUrl = `https://raw.githubusercontent.com/dnouri/pi-submarine/${releaseTag}/media/pi-submarine`;
 
     expect(packageJson.author).toBe("Daniel Nouri");
     expect(packageJson.repository).toEqual({

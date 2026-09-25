@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+'
 
 permissions:
   contents: read
@@ -23,8 +24,10 @@ jobs:
       - name: Verify tag matches package.json version
         run: |
           version=$(node -p "require('./package.json').version")
-          if [ "$version" != "$GITHUB_REF_NAME" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match package.json version $version"
+          tag=$GITHUB_REF_NAME
+          # Accept the exact version or the version without a trailing .0
+          if [ "v$version" != "v$tag" ] && [ "${version%.0}" != "$tag" ]; then
+            echo "Tag $tag does not match package.json version $version"
             exit 1
           fi
 
