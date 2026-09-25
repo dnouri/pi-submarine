@@ -74,11 +74,13 @@ function expectSubagentResult(
   result: { content: Array<{ text: string }>; details: { run: { sessionId: string } } },
   heading = "## Subagent result",
   answer = "child answer",
+  modelNote?: string,
 ): void {
   const sessionId = result.details.run.sessionId;
   expect(sessionId).toEqual(expect.any(String));
   expect(sessionId).not.toBe("");
-  expect(result.content[0]?.text).toBe(`${heading}\nSubagent session ID: ${sessionId}\n\n${answer}`);
+  const note = modelNote === undefined ? "" : `\n${modelNote}`;
+  expect(result.content[0]?.text).toBe(`${heading}\nSubagent session ID: ${sessionId}${note}\n\n${answer}`);
 }
 
 async function rejectedMessage(promise: Promise<unknown>): Promise<string> {
@@ -1168,7 +1170,7 @@ describe("subagent runner", () => {
     const result = await runSubagent({ task: "answer briefly" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession, { model: parentModel }), { deps });
 
     expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fresh", "answer briefly"));
-    expectSubagentResult(result);
+    expectSubagentResult(result, "## Subagent result", "child answer", "Model: zai/glm-5");
     expect(result.content[0]?.text).not.toContain(".subagents.md");
     expect(result.content[0]?.text).not.toContain(".subagents");
     expect(result.content[0]?.text).not.toContain(".jsonl");
@@ -1390,7 +1392,8 @@ describe("subagent runner", () => {
 
       const result = await runSubagent({ agent: "reviewer", task: "review this" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps });
 
-      expectSubagentResult(result, "## Subagent reviewer result");
+      expectSubagentResult(result, "## Subagent reviewer result", "child answer",
+        "Model: provider/b — after failed attempts: provider/a (first provider failed)");
       expect(deps.createAgentSession).toHaveBeenCalledTimes(2);
       expect(deps.createAgentSession).toHaveBeenNthCalledWith(1, expect.objectContaining({ model: first, thinkingLevel: "low" }));
       expect(deps.createAgentSession).toHaveBeenNthCalledWith(2, expect.objectContaining({ model: second, thinkingLevel: "high" }));
@@ -1434,7 +1437,8 @@ describe("subagent runner", () => {
       const result = await runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined,
         fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, third]) }), { deps });
 
-      expectSubagentResult(result, "## Subagent reviewer result");
+      expectSubagentResult(result, "## Subagent reviewer result", "child answer",
+        "Model: provider/c — after failed attempts: provider/a (first provider failed), provider/b (second provider failed)");
       expect(deps.createAgentSession.mock.calls.map(([options]) => [options.model, options.thinkingLevel]))
         .toEqual([[first, "low"], [second, "high"], [third, "low"]]);
       expect(new Set(deps.createAgentSession.mock.calls.map(([options]) => options.sessionManager)).size).toBe(1);
@@ -1463,13 +1467,30 @@ describe("subagent runner", () => {
       expect(resumed.fakeSession.promptSettings).toEqual([{ model: third, thinkingLevel: "low" }]);
     });
 
+    it("records failed attempts in the activity log and names the serving model in the result", async () => {
+      const third = thinkingModel("provider", "c");
+      const { root, cwd, parentSession } = await chainFixture("provider/a@low,provider/b@high,provider/c@low");
+      const { deps } = fakeChainDeps(root,
+        { messagesByPrompt: [[firstModelError]] },
+        { messagesByPrompt: [[{ ...firstModelError, errorMessage: "second provider failed" }]] },
+        { messagesByPrompt: [[fallbackAnswer]] });
+      const result = await runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined,
+        fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, third]) }), { deps });
+
+      expect(result.content[0]?.text)
+        .toContain("Model: provider/c — after failed attempts: provider/a (first provider failed), provider/b (second provider failed)");
+      const activity = await readFile(`${parentSession}.subagents.md`, "utf8");
+      expect(activity).toContain("reviewer: model provider/a failed (first provider failed); retrying on provider/b");
+      expect(activity).toContain("reviewer: model provider/b failed (second provider failed); retrying on provider/c");
+    });
+
     it("stays on the first model when the first turn succeeds", async () => {
       const { root, cwd, parentSession } = await chainFixture();
       const { deps, fakeSession } = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
 
       const result = await runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps });
 
-      expectSubagentResult(result, "## Subagent reviewer result");
+      expectSubagentResult(result, "## Subagent reviewer result", "child answer", "Model: provider/a");
       expect(fakeSession.promptSettings).toEqual([{ model: first, thinkingLevel: "low" }]);
       expect(fakeSession.modelSelections).toEqual([]);
     });
@@ -1693,7 +1714,7 @@ describe("subagent runner", () => {
 
       const result = await runSubagent({ agent: "reviewer", task: "review", model: "provider/override", thinkingLevel: "high" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([override]) }), { deps });
 
-      expectSubagentResult(result, "## Subagent reviewer result");
+      expectSubagentResult(result, "## Subagent reviewer result", "child answer", "Model: provider/override");
       expect(deps.createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ model: override, thinkingLevel: "high" }));
       expect(fakeSession.promptSettings).toEqual([{ model: override, thinkingLevel: "high" }]);
       expect(fakeSession.modelSelections).toEqual([]);
@@ -1742,7 +1763,8 @@ describe("subagent runner", () => {
 
       const result = await runSubagent({ agent: "reviewer", task: "review", context: "fork" }, undefined, undefined, fakeContext(cwd, parentSession, { leafId: parentManager.getLeafId(), modelRegistry: registry }), { deps });
 
-      expectSubagentResult(result, "## Subagent reviewer result");
+      expectSubagentResult(result, "## Subagent reviewer result", "child answer",
+        "Model: provider/b — after failed attempts: provider/a (first provider failed)");
       expect(deps.createAgentSession).toHaveBeenCalledTimes(2);
       expect(deps.openSessionManager).toHaveBeenCalledTimes(1);
       expect(firstSession.promptSettings).toEqual([{ model: first, thinkingLevel: "low" }]);
@@ -1776,7 +1798,8 @@ describe("subagent runner", () => {
       const result = await runSubagent({ agent: "reviewer", task: "review", context: "fork" }, undefined, undefined,
         fakeContext(cwd, parentSession, { leafId: parentManager.getLeafId(), modelRegistry: fakeModelRegistry([first, second, third]) }), { deps });
 
-      expectSubagentResult(result, "## Subagent reviewer result");
+      expectSubagentResult(result, "## Subagent reviewer result", "child answer",
+        "Model: provider/c — after failed attempts: provider/a (first provider failed), provider/b (second provider failed)");
       expect(deps.openSessionManager).toHaveBeenCalledTimes(1);
       expect(sessions.map((session) => session.promptCount)).toEqual([1, 1, 1]);
       const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);

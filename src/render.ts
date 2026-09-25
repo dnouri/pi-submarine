@@ -19,8 +19,9 @@ export function resultHeading(selection: AgentSelection): string {
   return `## ${subagentTitle(selection)} result`;
 }
 
-export function renderSubagentResult(selection: AgentSelection, sessionId: string, answer: string): string {
-  return `${resultHeading(selection)}\nSubagent session ID: ${sessionId}\n\n${answer}`;
+export function renderSubagentResult(selection: AgentSelection, sessionId: string, answer: string, modelNote?: string): string {
+  const note = modelNote === undefined ? "" : `\n${modelNote}`;
+  return `${resultHeading(selection)}\nSubagent session ID: ${sessionId}${note}\n\n${answer}`;
 }
 
 export function interruptedHeading(selection: AgentSelection): string {

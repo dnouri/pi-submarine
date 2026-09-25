@@ -133,6 +133,27 @@ class SubagentInterruptedError extends Error {
 
 class FirstTurnProviderError extends Error {}
 
+// The model that served attempt `n`: the planned first choice, then each fallback in order.
+function attemptModel(plan: { model: Model<Api> | undefined; fallbacks: readonly ModelChoice[] }, attempt: number): Model<Api> | undefined {
+  return attempt === 0 ? plan.model : plan.fallbacks[attempt - 1]?.model;
+}
+
+function describeModel(model: Model<Api>): string {
+  return `${model.provider}/${model.id}`;
+}
+
+function summarizeProviderError(message: string): string {
+  const summary = message.replace(/\s+/g, " ").trim();
+  return summary.length > 120 ? `${summary.slice(0, 117)}…` : summary;
+}
+
+function formatModelNote(model: Model<Api> | undefined, failedAttempts: readonly string[]): string | undefined {
+  if (model === undefined) return undefined;
+  return failedAttempts.length === 0
+    ? `Model: ${describeModel(model)}`
+    : `Model: ${describeModel(model)} — after failed attempts: ${failedAttempts.join(", ")}`;
+}
+
 function isSubagentInterruptedError(error: unknown): error is SubagentInterruptedError {
   return error instanceof SubagentInterruptedError;
 }
@@ -266,6 +287,7 @@ export async function runSubagent(
     unsubscribe = subscribe(activeChildSession);
 
     const prePromptLeaf = startedRun.childSessionManager.getLeafId();
+    const failedAttempts: string[] = [];
     let answer: string;
     for (let attempt = 0; ; attempt++) {
       const next = plan.fallbacks[attempt];
@@ -276,6 +298,10 @@ export async function runSubagent(
       } catch (error: unknown) {
         if (!(error instanceof FirstTurnProviderError) || !next) throw error;
         throwIfInterrupted(signal);
+        const failed = describeModel(attemptModel(plan, attempt)!);
+        const reason = summarizeProviderError(error instanceof Error ? error.message : String(error));
+        failedAttempts.push(`${failed} (${reason})`);
+        activityLogWriter?.appendStatus(deps.now(), `model ${failed} failed (${reason}); retrying on ${describeModel(next.model)}`);
         // Recreate the AgentSession on the pre-prompt branch so failed requests
         // remain inspectable but do not enter the next model's context.
         runCleanup("remove subagent abort listener", detachAbortHandler);
@@ -311,7 +337,8 @@ export async function runSubagent(
     forgetRuntimeEpisode(startedRun.run.episodeId);
 
     return {
-      content: [{ type: "text", text: renderSubagentResult(plan.profile.selection, run.sessionId, answer) }],
+      content: [{ type: "text", text: renderSubagentResult(plan.profile.selection, run.sessionId, answer,
+        formatModelNote(attemptModel(plan, failedAttempts.length), failedAttempts)) }],
       details: { run: cloneRunView(run) },
     };
   } catch (error: unknown) {
