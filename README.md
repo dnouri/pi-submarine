@@ -24,7 +24,8 @@ call returns a compact result without the child transcript.
   knobs: `description`, `model`, `thinkingLevel`, `agentsMd`, and
   `skills`.
 - Per-agent model and thinking-level defaults, with optional first-turn
-  fallback across up to three models and call-level overrides.
+  fallback across up to three models; call-level `model`/`thinkingLevel`
+  are usually only for the default agent.
 - Agent discovery for user-level and project-level markdown agents,
   including `subagent_list` for showing what is visible from a cwd.
 - Runtime status updates that report activity, turn counts, nested
@@ -64,7 +65,7 @@ The common calls are intentionally small:
 
 ```ts
 subagent({ task: "Inspect src/runner.ts and summarize the control flow." })
-subagent({ agent: "vision", task: "Read any screenshots or images and return their contents", model: "glm-5v-turbo" })
+subagent({ model: "acme/acme-5v-turbo", task: "Read screenshots/login.png and return its contents." })
 subagent({ context: "fork", task: "Use the current conversation branch to check my last plan." })
 ```
 
@@ -89,13 +90,15 @@ Arguments:
   `subagent.md`; omission is the only way to request the default mode,
   although a literal `agent: "default"` is tolerated and resolves to
   the default mode whenever no `default.md` is visible.
-- `model` is optional. Pass a model ID such as `"glm-5v-turbo"` or a
+- `model` is optional. Pass a model ID such as `"acme-5v-turbo"` or a
   canonical `provider/model-id` reference. It replaces the named
-  agent's entire frontmatter model chain for this call (no fallback).
+  agent's entire frontmatter model chain for this call (no fallback),
+  but is usually only for the default agent.
 - `thinkingLevel` is optional. Pass one of Pi's thinking levels
   (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). It
   overrides every candidate's `@level` and the named agent's
-  frontmatter level for this call.
+  frontmatter level for this call, but is usually only for the
+  default agent.
 - `context` is optional and defaults to `"fresh"`. Use `"fresh"` for a
   new child session. Use `"fork"` only when the child must inherit the
   current conversation branch.
@@ -133,7 +136,7 @@ A successful result looks like this:
 ```md
 ## Subagent vision result
 Subagent session ID: 019...
-Model: zai/glm-5.3 — after failed attempts: openai-codex/gpt-6-sol (Codex error: The usage limit has been reached)
+Model: acme/acme-5.3 — after failed attempts: openai-codex/gpt-6-sol (Codex error: The usage limit has been reached)
 
 <child assistant answer>
 ```
@@ -213,7 +216,7 @@ example, create `.pi/agents/vision.md`:
 ```md
 ---
 description: Reads screenshots, diagrams, and other images.
-model: glm-5v-turbo
+model: acme/acme-5v-turbo
 thinkingLevel: low
 agentsMd: auto
 skills: none
@@ -230,11 +233,8 @@ The frontmatter model is the default:
 subagent({ agent: "vision", task: "Read screenshots/login.png and return its contents." })
 ```
 
-A call-level model selects or overrides it for one invocation:
-
-```ts
-subagent({ agent: "vision", task: "Read any screenshots or images and return their contents", model: "glm-5v-turbo" })
-```
+A call-level `model` or `thinkingLevel` still overrides it for one
+invocation, but both are usually only for the default agent.
 
 If the task needs files outside the project, put those paths in `task`
 unless you intentionally want the external directory to define the
@@ -248,7 +248,7 @@ optionally suffixed with `@level`. For example:
 ```md
 ---
 description: Completes bounded development tasks
-model: openai-codex/gpt-6-sol@max,kimi-coding/k3@max,zai/glm-5.3@max
+model: openai-codex/gpt-6-sol@max,kimi-coding/k3@max,acme/acme-5.3@max
 ---
 
 Complete the task and report the result.
