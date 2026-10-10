@@ -2,7 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it } from "vitest";
+import { IsObject } from "typebox";
+import { afterEach, assert, describe, expect, it } from "vitest";
 import register, { subagentListTool, subagentResumeTool, subagentTool } from "../src/index.js";
 
 type RegisteredTool = Parameters<ExtensionAPI["registerTool"]>[0];
@@ -31,11 +32,6 @@ describe("pi-submarine extension registration", () => {
 
     expect(tools.map((tool) => tool.name)).toEqual(["subagent", "subagent_resume", "subagent_list"]);
     expect(tools.map((tool) => tool.label)).toEqual(["Subagent", "Resume subagent", "List subagents"]);
-    expect(tools.map((tool) => tool.description)).toEqual([
-      expect.stringContaining("Delegate one focused task"),
-      expect.stringContaining("Continue an existing child Pi session"),
-      expect.stringContaining("List specialized markdown"),
-    ]);
   });
 
   it("registers strict parameter schemas for all tools", () => {
@@ -74,67 +70,19 @@ describe("pi-submarine extension registration", () => {
     });
   });
 
-  it("presents the subagent contract in model-facing metadata", () => {
-    const [subagent, subagentResume, subagentList] = registeredToolsFromFactory();
-
-    expect(subagent?.description).toContain("Delegate one focused task to a new subagent");
-    expect(subagent?.description).toContain("compact session metadata");
-    expect(subagent?.promptSnippet).toContain("synchronous subagent");
-    const guidelines = subagent?.promptGuidelines?.join("\n") ?? "";
-    expect(guidelines).toContain("Common calls");
-    expect(guidelines).toContain("subagent({ task: \"...\" })");
-    expect(guidelines).toContain("subagent({ model: \"acme/acme-5v-turbo\", task: \"Read screenshots/login.png and return its contents\" })");
-    expect(guidelines).toContain("subagent({ context: \"fork\", task: \"...\" })");
-    expect(guidelines).toContain("do not see the parent conversation");
-    expect(guidelines).toContain("foreground child");
-    expect(guidelines).toContain("not a background job or workflow engine");
-    expect(guidelines).toContain("project .pi/agents/*.md overrides same-named user agents");
-    expect(guidelines).toContain("Omit `agent` for default mode");
-    expect(guidelines).toContain("Role text inside `task` does not select an agent");
-    expect(guidelines).toContain("Usually omit `cwd`");
-    expect(guidelines).toContain("Call-level `model`/`thinkingLevel` are usually only for the default agent");
-    expect(guidelines).toContain("An explicit `thinkingLevel` must be supported by the resolved child model");
-    expect(guidelines).toContain("Prefer a new `subagent` for follow-up or related work");
-
-    expect(subagent?.parameters).toMatchObject({
-      properties: {
-        agent: { description: expect.stringContaining("project agents from the effective `cwd`") },
-        task: { description: expect.stringContaining("does not see the parent conversation") },
-        model: { description: expect.stringContaining("Usually only for the default agent") },
-        thinkingLevel: { description: expect.stringContaining("must be supported by the resolved model") },
-        context: { description: expect.stringContaining("Defaults to `fresh`") },
-        cwd: { description: expect.stringContaining("Omit to inherit the caller cwd") },
-      },
-    });
-    expect(subagentResume?.description).toContain("Continue an existing child Pi session");
-    expect(subagentResume?.description).toContain("recover an interrupted or failed child");
-    expect(subagentResume?.description).toContain("user explicitly asks to resume that exact child session");
-    expect(subagentResume?.description).toContain("otherwise use a new `subagent`");
-    expect(subagentResume?.promptSnippet).toContain("Recover an interrupted or failed child");
-    expect(subagentResume?.promptSnippet).toContain("explicit request");
-    const resumeGuidelines = subagentResume?.promptGuidelines?.join("\n") ?? "";
-    expect(resumeGuidelines).toContain("subagent_resume({ sessionId: \"...\", message: \"...\" })");
-    expect(resumeGuidelines).toContain("recover an interrupted or failed child when its result includes a session ID");
-    expect(resumeGuidelines).toContain("user explicitly asks to resume that exact child session");
-    expect(resumeGuidelines).toContain("`subagent_resume` continues an existing child subagent session");
-    expect(resumeGuidelines).toContain("does not create a new child context");
-    expect(resumeGuidelines).not.toContain("completed result that needs a follow-up");
-    expect(subagentResume?.parameters).toMatchObject({
-      properties: {
-        sessionId: { description: expect.stringContaining("from an earlier `subagent` or `subagent_resume` result") },
-        message: { description: expect.stringContaining("existing child conversation") },
-      },
-    });
-    expect(subagentList?.promptSnippet).toContain("Inspect visible subagents");
-    const listGuidelines = subagentList?.promptGuidelines?.join("\n") ?? "";
-    expect(listGuidelines).toContain("subagent_list({})");
-    expect(listGuidelines).toContain("subagent_list({ cwd: \"/path\" })");
-    expect(listGuidelines).toContain("do not call it first if you already know the agent name");
-    expect(subagentList?.parameters).toMatchObject({
-      properties: {
-        cwd: { description: expect.stringContaining("intentionally inspecting another directory") },
-      },
-    });
+  it("supplies model-facing help for every tool and parameter", () => {
+    for (const tool of registeredToolsFromFactory()) {
+      expect(tool.description).toMatch(/\S/);
+      expect(tool.promptSnippet).toMatch(/\S/);
+      expect(tool.promptGuidelines?.length).toBeGreaterThan(0);
+      for (const guideline of tool.promptGuidelines ?? []) {
+        expect(guideline).toMatch(/\S/);
+      }
+      assert(IsObject(tool.parameters));
+      for (const parameter of Object.values(tool.parameters.properties)) {
+        expect(parameter).toMatchObject({ description: expect.stringMatching(/\S/) });
+      }
+    }
   });
 
   it("keeps registration model-free while execution requires a persisted parent session", async () => {

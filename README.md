@@ -24,8 +24,8 @@ call returns a compact result without the child transcript.
   knobs: `description`, `model`, `thinkingLevel`, `agentsMd`, and
   `skills`.
 - Per-agent model and thinking-level defaults, with optional first-turn
-  fallback across up to three models; call-level `model`/`thinkingLevel`
-  are usually only for the default agent.
+  fallback across up to three models. Call-level `model`/`thinkingLevel`
+  overrides work in both default and named-agent modes.
 - Agent discovery for user-level and project-level markdown agents,
   including `subagent_list` for showing what is visible from a cwd.
 - Runtime status updates that report activity, turn counts, nested
@@ -42,7 +42,7 @@ call returns a compact result without the child transcript.
 
 The package is deliberately narrow: one `subagent` call runs one
 foreground child Pi session and waits for it.  It does not provide
-built-in agent roles, background jobs, chains, dashboards, or a
+built-in agent roles, background jobs, workflow chains, dashboards, or a
 workflow engine.
 
 ## Usage
@@ -66,8 +66,13 @@ The common calls are intentionally small:
 ```ts
 subagent({ task: "Inspect src/runner.ts and summarize the control flow." })
 subagent({ model: "acme/acme-5v-turbo", task: "Read screenshots/login.png and return its contents." })
+subagent({ agent: "reviewer", model: "acme/fast@low,acme/steady@high", task: "Review src/runner.ts." })
 subagent({ context: "fork", task: "Use the current conversation branch to check my last plan." })
 ```
+
+Choose model references and supported levels from `subagent_list`.
+One comma-separated model chain is one child with fallback, not parallel
+children.
 
 Fresh runs are independent child sessions. They can use files and
 tools in their cwd, but they do not see the current parent
@@ -90,15 +95,18 @@ Arguments:
   `subagent.md`; omission is the only way to request the default mode,
   although a literal `agent: "default"` is tolerated and resolves to
   the default mode whenever no `default.md` is visible.
-- `model` is optional. Pass a model ID such as `"acme-5v-turbo"` or a
-  canonical `provider/model-id` reference. It replaces the named
-  agent's entire frontmatter model chain for this call (no fallback),
-  but is usually only for the default agent.
+- `model` is optional. Pass one to three comma-separated model IDs or
+  canonical `provider/model-id` references, each optionally suffixed
+  with `@thinkingLevel` in the final slash-delimited path segment.
+  Earlier `@` characters stay in the model ID, as in
+  `@cf/openai/gpt-oss-120b`. Surrounding whitespace is ignored; slashes
+  and colons in IDs are preserved. Empty, unknown, or duplicate
+  suffixes are invalid. The selected string replaces the named agent's
+  entire frontmatter model chain for this call. A one-model override
+  leaves no profile backups.
 - `thinkingLevel` is optional. Pass one of Pi's thinking levels
-  (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). It
-  overrides every candidate's `@level` and the named agent's
-  frontmatter level for this call, but is usually only for the
-  default agent.
+  (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) for this
+  call.
 - `context` is optional and defaults to `"fresh"`. Use `"fresh"` for a
   new child session. Use `"fork"` only when the child must inherit the
   current conversation branch.
@@ -109,17 +117,26 @@ Arguments:
   files such as `AGENTS.md` / `CLAUDE.md`, skills, and Pi resources
   follow that cwd. Relative `cwd` values resolve from the caller cwd.
 
-Model references must match Pi's current model catalog and have
-configured authentication. For a bare model ID, `pi-submarine` first
-prefers a matching model from the parent's provider, then the only
-authenticated match; otherwise it asks for a canonical reference. If
-neither the call nor the agent chooses a model, fresh runs inherit the
-parent model and fork runs restore the model from the copied branch.
-An explicit thinking level must be supported by the resolved model:
-if it is not, the run fails before child artifacts are created and the
-error lists the supported levels rather than silently clamping. When
-no level is requested, fresh runs use Pi's default for the model and
-fork runs restore the level recorded on the copied branch.
+Every selected candidate must match Pi's current model catalog, have
+configured authentication, and support its effective thinking level
+before a child session file, manifest, or activity log is created.
+Missing, unauthenticated, or unsupported candidates cause an error;
+they are not skipped.
+
+For a bare model ID, `pi-submarine` first prefers a matching model from
+the parent's provider, then the only authenticated match; otherwise it
+asks for a canonical reference. If neither the call nor the agent
+chooses a model, fresh runs inherit the parent model and fork runs
+restore the model from the copied branch.
+
+Thinking precedence for each selected candidate is call-level
+`thinkingLevel`, then its suffix, then frontmatter `thinkingLevel`.
+Only the effective level must be supported by the resolved model; a
+supported call-level override can shadow an unsupported but valid
+suffix. An unsupported effective level fails with an error listing the
+supported levels rather than silently clamping. When no level is
+requested, fresh runs use Pi's default for the model and fork runs
+restore the level recorded on the copied branch.
 
 Fresh runs create a new child session below the current root session's
 `.subagents/` directory; nested subagents share that directory. The
@@ -233,39 +250,36 @@ The frontmatter model is the default:
 subagent({ agent: "vision", task: "Read screenshots/login.png and return its contents." })
 ```
 
-A call-level `model` or `thinkingLevel` still overrides it for one
-invocation, but both are usually only for the default agent.
+A call-level `model` or `thinkingLevel` overrides these defaults for
+one invocation, including a whole replacement model chain. The named
+prompt and fresh-run resource controls stay loaded.
 
 If the task needs files outside the project, put those paths in `task`
 unless you intentionally want the external directory to define the
 child's project context.
 
 Agent files use the small frontmatter block shown above, not YAML.
-`description` is required. `model` is optional and accepts one model
-reference or a comma-separated chain of at most three references, each
-optionally suffixed with `@level`. For example:
+`description` is required. The optional `model` uses the same format as
+the call-level `model` argument and supplies the default when the call
+omits it. For example:
 
 ```md
 ---
 description: Completes bounded development tasks
-model: openai-codex/gpt-6-sol@max,kimi-coding/k3@max,acme/acme-5.3@max
+model: acme/fast@low,acme/steady@high,acme/backup@low
 ---
 
 Complete the task and report the result.
 ```
 
-Every candidate must be in Pi's catalog, authenticated, and support its
-effective thinking level *before* any child artifacts are created.
-The precedence for each candidate is call-level `thinkingLevel`, then
-its `@level`, then frontmatter `thinkingLevel`. `thinkingLevel` is
-optional and may be one of `off`, `minimal`, `low`, `medium`, `high`,
-`xhigh`, or `max`; it uses the same call-level override and validation
-rules as `model`. `agentsMd` is optional and
-may be `none` or `auto`; it defaults to `none`. `skills` is optional
-and may be `auto`, `none`, or a comma-separated list of skill names;
-it defaults to `auto`. Unknown keys, blank frontmatter lines,
-comments, quoted values, arrays, block scalars, duplicate keys,
-missing delimiters, and empty bodies are rejected.
+The optional `thinkingLevel` uses the call argument's values and
+supplies the profile default under the precedence and validation rules
+above. `agentsMd` is optional and may be `none` or `auto`; it defaults
+to `none`. `skills` is optional and may be `auto`, `none`, or a
+comma-separated list of skill names; it defaults to `auto`. Unknown
+keys, blank frontmatter lines, comments, quoted values, arrays, block
+scalars, duplicate keys, missing delimiters, and empty bodies are
+rejected.
 
 Discovery is non-recursive and ignores hidden files, nested
 directories, uppercase `.MD`, and `*.chain.md` files.
@@ -281,10 +295,11 @@ body stays in the user prompt envelope rather than the child system
 prompt. Fork runs ignore those frontmatter resource controls but use
 the same user prompt envelope for omitted and named agents. A
 frontmatter model or thinking level applies to both fresh and forked
-initial runs. A chained agent tries the next model only when the current
-model's initial provider turn ends with assistant `stopReason: "error"`
-and no assistant success or tool progress occurred. Prompt rejections,
-aborts, later errors, and failures of the last candidate are not retried.
+initial runs. A selected model chain, from the call or frontmatter,
+tries the next model only when the current model's initial provider
+turn ends with assistant `stopReason: "error"` and no assistant success
+or tool progress occurred. Prompt rejections, aborts, later errors, and
+failures of the last candidate are not retried.
 Each failed attempt appends a `model <provider>/<id> failed (<reason>);
 retrying on <provider>/<id>` breadcrumb to the `.subagents.md` activity
 log, so quota and auth failures stay visible even when a later candidate
@@ -292,10 +307,7 @@ succeeds. Each retry creates a new AgentSession on a clean branch of the *same*
 child session ID and lifecycle episode: failed branches stay in the JSONL
 file but are excluded from the active conversation. Resuming restores the
 model and thinking level recorded on that active branch rather than
-reapplying the current agent-file
-defaults. The available levels come from the model catalog of the
-running Pi; unsupported levels fail validation rather than silently
-downgrading.
+reapplying the current agent-file defaults.
 
 ## Artifacts and progress
 
@@ -371,13 +383,9 @@ is required for correctness.
   cautious “may be recoverable” wording. Preflight and lookup failures
   before a trusted child session exists do not invent a continuation
   handle.
-- Requested and recorded models are checked before the child is
-  prompted. If a model is unavailable or unauthenticated, or Pi
-  reports that it would fall back, the run fails instead of silently
-  using a substitute.
-- Requested thinking levels are validated against the resolved model
-  before child artifacts are created. Unsupported levels fail with the
-  supported list instead of silently clamping to a neighboring level.
+- Resume requires the recorded model to be available and authenticated.
+  If Pi reports an SDK model fallback on any run, the run fails before
+  prompting instead of silently using a substitute.
 - `pi-submarine`'s wrapper text does not add session-file paths,
   activity-log paths, stack traces, child transcripts, or the Markdown
   activity log to model-visible success, interruption, or recovery
