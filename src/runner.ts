@@ -17,11 +17,11 @@ import {
   type ResourceLoader,
   type Skill,
 } from "@earendil-works/pi-coding-agent";
-import { MissingMarkdownAgentError, parseMarkdownModelChain, resolveMarkdownAgent } from "./agents.js";
+import { MissingMarkdownAgentError, resolveMarkdownAgent } from "./agents.js";
 import { cloneRunView, createActivityState, createInitialRunView, reduceActivityEvent } from "./activity.js";
 import { QueuedActivityLogWriter, appendActivityLogFinished, appendActivityLogStarted, ensureActivityLogHeader, type DegradedActivityLogOptions } from "./activity-log.js";
 import { appendManifestRecord, findLatestEpisodeStartedRecordBySessionFile, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
-import { resolveRecordedSubagentModel, resolveSubagentModel, resolveSubagentThinkingLevel } from "./models.js";
+import { parseModelChain, resolveRecordedSubagentModel, resolveSubagentModel, resolveSubagentThinkingLevel } from "./models.js";
 import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult } from "./render.js";
 import { assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
 import { buildSubagentPromptEnvelope } from "./tool-prompts.js";
@@ -671,9 +671,8 @@ function resolveRunModelChoices(
   forkInheritedModel?: Model<Api>,
 ): { model: Model<Api> | undefined; thinkingLevel: string | undefined; fallbacks: ModelChoice[] } {
   // A call-level model replaces the chain, not just its first candidate.
-  const candidates = params.model !== undefined
-    ? [{ reference: params.model }]
-    : profile.model !== undefined ? parseMarkdownModelChain(profile.model) : [];
+  const selectedModel = params.model ?? profile.model;
+  const candidates = selectedModel === undefined ? [] : parseModelChain(selectedModel);
   const choices = candidates.map(({ reference, level }) => {
     const model = resolveSubagentModel(reference, ctx.modelRegistry, parentModel?.provider)!;
     return { model, thinkingLevel: resolveSubagentThinkingLevel(params.thinkingLevel ?? level ?? profile.thinkingLevel, model) };
