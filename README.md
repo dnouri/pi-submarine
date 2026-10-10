@@ -278,8 +278,13 @@ markdown agents, suppress `AGENTS.md` / `CLAUDE.md` context files, and
 keep normal skills. For named fresh runs, `agentsMd` controls
 context-file loading and `skills` controls skill loading; the agent
 body stays in the user prompt envelope rather than the child system
-prompt. Fork runs ignore those frontmatter resource controls but use
-the same user prompt envelope for omitted and named agents. A
+prompt. A skill marked `disable-model-invocation: true` remains hidden
+from automatic invocation, but a named agent may explicitly select it
+with `skills:`; the child receives an enabled in-memory copy while the
+original skill remains hidden for normal automatic selection.
+
+Fork runs ignore those frontmatter resource controls but use the same
+user prompt envelope for omitted and named agents. A
 frontmatter model or thinking level applies to both fresh and forked
 initial runs. A chained agent tries the next model only when the current
 model's initial provider turn ends with assistant `stopReason: "error"`

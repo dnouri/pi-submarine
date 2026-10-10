@@ -66,7 +66,7 @@ describe("subagent prompt-resource profiles", () => {
     expect(options.skillsOverride).toBeUndefined();
   });
 
-  it("filters named skills and fails when a requested skill is missing or hidden from model invocation", () => {
+  it("loads explicitly requested hidden skills without exposing them in the parent resource set", () => {
     const profile = namedSubagentProfile(namedAgent);
     const options = buildFreshResourceLoaderOptions(profile, { cwd: "/repo", agentDir: "/agent" });
     const base: { diagnostics: []; skills: Skill[] } = {
@@ -80,7 +80,14 @@ describe("subagent prompt-resource profiles", () => {
     expect(options.skillsOverride?.(base).skills.map((skill) => skill.name)).toEqual(["audit"]);
 
     const hiddenOptions = buildFreshResourceLoaderOptions(namedSubagentProfile({ ...namedAgent, skills: { names: ["hidden"] } }), { cwd: "/repo", agentDir: "/agent" });
-    expect(() => hiddenOptions.skillsOverride?.(base)).toThrow("Unavailable skill(s) for subagent 'reviewer': hidden");
+    const hiddenSkills = hiddenOptions.skillsOverride?.(base).skills;
+    expect(hiddenSkills).toHaveLength(1);
+    expect(hiddenSkills?.[0]).toMatchObject({ name: "hidden", disableModelInvocation: false });
+    expect(hiddenSkills?.[0]).not.toBe(base.skills[1]);
+    expect(base.skills[1]!.disableModelInvocation).toBe(true);
+
+    const missingOptions = buildFreshResourceLoaderOptions(namedSubagentProfile({ ...namedAgent, skills: { names: ["missing"] } }), { cwd: "/repo", agentDir: "/agent" });
+    expect(() => missingOptions.skillsOverride?.(base)).toThrow("Unavailable skill(s) for subagent 'reviewer': missing");
   });
 });
 
