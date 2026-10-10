@@ -93,7 +93,7 @@ describe("pi-submarine extension registration", () => {
     expect(guidelines).toContain("Role text inside `task` does not select an agent");
     expect(guidelines).toContain("Usually omit `cwd`");
     expect(guidelines).toContain("Call-level `model`/`thinkingLevel` override named-agent defaults");
-    expect(guidelines).toContain("An explicit `thinkingLevel` must be supported by every selected child model");
+    expect(guidelines).toContain("Every selected candidate must be registered, authenticated, and support its effective thinking level");
     expect(guidelines).toContain("Prefer a new `subagent` for follow-up or related work");
 
     expect(subagent?.parameters).toMatchObject({
@@ -101,7 +101,7 @@ describe("pi-submarine extension registration", () => {
         agent: { description: expect.stringContaining("project agents from the effective `cwd`") },
         task: { description: expect.stringContaining("does not see the parent conversation") },
         model: { description: expect.stringContaining("Replaces the whole frontmatter model chain") },
-        thinkingLevel: { description: expect.stringContaining("must be supported by each resolved model") },
+        thinkingLevel: { description: expect.stringContaining("See the thinking precedence and validation rules below") },
         context: { description: expect.stringContaining("Defaults to `fresh`") },
         cwd: { description: expect.stringContaining("Omit to inherit the caller cwd") },
       },

@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { getModel } from "@earendil-works/pi-ai";
 import { SessionManager, SettingsManager, type AgentSession, type AgentSessionEvent, type CreateAgentSessionOptions, type ExtensionContext, type ResourceLoader } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readManifestRecords } from "../src/manifest.js";
@@ -1385,20 +1386,29 @@ describe("subagent runner", () => {
     const first = thinkingModel("provider", "a");
     const second = thinkingModel("provider", "b");
     const registry = fakeModelRegistry([first, second]);
-
-    it.each([
+    const chainSources = [
       ["markdown", "reviewer"],
       ["omitted call", undefined],
       ["literal named call", "subagent"],
-    ])("retries a first-turn model error on the next candidate in the same child session and episode (%s)", async (source, agent) => {
-      const { root, cwd, parentSession, agentPath } = await chainFixture(MODEL_CHAIN, undefined, agent);
+    ] as const;
+
+    it.each(chainSources)("retries a first-turn model error on the next candidate in the same child session and episode (%s)", async (source, agent) => {
+      const { root, cwd, parentSession, agentPath } = await chainFixture(
+        source === "markdown" ? MODEL_CHAIN : "provider/a", undefined, agent,
+      );
       const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] });
 
-      const result = await runSubagent({
-        ...(agent === undefined ? {} : { agent }),
-        ...(source === "markdown" ? {} : { model: MODEL_CHAIN }),
-        task: "review this",
-      }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps });
+      const result = await runSubagent(
+        {
+          ...(agent === undefined ? {} : { agent }),
+          ...(source === "markdown" ? {} : { model: MODEL_CHAIN }),
+          task: "review this",
+        },
+        undefined,
+        undefined,
+        fakeContext(cwd, parentSession, { modelRegistry: registry }),
+        { deps },
+      );
 
       expectSubagentResult(result, agent === undefined ? "## Subagent result" : `## Subagent ${agent} result`, "child answer",
         "Model: provider/b — after failed attempts: provider/a (first provider failed)");
@@ -1438,22 +1448,26 @@ describe("subagent runner", () => {
       expect(childEntries).toContainEqual(expect.objectContaining({ type: "thinking_level_change", thinkingLevel: "high" }));
     });
 
-    it.each([
-      ["markdown", "reviewer"],
-      ["omitted call", undefined],
-      ["literal named call", "subagent"],
-    ])("tries a third model after two failed initial turns, retaining one resumable child session (%s)", async (source, agent) => {
+    it.each(chainSources)("tries a third model after two failed initial turns, retaining one resumable child session (%s)", async (source, agent) => {
       const third = thinkingModel("provider", "c");
       const chain = "provider/a@low,provider/b@high,provider/c@low";
-      const { root, cwd, parentSession, agentPath } = await chainFixture(chain, undefined, agent);
+      const { root, cwd, parentSession, agentPath } = await chainFixture(
+        source === "markdown" ? chain : "provider/a", undefined, agent,
+      );
       const { deps, sessions } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] },
         { messagesByPrompt: [[{ ...firstModelError, errorMessage: "second provider failed" }]] },
         { messagesByPrompt: [[fallbackAnswer]] });
-      const result = await runSubagent({
-        ...(agent === undefined ? {} : { agent }),
-        ...(source === "markdown" ? {} : { model: chain }),
-        task: "review",
-      }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, third]) }), { deps });
+      const result = await runSubagent(
+        {
+          ...(agent === undefined ? {} : { agent }),
+          ...(source === "markdown" ? {} : { model: chain }),
+          task: "review",
+        },
+        undefined,
+        undefined,
+        fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, third]) }),
+        { deps },
+      );
 
       expectSubagentResult(result, agent === undefined ? "## Subagent result" : `## Subagent ${agent} result`, "child answer",
         "Model: provider/c — after failed attempts: provider/a (first provider failed), provider/b (second provider failed)");
@@ -1508,10 +1522,16 @@ describe("subagent runner", () => {
     });
 
     it.each(["markdown", "call"])("stays on the first model when the first turn succeeds (%s)", async (source) => {
-      const { root, cwd, parentSession } = await chainFixture();
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
       const { deps, fakeSession } = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
 
-      const result = await runSubagent({ agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps });
+      const result = await runSubagent(
+        { agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) },
+        undefined,
+        undefined,
+        fakeContext(cwd, parentSession, { modelRegistry: registry }),
+        { deps },
+      );
 
       expectSubagentResult(result, "## Subagent reviewer result", "child answer", "Model: provider/a");
       expect(deps.createAgentSession).toHaveBeenCalledTimes(1);
@@ -1520,12 +1540,18 @@ describe("subagent runner", () => {
     });
 
     it.each(["markdown", "call"])("does not fall back when prompt rejects before a terminal assistant error (%s)", async (source) => {
-      const { root, cwd, parentSession } = await chainFixture();
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
       const { deps, firstSession, secondSession } = fakeChainDeps(root, {
         promptImpl: async () => { throw new Error("prompt preflight failed"); },
       });
 
-      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps }));
+      const message = await rejectedMessage(runSubagent(
+        { agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) },
+        undefined,
+        undefined,
+        fakeContext(cwd, parentSession, { modelRegistry: registry }),
+        { deps },
+      ));
 
       const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
       const sessionId = manifest[0]?.type === "started" ? manifest[0].sessionId : "";
@@ -1560,13 +1586,19 @@ describe("subagent runner", () => {
     });
 
     it.each(["markdown", "call"])("does not retry an all-error assistant sequence after tool activity (%s)", async (source) => {
-      const { root, cwd, parentSession } = await chainFixture();
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
       const { deps, firstSession, secondSession } = fakeChainDeps(root, {
         messagesByPrompt: [[firstModelError]],
         events: [event({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} })],
       });
 
-      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps }));
+      const message = await rejectedMessage(runSubagent(
+        { agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) },
+        undefined,
+        undefined,
+        fakeContext(cwd, parentSession, { modelRegistry: registry }),
+        { deps },
+      ));
 
       expect(message).toContain("first provider failed");
       expect(deps.createAgentSession).toHaveBeenCalledTimes(1);
@@ -1586,10 +1618,16 @@ describe("subagent runner", () => {
     });
 
     it.each(["markdown", "call"])("does not fall back on a child-aborted first turn (%s)", async (source) => {
-      const { root, cwd, parentSession } = await chainFixture();
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
       const { deps, fakeSession } = fakeDeps(root, { messagesByPrompt: [[{ role: "assistant", stopReason: "aborted" }]] });
 
-      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps }));
+      const message = await rejectedMessage(runSubagent(
+        { agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) },
+        undefined,
+        undefined,
+        fakeContext(cwd, parentSession, { modelRegistry: registry }),
+        { deps },
+      ));
 
       expect(message).toContain("Child subagent was aborted.");
       expect(deps.createAgentSession).toHaveBeenCalledTimes(1);
@@ -1598,14 +1636,20 @@ describe("subagent runner", () => {
     });
 
     it.each(["markdown", "call"])("does not fall back after a parent abort during the first attempt (%s)", async (source) => {
-      const { root, cwd, parentSession } = await chainFixture();
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
       const controller = new AbortController();
       const { deps, fakeSession } = fakeDeps(root, {
         messagesByPrompt: [[firstModelError]],
         promptImpl: async () => { controller.abort(); },
       });
 
-      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) }, controller.signal, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps }));
+      const message = await rejectedMessage(runSubagent(
+        { agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) },
+        controller.signal,
+        undefined,
+        fakeContext(cwd, parentSession, { modelRegistry: registry }),
+        { deps },
+      ));
 
       const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
       const sessionId = manifest[0]?.type === "started" ? manifest[0].sessionId : "";
@@ -1793,6 +1837,107 @@ describe("subagent runner", () => {
       expect(manifest[1]).toMatchObject({ type: "finished", status: "failed" });
     });
 
+    describe("catalog namespace IDs", () => {
+      const workersAI = getModel("cloudflare-workers-ai", "@cf/openai/gpt-oss-120b");
+      const gateway = getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.5");
+      const namespaceRegistry = fakeModelRegistry([first, workersAI, gateway]);
+
+      it.each([
+        "@cf/openai/gpt-oss-120b",
+        "cloudflare-workers-ai/@cf/openai/gpt-oss-120b",
+      ])("preserves the full catalog ID in a scalar call override (%s)", async (reference) => {
+        const { root, cwd, parentSession } = await chainFixture("provider/a", "high");
+        const { deps, fakeSession } = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
+
+        const result = await runSubagent(
+          { agent: "reviewer", task: "review", model: reference },
+          undefined,
+          undefined,
+          fakeContext(cwd, parentSession, { modelRegistry: namespaceRegistry }),
+          { deps },
+        );
+
+        expect(deps.createAgentSession).toHaveBeenCalledTimes(1);
+        expect(deps.createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+          model: expect.objectContaining({ provider: "cloudflare-workers-ai", id: "@cf/openai/gpt-oss-120b" }),
+          thinkingLevel: "high",
+        }));
+        expect(fakeSession.promptSettings).toEqual([{ model: workersAI, thinkingLevel: "high" }]);
+        expectSubagentResult(result, "## Subagent reviewer result", "child answer",
+          "Model: cloudflare-workers-ai/@cf/openai/gpt-oss-120b");
+      });
+
+      describe.each(["markdown", "call"])("%s chains", (source) => {
+        it.each([
+          ["unsuffixed", "@cf/openai/gpt-oss-120b,cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.5", "low", ["low", "low"]],
+          ["suffixed", "cloudflare-workers-ai/@cf/openai/gpt-oss-120b@low,workers-ai/@cf/moonshotai/kimi-k2.5@high", "medium", ["low", "high"]],
+        ] as const)("uses literal namespace IDs and effective levels through fallback (%s)", async (_case, chain, defaultLevel, levels) => {
+          const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a", defaultLevel);
+          const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] });
+
+          const result = await runSubagent(
+            { agent: "reviewer", task: "review", ...(source === "call" ? { model: chain } : {}) },
+            undefined,
+            undefined,
+            fakeContext(cwd, parentSession, { modelRegistry: namespaceRegistry }),
+            { deps },
+          );
+
+          expect(deps.createAgentSession.mock.calls.map(([options]) => [options.model?.provider, options.model?.id, options.thinkingLevel]))
+            .toEqual([
+              ["cloudflare-workers-ai", "@cf/openai/gpt-oss-120b", levels[0]],
+              ["cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.5", levels[1]],
+            ]);
+          expect(firstSession.promptSettings).toEqual([{ model: workersAI, thinkingLevel: levels[0] }]);
+          expect(secondSession.promptSettings).toEqual([{ model: gateway, thinkingLevel: levels[1] }]);
+          expectSubagentResult(result, "## Subagent reviewer result", "child answer",
+            "Model: cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.5 — after failed attempts: cloudflare-workers-ai/@cf/openai/gpt-oss-120b (first provider failed)");
+          expect(new Set(deps.createAgentSession.mock.calls.map(([options]) => options.sessionManager)).size).toBe(1);
+          expect(deps.createFreshSessionManager).toHaveBeenCalledTimes(1);
+          expect(deps.createEpisodeId).toHaveBeenCalledTimes(1);
+          const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
+          expect(manifest).toEqual([
+            expect.objectContaining({ type: "started", sessionId: result.details.run.sessionId }),
+            expect.objectContaining({ type: "finished", status: "completed" }),
+          ]);
+          const childFile = manifest[0]?.type === "started" ? manifest[0].sessionFile : "";
+          const restored = SessionManager.open(childFile, `${parentSession}.subagents`).buildSessionContext();
+          expect(restored).toMatchObject({
+            model: { provider: "cloudflare-ai-gateway", modelId: "workers-ai/@cf/moonshotai/kimi-k2.5" },
+            thinkingLevel: levels[1],
+          });
+          expect(restored.messages.at(-1)).toMatchObject({
+            ...fallbackAnswer, provider: "cloudflare-ai-gateway", model: "workers-ai/@cf/moonshotai/kimi-k2.5",
+          });
+          expect(restored.messages).not.toContainEqual(expect.objectContaining(firstModelError));
+        });
+
+        it.each([
+          ["empty", "cloudflare-workers-ai/@cf/openai/gpt-oss-120b@", "thinking level ''"],
+          ["unknown", "cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.5@turbo", "thinking level 'turbo'"],
+          ["duplicate", "cloudflare-workers-ai/@cf/openai/gpt-oss-120b@low@high", "empty or invalid candidate"],
+        ])("rejects a terminal %s suffix even with a call thinking override", async (_case, chain, reason) => {
+          const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a", "high");
+          const { deps } = fakeDeps(root);
+
+          const message = await rejectedMessage(runSubagent(
+            { agent: "reviewer", task: "review", thinkingLevel: "low", ...(source === "call" ? { model: chain } : {}) },
+            undefined,
+            undefined,
+            fakeContext(cwd, parentSession, { modelRegistry: namespaceRegistry }),
+            { deps },
+          ));
+
+          expect(message).toContain(reason);
+          expectNoRecoveryHandle(message);
+          expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+          expect(deps.createAgentSession).not.toHaveBeenCalled();
+          await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
+          await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
+        });
+      });
+    });
+
     it("accepts one call candidate with a thinking suffix and whitespace around a model ID containing slashes and colons", async () => {
       const { root, cwd, parentSession } = await chainFixture();
       const model = thinkingModel("provider", "family/a:variant");
@@ -1813,10 +1958,16 @@ describe("subagent runner", () => {
       ["call", "provider/a@low,provider/b", "high", ["low", "high"]],
       ["call", "provider/a,provider/b@high", "low", ["low", "high"]],
     ])("uses per-candidate levels before a named default, and the default for unsuffixed models (%s: %s)", async (source, chain, defaultLevel, levels) => {
-      const { root, cwd, parentSession } = await chainFixture(chain, defaultLevel);
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a", defaultLevel);
       const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] });
 
-      await runSubagent({ agent: "reviewer", task: "review", ...(source === "call" ? { model: chain } : {}) }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps });
+      await runSubagent(
+        { agent: "reviewer", task: "review", ...(source === "call" ? { model: chain } : {}) },
+        undefined,
+        undefined,
+        fakeContext(cwd, parentSession, { modelRegistry: registry }),
+        { deps },
+      );
 
       expect(deps.createAgentSession.mock.calls.map(([options]) => [options.model, options.thinkingLevel]))
         .toEqual([[first, levels[0]], [second, levels[1]]]);
@@ -1830,12 +1981,17 @@ describe("subagent runner", () => {
       ["call", "provider/a@max,provider/b@max,provider/c@max"],
     ])("applies a call-level thinking override to every selected candidate (%s: %s)", async (source, chain) => {
       const third = thinkingModel("provider", "c");
-      const { root, cwd, parentSession } = await chainFixture(chain, "high");
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a", "high");
       const { deps, sessions } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] },
         { messagesByPrompt: [[firstModelError]] }, { messagesByPrompt: [[fallbackAnswer]] });
 
-      await runSubagent({ agent: "reviewer", task: "review", thinkingLevel: "low", ...(source === "call" ? { model: chain } : {}) }, undefined, undefined,
-        fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, third]) }), { deps });
+      await runSubagent(
+        { agent: "reviewer", task: "review", thinkingLevel: "low", ...(source === "call" ? { model: chain } : {}) },
+        undefined,
+        undefined,
+        fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, third]) }),
+        { deps },
+      );
 
       expect(deps.createAgentSession.mock.calls.map(([options]) => [options.model, options.thinkingLevel]))
         .toEqual([[first, "low"], [second, "low"], [third, "low"]]);
@@ -1848,14 +2004,20 @@ describe("subagent runner", () => {
     });
 
     it.each(["markdown", "call"])("uses a named chain on a fork without branching again for the fallback (%s)", async (source) => {
-      const { root, cwd } = await chainFixture();
+      const { root, cwd } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
       const parentManager = SessionManager.create(cwd, path.join(root, "sessions"));
       parentManager.appendMessage({ role: "user", content: "Start here" } as Parameters<SessionManager["appendMessage"]>[0]);
       parentManager.appendMessage({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Ready" }] } as Parameters<SessionManager["appendMessage"]>[0]);
       const parentSession = parentManager.getSessionFile()!;
       const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] });
 
-      const result = await runSubagent({ agent: "reviewer", task: "review", context: "fork", ...(source === "call" ? { model: MODEL_CHAIN } : {}) }, undefined, undefined, fakeContext(cwd, parentSession, { leafId: parentManager.getLeafId(), modelRegistry: registry }), { deps });
+      const result = await runSubagent(
+        { agent: "reviewer", task: "review", context: "fork", ...(source === "call" ? { model: MODEL_CHAIN } : {}) },
+        undefined,
+        undefined,
+        fakeContext(cwd, parentSession, { leafId: parentManager.getLeafId(), modelRegistry: registry }),
+        { deps },
+      );
 
       expectSubagentResult(result, "## Subagent reviewer result", "child answer",
         "Model: provider/b — after failed attempts: provider/a (first provider failed)");
@@ -1883,7 +2045,7 @@ describe("subagent runner", () => {
     it.each(["markdown", "call"])("keeps a triple-chain fork on one child branch without leaking either failed attempt (%s)", async (source) => {
       const third = thinkingModel("provider", "c");
       const chain = "provider/a@low,provider/b@high,provider/c@low";
-      const { root, cwd } = await chainFixture(chain);
+      const { root, cwd } = await chainFixture(source === "markdown" ? chain : "provider/a");
       const parentManager = SessionManager.create(cwd, path.join(root, "sessions"));
       parentManager.appendMessage({ role: "user", content: "Start here" } as Parameters<SessionManager["appendMessage"]>[0]);
       parentManager.appendMessage({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Ready" }] } as Parameters<SessionManager["appendMessage"]>[0]);
@@ -1894,8 +2056,13 @@ describe("subagent runner", () => {
         { messagesByPrompt: [[{ ...firstModelError, errorMessage: "second provider failed" }]] },
         { messagesByPrompt: [[fallbackAnswer]] });
 
-      const result = await runSubagent({ agent: "reviewer", task: "review", context: "fork", ...(source === "call" ? { model: chain } : {}) }, undefined, undefined,
-        fakeContext(cwd, parentSession, { leafId: parentManager.getLeafId(), modelRegistry: fakeModelRegistry([first, second, third]) }), { deps });
+      const result = await runSubagent(
+        { agent: "reviewer", task: "review", context: "fork", ...(source === "call" ? { model: chain } : {}) },
+        undefined,
+        undefined,
+        fakeContext(cwd, parentSession, { leafId: parentManager.getLeafId(), modelRegistry: fakeModelRegistry([first, second, third]) }),
+        { deps },
+      );
 
       expectSubagentResult(result, "## Subagent reviewer result", "child answer",
         "Model: provider/c — after failed attempts: provider/a (first provider failed), provider/b (second provider failed)");

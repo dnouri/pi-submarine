@@ -13,7 +13,8 @@ export function parseModelChain(raw: string, fail: (reason: string) => never = (
   const parts = raw.split(",");
   if (parts.length > 3) fail("model chain must contain at most three candidates");
   return parts.map((part) => {
-    const [reference, level, extra] = part.trim().split("@");
+    // Only @ in the final path segment separates a thinking suffix.
+    const [reference, level, extra] = part.trim().split(/@(?=[^/]*$)/);
     if (!reference?.trim() || extra !== undefined) fail("model chain contains an empty or invalid candidate");
     if (level !== undefined && !(THINKING_LEVELS as readonly string[]).includes(level.trim())) {
       fail(`model candidate thinking level '${level?.trim()}' must be one of: ${THINKING_LEVELS.join(", ")}`);
