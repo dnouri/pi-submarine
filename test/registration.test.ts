@@ -6,6 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { IsObject } from "typebox";
 import { afterEach, assert, describe, expect, it } from "vitest";
 import register, { subagentListTool, subagentResumeTool, subagentTool } from "../src/index.js";
+import { TOOL_PROMPTS } from "../src/tool-prompts.js";
 
 type RegisteredTool = Parameters<ExtensionAPI["registerTool"]>[0];
 
@@ -92,17 +93,31 @@ describe("pi-submarine extension registration", () => {
     expect(validateToolArguments(subagentTool, { type: "toolCall", id: "valid", name: "subagent", arguments: args })).toEqual(args);
   });
 
-  it("supplies model-facing help for every tool and parameter", () => {
-    for (const tool of registeredToolsFromFactory()) {
-      expect(tool.description).toMatch(/\S/);
-      expect(tool.promptSnippet).toMatch(/\S/);
+  it("registers model-facing help from TOOL_PROMPTS for every tool and parameter", () => {
+    const tools = registeredToolsFromFactory();
+    for (const [name, prompt] of [
+      ["subagent", TOOL_PROMPTS.subagent],
+      ["subagent_resume", TOOL_PROMPTS.subagentResume],
+      ["subagent_list", TOOL_PROMPTS.subagentList],
+    ] as const) {
+      const tool = tools.find((tool) => tool.name === name);
+      assert(tool && IsObject(tool.parameters));
+      expect(tool.description.trim().length).toBeGreaterThan(0);
+      expect(tool.promptSnippet?.trim().length).toBeGreaterThan(0);
       expect(tool.promptGuidelines?.length).toBeGreaterThan(0);
-      for (const guideline of tool.promptGuidelines ?? []) {
-        expect(guideline).toMatch(/\S/);
-      }
-      assert(IsObject(tool.parameters));
-      for (const parameter of Object.values(tool.parameters.properties)) {
-        expect(parameter).toMatchObject({ description: expect.stringMatching(/\S/) });
+      expect(tool.promptGuidelines?.every((guideline) => guideline.trim().length > 0)).toBe(true);
+      expect(tool).toMatchObject({
+        description: prompt.description,
+        promptSnippet: prompt.promptSnippet,
+        promptGuidelines: prompt.promptGuidelines,
+      });
+      expect(Object.keys(tool.parameters.properties).sort()).toEqual(
+        Object.keys(prompt.parameterDescriptions).sort(),
+      );
+      for (const [parameterName, description] of Object.entries(prompt.parameterDescriptions)) {
+        const parameter = tool.parameters.properties[parameterName];
+        expect(parameter).toHaveProperty("description", expect.stringMatching(/\S/));
+        expect(parameter).toMatchObject({ description });
       }
     }
   });

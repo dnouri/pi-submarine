@@ -24,19 +24,20 @@ subagent({
 
 Fresh children do not see the parent conversation or its attached images. Include background, paths, constraints, and expected output in `task`. For images, provide child-readable file paths.
 
-Use a named agent, a model chain, or copied history when the task needs one:
+When the child needs project instructions, enable normal context-file discovery:
 
 ```ts
 subagent({
-	agent: "reviewer",
-	model: "acme/fast@low,acme/steady@high",
-	agentsMd: "none",
-	task: "Review src/runner.ts for regressions. Report paths and failure cases.",
+	agentsMd: "auto",
+	task: "Review src/runner.ts for regressions using the project instructions. Report paths and failure cases. Do not edit files.",
 })
-subagent({ context: "fork", task: "Check the last plan against the current code. Do not edit." })
 ```
 
-Model names in these examples are placeholders. Use `subagent_list({})` to find visible agents and authenticated models with supported effort levels.
+Use copied history when the task needs the parent conversation:
+
+```ts
+subagent({ context: "fork", task: "Check the last plan against the current code. Do not edit." })
+```
 
 ## Arguments
 
@@ -71,9 +72,20 @@ A bare model ID prefers a match from the parent's provider, then the only authen
 
 Without a selected model chain, a fresh child inherits the parent model. A fork restores the model and effort from the copied branch.
 
-One chain runs one child, not parallel children. Fallback occurs only after an initial provider-error response, before assistant success or tool progress. Prompt rejection, abort, later errors, and an exhausted chain do not trigger fallback. Retries keep the same child session ID. Failed attempts remain inspectable in its JSONL file but stay outside the active conversation.
+Comma order selects fallback candidates for one child, not parallel children:
 
-Separate calls can run in parallel through Pi's native multi-tool calling. The extension does not add background jobs or a workflow engine.
+```ts
+subagent({
+	model: "acme/first@low,acme/second@high",
+	task: "Review src/runner.ts for regressions. Report paths and failure cases. Do not edit files.",
+})
+```
+
+Model names in these examples are placeholders. Use `subagent_list({})` when agent names, models, or supported effort levels are unknown.
+
+Fallback advances only on an initial provider error before assistant success or tool progress. Prompt rejection, abort, later failures, and weak answers do not trigger fallback. An exhausted chain returns the failure. Retries keep the same child session ID. Failed attempts remain inspectable in its JSONL file but stay outside the active conversation.
+
+When available, the host's `multi_tool_use.parallel` can run independent calls together. Each call still waits for its foreground child. Start dependent calls in a later foreground wave after their prerequisites finish. The extension adds no detached background jobs or workflow engine.
 
 ## Named agents
 
@@ -82,12 +94,22 @@ Create `.pi/agents/reviewer.md` in your project:
 ```md
 ---
 description: Reviews code for concrete regressions
-model: acme/fast@low,acme/steady@high
 agentsMd: auto
-skills: audit
+skills: auto
 ---
 
 Inspect the requested changes. Separate verified failures from concerns.
+```
+
+This profile inherits the parent model unless you set a model chain in the profile or call.
+
+After creating the file, select it by filename stem:
+
+```ts
+subagent({
+	agent: "reviewer",
+	task: "Review src/runner.ts for regressions. Report paths and failure cases. Do not edit files.",
+})
 ```
 
 The four allowed frontmatter keys are:
