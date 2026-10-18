@@ -3,7 +3,6 @@ import path from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   DefaultResourceLoader,
-  buildSessionContext,
   createAgentSession,
   getAgentDir,
   SessionManager,
@@ -25,7 +24,7 @@ import { parseModelChain, resolveRecordedSubagentModel, resolveSubagentModel, re
 import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult } from "./render.js";
 import { assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
 import { buildSubagentPromptEnvelope } from "./tool-prompts.js";
-import { DEFAULT_AGENT_ALIAS, OMITTED_AGENT_LABEL, type AgentSelection, type MarkdownAgent, type SubagentContextMode, type SubagentContextUsage, type SubagentParams, type SubagentResumeParams, type SubagentToolDetails, type TextToolResult } from "./types.js";
+import { DEFAULT_AGENT_ALIAS, OMITTED_AGENT_LABEL, type AgentResourceMode, type AgentSelection, type MarkdownAgent, type SubagentContextMode, type SubagentContextUsage, type SubagentParams, type SubagentResumeParams, type SubagentToolDetails, type TextToolResult } from "./types.js";
 
 type DefaultResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
 type ProjectTrustedSettingsManager = ReturnType<typeof SettingsManager.create>;
@@ -39,8 +38,7 @@ export interface SubagentPromptProfile {
   agentFile?: string;
   agentBody?: string;
   model?: string;
-  thinkingLevel?: string;
-  agentsMd: "none" | "auto";
+  agentsMd: AgentResourceMode;
   skills: MarkdownAgent["skills"];
 }
 
@@ -82,6 +80,7 @@ interface BaseRunPlan {
 
 interface FreshRunPlan extends BaseRunPlan {
   context: "fresh";
+  agentsMdOverride?: AgentResourceMode;
 }
 
 interface ForkRunPlan extends BaseRunPlan {
@@ -174,13 +173,12 @@ export function namedSubagentProfile(agent: MarkdownAgent): SubagentPromptProfil
     agentFile: agent.filePath,
     agentBody: agent.body,
     ...(agent.model === undefined ? {} : { model: agent.model }),
-    ...(agent.thinkingLevel === undefined ? {} : { thinkingLevel: agent.thinkingLevel }),
     agentsMd: agent.agentsMd,
     skills: agent.skills,
   };
 }
 
-export function buildFreshResourceLoaderOptions(profile: SubagentPromptProfile, options: { cwd: string; agentDir: string; settingsManager?: ProjectTrustedSettingsManager; extensionFactories?: ExtensionFactory[] }): DefaultResourceLoaderOptions {
+export function buildFreshResourceLoaderOptions(profile: SubagentPromptProfile, options: { cwd: string; agentDir: string; settingsManager?: ProjectTrustedSettingsManager; extensionFactories?: ExtensionFactory[] }, agentsMdOverride?: AgentResourceMode): DefaultResourceLoaderOptions {
   const loaderOptions: DefaultResourceLoaderOptions = {
     cwd: options.cwd,
     agentDir: options.agentDir,
@@ -188,7 +186,7 @@ export function buildFreshResourceLoaderOptions(profile: SubagentPromptProfile, 
 
   if (options.settingsManager) loaderOptions.settingsManager = options.settingsManager;
   if (options.extensionFactories && options.extensionFactories.length > 0) loaderOptions.extensionFactories = options.extensionFactories;
-  if (profile.agentsMd === "none") loaderOptions.noContextFiles = true;
+  if ((agentsMdOverride ?? profile.agentsMd) === "none") loaderOptions.noContextFiles = true;
   if (profile.skills === "none") {
     loaderOptions.noSkills = true;
   } else if (typeof profile.skills === "object") {
@@ -529,7 +527,7 @@ async function prepareResumeRun(
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
   const resourceLoader = deps.createResourceLoader(startedRecord.context === "fresh"
-    ? buildFreshResourceLoaderOptions(profile, loaderContext)
+    ? buildFreshResourceLoaderOptions(profile, loaderContext, startedRecord.agentsMdOverride)
     : buildForkResourceLoaderOptions(loaderContext));
   await resourceLoader.reload();
 
@@ -580,11 +578,12 @@ async function prepareFreshRun(
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
-  const resourceLoader = deps.createResourceLoader(buildFreshResourceLoaderOptions(profile, loaderContext));
+  const resourceLoader = deps.createResourceLoader(buildFreshResourceLoaderOptions(profile, loaderContext, params.agentsMd));
   await resourceLoader.reload();
 
   return {
     context: "fresh",
+    ...(params.agentsMd === undefined ? {} : { agentsMdOverride: params.agentsMd }),
     effectiveCwd,
     profile,
     root,
@@ -609,6 +608,7 @@ async function prepareForkRun(
   extensionFactories: ExtensionFactory[] | undefined,
 ): Promise<ForkRunPlan> {
   if (params.cwd !== undefined) throw new Error("cwd is not supported with context 'fork'.");
+  if (params.agentsMd !== undefined) throw new Error("agentsMd is not supported with context 'fork'. Use it only with fresh runs.");
   throwIfAborted(signal, "Subagent run was aborted before child execution.");
 
   const parentSessionFile = ctx.sessionManager.getSessionFile();
@@ -627,15 +627,7 @@ async function prepareForkRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, { userAgentsDir });
-  // A fork with no explicit model still has a model on its copied branch.
-  // Validate requested thinking against that model before SDK clamping can occur.
-  const needsInheritedModel = params.model === undefined && profile.model === undefined
-    && (params.thinkingLevel ?? profile.thinkingLevel) !== undefined;
-  const recorded = needsInheritedModel ? buildSessionContext(sourceSessionManager.getBranch(currentLeafId)).model : undefined;
-  const inheritedModel = recorded
-    ? resolveRecordedSubagentModel(recorded.provider, recorded.modelId, ctx.modelRegistry)
-    : ctx.model;
-  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, ctx.model, "fork", inheritedModel);
+  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, ctx.model, "fork");
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
@@ -668,21 +660,16 @@ function resolveRunModelChoices(
   ctx: ExtensionContext,
   parentModel: Model<Api> | undefined,
   context: SubagentContextMode,
-  forkInheritedModel?: Model<Api>,
 ): { model: Model<Api> | undefined; thinkingLevel: string | undefined; fallbacks: ModelChoice[] } {
   // A call-level model replaces the chain, not just its first candidate.
   const selectedModel = params.model ?? profile.model;
   const candidates = selectedModel === undefined ? [] : parseModelChain(selectedModel);
   const choices = candidates.map(({ reference, level }) => {
     const model = resolveSubagentModel(reference, ctx.modelRegistry, parentModel?.provider)!;
-    return { model, thinkingLevel: resolveSubagentThinkingLevel(params.thinkingLevel ?? level ?? profile.thinkingLevel, model) };
+    return { model, thinkingLevel: resolveSubagentThinkingLevel(level, model) };
   });
   const model = choices[0]?.model ?? (context === "fresh" ? parentModel : undefined);
-  const requestedLevel = params.thinkingLevel ?? profile.thinkingLevel;
-  if (requestedLevel !== undefined && !model && !forkInheritedModel) {
-    throw new Error(`Cannot validate subagent thinking level '${requestedLevel}' without a resolved model. Specify a model first.`);
-  }
-  const thinkingLevel = choices[0]?.thinkingLevel ?? resolveSubagentThinkingLevel(requestedLevel, model ?? forkInheritedModel);
+  const thinkingLevel = choices[0]?.thinkingLevel;
   return { model, thinkingLevel, fallbacks: choices.slice(1) };
 }
 
@@ -760,7 +747,9 @@ function assertUsableStartedRecord(record: StartedManifestRecord, sessionId: str
     || typeof record.cwd !== "string"
     || (record.context !== "fresh" && record.context !== "fork")
     || typeof record.sessionFile !== "string"
-    || typeof record.activityLog !== "string") {
+    || typeof record.activityLog !== "string"
+    || (Object.hasOwn(record, "agentsMdOverride")
+      && (record.context !== "fresh" || (record.agentsMdOverride !== "none" && record.agentsMdOverride !== "auto")))) {
     throw new Error(`Subagent session '${sessionId}' has an invalid manifest record.`);
   }
 }
@@ -885,6 +874,7 @@ async function startRunArtifacts(
     agent: plan.profile.agentName,
     cwd: plan.effectiveCwd,
     context: plan.context,
+    ...(plan.context === "fresh" && plan.agentsMdOverride !== undefined ? { agentsMdOverride: plan.agentsMdOverride } : {}),
     sessionFile: childSessionFile,
     activityLog,
     agentFile: plan.profile.agentFile ?? null,

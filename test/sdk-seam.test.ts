@@ -1,9 +1,11 @@
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { getModel } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import register from "../src/index.js";
+import { buildFreshResourceLoaderOptions, namedSubagentProfile, omittedSubagentProfile } from "../src/runner.js";
 
 const tempRoots: string[] = [];
 
@@ -163,6 +165,115 @@ export default function(pi) {
       expect(firstManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(1);
     } finally {
       second.dispose();
+    }
+  });
+
+  it.each([
+    ["omitted", "none"], ["omitted", "auto"],
+    ["named skills none", "none"], ["named skills none", "auto"],
+    ["named selected skills", "none"], ["named selected skills", "auto"],
+  ] as const)("loads actual context markers independently of skills (%s, %s)", async (selection, agentsMd) => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    const agentDir = path.join(root, "agent-dir");
+    await mkdir(cwd, { recursive: true });
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(path.join(agentDir, "AGENTS.md"), "SDK_USER_CONTEXT_MARKER", "utf8");
+    await writeFile(path.join(cwd, "AGENTS.md"), "SDK_PROJECT_CONTEXT_BEFORE", "utf8");
+    for (const name of ["audit", "other"]) {
+      const skillDir = path.join(cwd, ".pi", "skills", name);
+      await mkdir(skillDir, { recursive: true });
+      await writeFile(path.join(skillDir, "SKILL.md"), `---\nname: ${name}\ndescription: SDK ${name} skill marker\n---\n\nRead the requested code.\n`, "utf8");
+    }
+    const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
+    const profile = selection === "omitted" ? omittedSubagentProfile() : namedSubagentProfile({
+      name: "reviewer", description: "Reviews", source: "project", filePath: path.join(cwd, ".pi", "agents", "reviewer.md"), body: "Named body marker.",
+      agentsMd: agentsMd === "none" ? "auto" : "none",
+      skills: selection === "named skills none" ? "none" : { names: ["audit"] },
+    });
+    const loader = new DefaultResourceLoader(buildFreshResourceLoaderOptions(profile, { cwd, agentDir, settingsManager }, agentsMd));
+    await loader.reload();
+    const contents = loader.getAgentsFiles().agentsFiles.map((file) => file.content).join("\n");
+    if (agentsMd === "auto") {
+      expect(contents).toContain("SDK_USER_CONTEXT_MARKER");
+      expect(contents).toContain("SDK_PROJECT_CONTEXT_BEFORE");
+    } else {
+      expect(contents).not.toContain("SDK_USER_CONTEXT_MARKER");
+      expect(contents).not.toContain("SDK_PROJECT_CONTEXT_BEFORE");
+    }
+    const skillNames = loader.getSkills().skills.map((skill) => skill.name);
+    if (selection === "named skills none") expect(skillNames).toEqual([]);
+    else if (selection === "named selected skills") expect(skillNames).toEqual(["audit"]);
+    else expect(skillNames).toEqual(expect.arrayContaining(["audit", "other"]));
+
+    await writeFile(path.join(cwd, "AGENTS.md"), "SDK_PROJECT_CONTEXT_AFTER", "utf8");
+    await loader.reload();
+    const reloaded = loader.getAgentsFiles().agentsFiles.map((file) => file.content).join("\n");
+    expect(reloaded).not.toContain("SDK_PROJECT_CONTEXT_BEFORE");
+    expect(reloaded.includes("SDK_PROJECT_CONTEXT_AFTER")).toBe(agentsMd === "auto");
+    const { session } = await createAgentSession({ cwd, agentDir, settingsManager, resourceLoader: loader, sessionManager: SessionManager.inMemory(cwd), model: getModel("anthropic", "claude-opus-4-5"), tools: ["read"] });
+    try {
+      expect(session.systemPrompt.includes("SDK_PROJECT_CONTEXT_AFTER")).toBe(agentsMd === "auto");
+      expect(session.systemPrompt.includes("SDK_USER_CONTEXT_MARKER")).toBe(agentsMd === "auto");
+      expect(session.systemPrompt.includes("SDK audit skill marker")).toBe(selection !== "named skills none");
+      expect(session.systemPrompt).not.toContain("Named body marker.");
+    } finally {
+      session.dispose();
+    }
+  });
+
+  it("lets the real SDK select effort from settings when no explicit level is supplied", async () => {
+    const root = await tempRoot();
+    const settingsManager = SettingsManager.inMemory({ defaultThinkingLevel: "high" });
+    const resourceLoader = new DefaultResourceLoader({ cwd: root, agentDir: path.join(root, "agent"), settingsManager, noContextFiles: true });
+    await resourceLoader.reload();
+    const manager = SessionManager.inMemory(root);
+    const { session } = await createAgentSession({ cwd: root, agentDir: path.join(root, "agent"), model: getModel("anthropic", "claude-opus-4-5"), settingsManager, resourceLoader, sessionManager: manager, noTools: "all" });
+    try {
+      expect(session.thinkingLevel).toBe("high");
+      expect(manager.buildSessionContext().thinkingLevel).toBe("high");
+    } finally {
+      session.dispose();
+    }
+  });
+
+  it("persists explicit SDK effort and restores it without an effort override or network request", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    const agentDir = path.join(root, "agent-dir");
+    await mkdir(cwd, { recursive: true });
+    const settingsManager = SettingsManager.inMemory({ defaultThinkingLevel: "high" });
+    const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noContextFiles: true });
+    await resourceLoader.reload();
+    const manager = SessionManager.create(cwd, path.join(root, "sessions"));
+    const model = getModel("anthropic", "claude-opus-4-5");
+    const { session: first } = await createAgentSession({ cwd, agentDir, model, thinkingLevel: "low", settingsManager, resourceLoader, sessionManager: manager, noTools: "all" });
+    try {
+      expect(first.thinkingLevel).toBe("low");
+      expect(manager.getEntries()).toContainEqual(expect.objectContaining({ type: "thinking_level_change", thinkingLevel: "low" }));
+      manager.appendMessage({ role: "user", content: "Synthetic persisted request.", timestamp: 1 });
+      manager.appendMessage({
+        role: "assistant", content: [{ type: "text", text: "Synthetic persisted answer." }], api: model.api, provider: model.provider, model: model.id,
+        stopReason: "stop", timestamp: 2,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      });
+    } finally {
+      first.dispose();
+    }
+    const sessionFile = manager.getSessionFile();
+    if (!sessionFile) throw new Error("Expected persisted SDK session");
+    expect(await readFile(sessionFile, "utf8")).toContain('"thinkingLevel":"low"');
+    const reopened = SessionManager.open(sessionFile);
+    await resourceLoader.reload();
+    const { session: restored } = await createAgentSession({ cwd, agentDir, model, settingsManager, resourceLoader, sessionManager: reopened, noTools: "all" });
+    try {
+      expect(settingsManager.getDefaultThinkingLevel()).toBe("high");
+      expect(restored.thinkingLevel).toBe("low");
+      expect(restored.messages).toHaveLength(2);
+      expect(reopened.buildSessionContext()).toMatchObject({ model: { provider: model.provider, modelId: model.id }, thinkingLevel: "low" });
+      expect(reopened.getEntries().filter((entry) => entry.type === "thinking_level_change")).toHaveLength(1);
+    } finally {
+      restored.dispose();
     }
   });
 

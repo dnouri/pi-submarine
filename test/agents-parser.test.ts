@@ -27,11 +27,10 @@ describe("strict markdown agent parsing", () => {
     });
   });
 
-  it("parses optional model, agentsMd, skills, and thinkingLevel controls", () => {
-    const agent = parse(validAgent("description: Researches\nmodel: openrouter/z-ai/glm-5v-turbo:free\nthinkingLevel: high\nagentsMd: auto\nskills: none"));
+  it("parses the four frontmatter keys with a model effort suffix", () => {
+    const agent = parse(validAgent("description: Researches\nmodel: openrouter/z-ai/glm-5v-turbo:free@high\nagentsMd: auto\nskills: none"));
 
-    expect(agent.model).toBe("openrouter/z-ai/glm-5v-turbo:free");
-    expect(agent.thinkingLevel).toBe("high");
+    expect(agent.model).toBe("openrouter/z-ai/glm-5v-turbo:free@high");
     expect(agent.agentsMd).toBe("auto");
     expect(agent.skills).toBe("none");
     expect(parse(validAgent("description: Researches\nskills: research, audit")).skills).toEqual({ names: ["research", "audit"] });
@@ -81,8 +80,8 @@ describe("strict markdown agent parsing", () => {
     ["unknown candidate level", "---\ndescription: Reviews\nmodel: provider/a@turbo\n---\nBody", "thinking level 'turbo'"],
     ["missing candidate level", "---\ndescription: Reviews\nmodel: provider/a@\n---\nBody", "thinking level ''"],
     ["extra level separator", "---\ndescription: Reviews\nmodel: provider/a@low@high\n---\nBody", "empty or invalid candidate"],
-    ["invalid thinkingLevel", "---\ndescription: Reviews\nthinkingLevel: turbo\n---\nBody", "thinkingLevel must be one of: off, minimal, low, medium, high, xhigh, max"],
-    ["duplicate thinkingLevel key", "---\ndescription: Reviews\nthinkingLevel: high\nthinkingLevel: low\n---\nBody", "duplicate key 'thinkingLevel'"],
+    ["removed thinkingLevel", "---\ndescription: Reviews\nthinkingLevel: low\n---\nBody", "unknown key 'thinkingLevel'"],
+    ["invalid removed thinkingLevel", "---\ndescription: Reviews\nthinkingLevel: turbo\n---\nBody", "unknown key 'thinkingLevel'"],
     ["quoted double value", "---\ndescription: \"Reviews\"\n---\nBody", "quoted values are invalid"],
     ["quoted single value", "---\ndescription: 'Reviews'\n---\nBody", "quoted values are invalid"],
     ["invalid agentsMd", "---\ndescription: Reviews\nagentsMd: yes\n---\nBody", "agentsMd must be 'none' or 'auto'"],

@@ -1,320 +1,154 @@
-# pi-submarine 🥽
+# pi-submarine
 
-`pi-submarine` is a minimal Pi extension for delegating tasks to child
-Pi sessions, also known as *subagents*. The parent receives compact
-run metadata, the child session ID, and the child's final answer.
+Delegate one focused task to a child Pi session. Each `subagent` call waits for the child's answer and returns its session ID without copying the child transcript into the parent.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/dnouri/pi-submarine/0.4/media/pi-submarine.gif" alt="pi-submarine animation" width="480">
 </p>
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/dnouri/pi-submarine/main/media/overview.png" alt="pi-submarine delegation overview: a parent session issues subagent() calls that run as parallel child sessions, each returning a compact result">
-</p>
+## Start a child
 
-The diagram shows the delegation model: each `subagent()` call runs one
-focused child Pi session, calls in the same turn run in parallel, and each
-call returns a compact result without the child transcript.
+Install the extension in Pi `0.79.1` or newer:
 
-## Features
+```bash
+pi install npm:pi-submarine
+```
 
-- Fresh child sessions for isolated work, or forked child sessions
-  when the child should inherit the current conversation branch.
-- Named agents defined by simple markdown files with five frontmatter
-  knobs: `description`, `model`, `thinkingLevel`, `agentsMd`, and
-  `skills`.
-- Per-agent model and thinking-level defaults, with optional first-turn
-  fallback across up to three models. Call-level `model`/`thinkingLevel`
-  overrides work in both default and named-agent modes.
-- Agent discovery for user-level and project-level markdown agents,
-  including `subagent_list` for showing what is visible from a cwd.
-- Runtime status updates that report activity, turn counts, nested
-  children, and context usage.
-- An append-only `<parent-session>.jsonl.subagents.md` activity log
-  that can be tailed while children run.
-- Nested subagents, with a depth limit to prevent accidental circular
-  delegation.
-- Support for parallel subagents through Pi's native multi tool
-  calling.
-- Resumable child sessions through `subagent_resume` for recovery
-  after an interruption or failure, or when the user explicitly asks
-  to resume that exact child session.
-
-The package is deliberately narrow: one `subagent` call runs one
-foreground child Pi session and waits for it.  It does not provide
-built-in agent roles, background jobs, workflow chains, dashboards, or a
-workflow engine.
-
-## Usage
-
-The extension registers three tools:
+Give a fresh child a self-contained task:
 
 ```ts
-subagent({ agent?, task, model?, thinkingLevel?, context?, cwd? })
+subagent({
+	task: "Read src/runner.ts and its tests. Report concrete failure cases. Do not edit files.",
+})
+```
+
+Fresh children do not see the parent conversation or its attached images. Include background, paths, constraints, and expected output in `task`. For images, provide child-readable file paths.
+
+Use a named agent, a model chain, or copied history when the task needs one:
+
+```ts
+subagent({
+	agent: "reviewer",
+	model: "acme/fast@low,acme/steady@high",
+	agentsMd: "none",
+	task: "Review src/runner.ts for regressions. Report paths and failure cases.",
+})
+subagent({ context: "fork", task: "Check the last plan against the current code. Do not edit." })
+```
+
+Model names in these examples are placeholders. Use `subagent_list({})` to find visible agents and authenticated models with supported effort levels.
+
+## Arguments
+
+The extension registers three strict tools. Unknown arguments are rejected.
+
+```ts
+subagent({ task, agent?, model?, agentsMd?, context?, cwd? })
 subagent_resume({ sessionId, message })
 subagent_list({ cwd? })
 ```
 
-All three tools use strict parameter schemas: unknown properties are
-rejected.
+| `subagent` argument | Meaning |
+| --- | --- |
+| `task` | Required child task and expected output. Role text does not select a named agent. |
+| `agent` | Markdown filename stem. Omit it for an unnamed child. Project agents override same-named user agents. |
+| `model` | One to three comma-separated model IDs or `provider/model` references, each optionally suffixed with `@effort`. Replaces the profile's whole model chain. |
+| `agentsMd` | Fresh-only context-file override. `none` skips automatic context-file loading. `auto` enables normal discovery. An explicit choice persists on resume. |
+| `context` | `fresh` by default. `fork` copies the selected parent branch and forbids both `cwd` and `agentsMd`. |
+| `cwd` | Fresh-only workspace, relative to the caller cwd. Defaults to the caller cwd. Tools, project-agent discovery, and Pi resources use this directory. |
 
-> [!IMPORTANT]
-> `pi-submarine` treats project-local Pi inputs for the child cwd as trusted. Review unfamiliar `.pi/` and `.agents/` files before running subagents.
+Usually omit `cwd`. To work on files outside the project, put their paths in `task` unless that other directory must define the child's project resources. If an explicit cwd hides a named agent visible from the caller cwd, the error explains how to find it.
 
-The common calls are intentionally small:
+A literal `agent: "subagent"` loads `subagent.md`. The name `default` selects the unnamed mode only when no `default.md` is visible.
 
-```ts
-subagent({ task: "Inspect src/runner.ts and summarize the control flow." })
-subagent({ model: "acme/acme-5v-turbo", task: "Read screenshots/login.png and return its contents." })
-subagent({ agent: "reviewer", model: "acme/fast@low,acme/steady@high", task: "Review src/runner.ts." })
-subagent({ context: "fork", task: "Use the current conversation branch to check my last plan." })
-```
+### Models and fallback
 
-Choose model references and supported levels from `subagent_list`.
-One comma-separated model chain is one child with fallback, not parallel
-children.
+Effort uses only model suffixes, in calls and agent files. The suffix vocabulary is `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Support depends on the model and installed Pi version.
 
-Fresh runs are independent child sessions. They can use files and
-tools in their cwd, but they do not see the current parent
-conversation, so put the needed background, paths, constraints, and
-desired output in `task`. Fresh calls do not forward images attached
-to the parent turn; include child-readable image paths in `task`.
-Use `context: "fork"` only when the child should inherit a copy of the
-current conversation, including images already present on that branch.
+Each selected candidate must be registered, authenticated, and support its requested suffix before any child session, manifest, or activity log is created. Candidates are never skipped and requested levels are never clamped. Unsuffixed candidates leave effort selection to Pi.
 
-### `subagent({ agent?, task, model?, thinkingLevel?, context?, cwd? })`
+A bare model ID prefers a match from the parent's provider, then the only authenticated match. Ambiguous IDs require a canonical `provider/model` reference. An `@` before the final slash remains part of the ID, as in `@cf/openai/gpt-oss-120b`. Empty, unknown, or duplicate suffixes fail validation.
 
-Runs one focused task in a child Pi session and returns compact session metadata plus the child's final answer.
+Without a selected model chain, a fresh child inherits the parent model. A fork restores the model and effort from the copied branch.
 
-Arguments:
+One chain runs one child, not parallel children. Fallback occurs only after an initial provider-error response, before assistant success or tool progress. Prompt rejection, abort, later errors, and an exhausted chain do not trigger fallback. Retries keep the same child session ID. Failed attempts remain inspectable in its JSONL file but stay outside the active conversation.
 
-- `task` is required. It is the prompt for the child session.
-- `agent` is optional. Omit it for the generic default mode. Pass a
-  filename stem such as `"vision"` to use a markdown agent named
-  `vision.md`. A literal `agent: "subagent"` means the markdown file
-  `subagent.md`; omission is the only way to request the default mode,
-  although a literal `agent: "default"` is tolerated and resolves to
-  the default mode whenever no `default.md` is visible.
-- `model` is optional. Pass one to three comma-separated model IDs or
-  canonical `provider/model-id` references, each optionally suffixed
-  with `@thinkingLevel` in the final slash-delimited path segment.
-  Earlier `@` characters stay in the model ID, as in
-  `@cf/openai/gpt-oss-120b`. Surrounding whitespace is ignored; slashes
-  and colons in IDs are preserved. Empty, unknown, or duplicate
-  suffixes are invalid. The selected string replaces the named agent's
-  entire frontmatter model chain for this call. A one-model override
-  leaves no profile backups.
-- `thinkingLevel` is optional. Pass one of Pi's thinking levels
-  (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) for this
-  call.
-- `context` is optional and defaults to `"fresh"`. Use `"fresh"` for a
-  new child session. Use `"fork"` only when the child must inherit the
-  current conversation branch.
-- `cwd` is optional and valid only with fresh runs. Usually omit it;
-  the child then uses the caller cwd. Set it only when another
-  directory should be the child's workspace/project: relative tool
-  paths and bash run there, and project-agent discovery, context
-  files such as `AGENTS.md` / `CLAUDE.md`, skills, and Pi resources
-  follow that cwd. Relative `cwd` values resolve from the caller cwd.
+Separate calls can run in parallel through Pi's native multi-tool calling. The extension does not add background jobs or a workflow engine.
 
-Every selected candidate must match Pi's current model catalog, have
-configured authentication, and support its effective thinking level
-before a child session file, manifest, or activity log is created.
-Missing, unauthenticated, or unsupported candidates cause an error;
-they are not skipped.
+## Named agents
 
-For a bare model ID, `pi-submarine` first prefers a matching model from
-the parent's provider, then the only authenticated match; otherwise it
-asks for a canonical reference. If neither the call nor the agent
-chooses a model, fresh runs inherit the parent model and fork runs
-restore the model from the copied branch.
-
-Thinking precedence for each selected candidate is call-level
-`thinkingLevel`, then its suffix, then frontmatter `thinkingLevel`.
-Only the effective level must be supported by the resolved model; a
-supported call-level override can shadow an unsupported but valid
-suffix. An unsupported effective level fails with an error listing the
-supported levels rather than silently clamping. When no level is
-requested, fresh runs use Pi's default for the model and fork runs
-restore the level recorded on the copied branch.
-
-Fresh runs create a new child session below the current root session's
-`.subagents/` directory; nested subagents share that directory. The
-tail-able Markdown activity log is the sibling
-`<parent-session>.jsonl.subagents.md` file. Fork runs branch from the
-current conversation leaf into the same `.subagents/` directory.
-
-If a named agent cannot be found from an explicit `cwd` but would have
-been found from the caller cwd, `subagent` fails with a hint to omit
-`cwd` and put external paths in `task` instead.
-
-A successful result looks like this:
-
-```md
-## Subagent vision result
-Subagent session ID: 019...
-Model: acme/acme-5.3 — after failed attempts: openai-codex/gpt-6-sol (Codex error: The usage limit has been reached)
-
-<child assistant answer>
-```
-
-The `Subagent session ID` identifies the child for recovery or an
-explicit request to resume that exact child session. Prefer a new
-`subagent` for follow-up or related work, even when an earlier child
-already knows the topic. The `Model` line names the model that produced
-the answer and, when earlier chain candidates failed on their first
-turn, lists each with a truncated provider error.
-
-### `subagent_resume({ sessionId, message })`
-
-Continues an existing child Pi session in the current parent/root
-session. It requires a persisted parent Pi session so it can find the
-current parent/root manifest. It reopens the recorded child JSONL
-session, appends `message`, waits for the next child answer, and
-returns the same compact result shape.
-
-Arguments:
-
-- `sessionId` is required. Use the child Pi session ID from an earlier
-  `subagent` or `subagent_resume` result, including recovery text after
-  an interrupted or failed child run.
-- `message` is required. It is appended to that same child
-  conversation.
-
-Resume lookup is scoped to the current parent/root manifest. It does
-not search globally, fork, or copy the child session. Prefer a new
-`subagent` for follow-up or related work, even when an earlier child
-already knows the topic. Use `subagent_resume` to recover an
-interrupted or failed child when its result includes a session ID, or
-when the user explicitly asks to resume that exact child session.
-
-For original fresh runs, resume reloads current prompt resources from
-the recorded cwd, including named-agent `agentsMd` and `skills`
-controls. For original fork runs, resume uses fork-style resources.
-All resume calls send `message` as plain user text, because the
-initial `subagent` prompt envelope is already in the child transcript.
-
-### `subagent_list({ cwd? })`
-
-Lists the markdown agents visible from a working directory, plus the
-special default mode where `agent` is omitted.
-
-Arguments:
-
-- `cwd` is optional. Usually omit it to inspect the caller project
-  context. An explicit `cwd` is an advanced override for listing
-  another directory's visible agents; relative paths resolve from the
-  caller cwd.
-
-The text result shows each markdown agent's name, source label (`user`
-or `project`), description, and path, plus a `Callable models` section
-listing one line per model with configured authentication and its
-supported thinking levels, marking the current session model. The
-structured details include the resolved cwd, source counts,
-user/project agent directories, the callable model catalog, and the
-current model. If an explicit `cwd` hides project agents visible from
-the caller cwd, the result includes a warning.
-
-## Markdown agents
-
-Markdown agents are prompt resources. Treat them like trusted code:
-review project `.pi/agents/*.md` files before running subagents in an
-unfamiliar checkout.
-
-User agents live under the Pi agent directory in `agents/*.md`
-(`$PI_CODING_AGENT_DIR/agents` when that environment variable is set,
-otherwise Pi's normal agent directory). Project agents live in the
-nearest ancestor `.pi/agents/*.md` from the effective cwd. Project
-agents override user agents with the same filename stem.
-
-For project agents, normally pass the agent name and omit `cwd`. For
-example, create `.pi/agents/vision.md`:
+Create `.pi/agents/reviewer.md` in your project:
 
 ```md
 ---
-description: Reads screenshots, diagrams, and other images.
-model: acme/acme-5v-turbo
-thinkingLevel: low
+description: Reviews code for concrete regressions
+model: acme/fast@low,acme/steady@high
 agentsMd: auto
-skills: none
+skills: audit
 ---
 
-Read every image path named in the task. If no path is given, find the
-relevant image files in the cwd first. Return visible text and a concise
-description, separating direct observations from inferences.
+Inspect the requested changes. Separate verified failures from concerns.
 ```
 
-The frontmatter model is the default:
+The four allowed frontmatter keys are:
+
+- `description` is required and nonempty.
+- `model` supplies the default chain, using the call argument's grammar.
+- `agentsMd` is `none` or `auto`. It defaults to `none`.
+- `skills` is `auto`, `none`, or a comma-separated list of skill names. It defaults to `auto`. Missing or model-hidden named skills fail fresh preflight.
+
+The parser accepts this small format, not YAML. It rejects unknown or duplicate keys, blank frontmatter lines, comments, quotes, arrays, block scalars, missing delimiters, and empty bodies.
+
+User agents live in `<agent-dir>/agents/*.md`. `PI_CODING_AGENT_DIR` can select the agent directory. Project agents come from the nearest ancestor `.pi/agents/` directory. Discovery is non-recursive and ignores hidden files, uppercase `.MD`, and `*.chain.md`.
+
+Named bodies appear in an XML-style block in the initial user prompt, not the system prompt. Model and context-file overrides preserve the named body and skills.
+
+### Fresh and fork resources
+
+Unnamed fresh children skip context files unless you pass `agentsMd: "auto"`. They retain normal skills. Named fresh children follow their profile unless the call supplies `agentsMd`.
+
+`agentsMd` controls automatic Pi context-file discovery, including `AGENTS.md` and `CLAUDE.md`. It does not disable skills, extensions, settings, `SYSTEM.md`, `APPEND_SYSTEM.md`, or the child's ability to read files.
+
+Fork children use normal fork resources and ignore agent-file `agentsMd` and `skills` controls. Named bodies and model chains still apply. Copied history is not scrubbed, so fork cannot promise instruction isolation. Forked children may see the current parent turn. Avoid parent-only answer markers that conflict with the child's task.
+
+## Recover a child
+
+A result includes the final answer and a `Subagent session ID`. A model-chain result also names the serving model and summarizes earlier failed attempts.
+
+For an interrupted or failed task, recover that child with its returned ID:
 
 ```ts
-subagent({ agent: "vision", task: "Read screenshots/login.png and return its contents." })
+subagent_resume({
+	sessionId: "<returned-child-id>",
+	message: "Continue the interrupted task from where you left off.",
+})
 ```
 
-A call-level `model` or `thinkingLevel` overrides these defaults for
-one invocation, including a whole replacement model chain. The named
-prompt and fresh-run resource controls stay loaded.
+Use a new `subagent` for ordinary follow-up work. Resume is for recovery or an explicit user request to continue that exact child.
 
-If the task needs files outside the project, put those paths in `task`
-unless you intentionally want the external directory to define the
-child's project context.
+Resume lookup is scoped to the current parent/root manifest. It does not search globally or copy the session. Both execution tools require a persisted parent Pi session.
 
-Agent files use the small frontmatter block shown above, not YAML.
-`description` is required. The optional `model` uses the same format as
-the call-level `model` argument and supplies the default when the call
-omits it. For example:
+Fresh resume reloads current resources from the recorded cwd. An explicit original `agentsMd` choice remains in effect, even if the named profile changes. Without an original override, current profile controls remain live. Skills and file contents are reloaded, not snapshotted. Named fresh sessions still require a valid current agent file.
 
-```md
----
-description: Completes bounded development tasks
-model: acme/fast@low,acme/steady@high,acme/backup@low
----
+Fork resume uses fork resources. Both modes restore the active child's recorded model and effort rather than reapplying current model defaults. Resume sends `message` as plain user text without a second named-body envelope.
 
-Complete the task and report the result.
-```
+`subagent_list({ cwd? })` inspects another directory when needed. Its result includes agent paths and sources, callable models, supported thinking levels, and the current model. Structured details include discovery directories and source counts.
 
-The optional `thinkingLevel` uses the call argument's values and
-supplies the profile default under the precedence and validation rules
-above. `agentsMd` is optional and may be `none` or `auto`; it defaults
-to `none`. `skills` is optional and may be `auto`, `none`, or a
-comma-separated list of skill names; it defaults to `auto`. Unknown
-keys, blank frontmatter lines, comments, quoted values, arrays, block
-scalars, duplicate keys, missing delimiters, and empty bodies are
-rejected.
+## Trust and limitations
 
-Discovery is non-recursive and ignores hidden files, nested
-directories, uppercase `.MD`, and `*.chain.md` files.
+**Review unfamiliar project resources before running a child.** pi-submarine treats project-local Pi inputs for the child cwd as trusted, including `.pi/` resources and project `.agents/` skills. Children run with the Pi process's permissions. Neither fresh context nor `agentsMd: "none"` is a sandbox.
 
-Every initial `subagent` call sends the child a single XML-style user
-prompt envelope with subagent context and the task. Named agents add a
-sanitized `<name-agent>` block containing the markdown body between
-that context and the task. Fresh default-mode runs do not load
-markdown agents, suppress `AGENTS.md` / `CLAUDE.md` context files, and
-keep normal skills. For named fresh runs, `agentsMd` controls
-context-file loading and `skills` controls skill loading; the agent
-body stays in the user prompt envelope rather than the child system
-prompt. Fork runs ignore those frontmatter resource controls but use
-the same user prompt envelope for omitted and named agents. A
-frontmatter model or thinking level applies to both fresh and forked
-initial runs. A selected model chain, from the call or frontmatter,
-tries the next model only when the current model's initial provider
-turn ends with assistant `stopReason: "error"` and no assistant success
-or tool progress occurred. Prompt rejections, aborts, later errors, and
-failures of the last candidate are not retried.
-Each failed attempt appends a `model <provider>/<id> failed (<reason>);
-retrying on <provider>/<id>` breadcrumb to the `.subagents.md` activity
-log, so quota and auth failures stay visible even when a later candidate
-succeeds. Each retry creates a new AgentSession on a clean branch of the *same*
-child session ID and lifecycle episode: failed branches stay in the JSONL
-file but are excluded from the active conversation. Resuming restores the
-model and thinking level recorded on that active branch rather than
-reapplying the current agent-file defaults.
+- Parent aborts propagate to the child. After a child exists, interruption and failure errors include its session ID for possible recovery. Preflight errors do not invent one.
+- Resume requires the recorded model to be available and authenticated. An SDK model substitution fails before prompting instead of silently changing models.
+- Manifest and activity-log write failures are logged without failing an otherwise successful child. Recovery is not guaranteed if the original manifest write failed.
+- Concurrent writes to the same child are rejected within one Pi process. There is no cross-process lock.
+- Nested children share the Node.js event loop and extension runtime. The maximum nesting depth is four.
+- The extension adds no wall-clock timeout around Pi's prompt operation.
+- Compact result text omits transcript and artifact paths. Provider or extension error messages can still contain their own details.
 
 ## Artifacts and progress
 
-`subagent` and `subagent_resume` require a persisted parent Pi
-session. Once a child episode starts, `pi-submarine` writes artifacts
-beside the root parent session when possible, even if the episode
-later fails or is aborted:
+Children share a directory beside the root parent session:
 
 ```text
 <parent-session>.jsonl
@@ -324,120 +158,26 @@ later fails or is aborted:
   <child-session>.jsonl
 ```
 
-`manifest.jsonl` records lifecycle data used for resume and
-nesting. `<parent-session>.jsonl.subagents.md` is an append-only
-status stream suitable for `tail -f`, not a transcript. Full child
-messages remain in the child session JSONL.
+The manifest records lifecycle episodes for recovery and nesting. The append-only Markdown activity log reports status and fallback attempts, not full transcripts. Use `tail -f` to watch it. Child JSONL files retain the full messages.
 
-While a child runs, Pi frontends receive portable text partial updates
-like this:
-
-```text
-Log: ~/.pi/agent/sessions/.../parent.jsonl.subagents.md
-- subagent (6% ctx, 1 turn) -> vision (? ctx, 2 turns): using read
-```
-
-The same update includes structured `details.run` data:
-
-```ts
-type SubagentRunView = {
-  episodeId: string
-  sessionId: string
-  agent: string
-  status: "running" | "completed" | "failed" | "aborted"
-  turnCount: number
-  lastActivityAt: string
-  activity: string
-  activityLog: string
-  contextUsage?: {
-    tokens: number | null
-    contextWindow: number
-    percent: number | null
-  }
-  children: SubagentRunView[]
-}
-```
-
-`sessionId` is the public continuation handle. `episodeId` identifies
-one `subagent` or `subagent_resume` lifecycle episode; multiple
-episodes can share one child `sessionId`. Nested child run metadata
-stays in structured run details; nested transcripts and final answers
-remain in their child sessions instead of being pasted into the parent
-model context.
-
-Context usage comes from Pi's `AgentSession.getContextUsage()`. If Pi
-reports unknown usage, the progress text shows `? ctx`; if usage is
-unavailable, the segment omits context usage. No custom TUI renderer
-is required for correctness.
-
-## Errors and limits
-
-- Tool errors are thrown from `execute()`, which Pi records as failed
-  tool results.
-- Parent abort signals are forwarded to the child session. If a child
-  session already exists, the durable status is `aborted` and the
-  model-visible error text includes the `Subagent session ID` and a
-  recovery example for `subagent_resume`.
-- Non-abort child failures after a trusted child session exists stay
-  durable `failed`; the error text includes the public session ID with
-  cautious “may be recoverable” wording. Preflight and lookup failures
-  before a trusted child session exists do not invent a continuation
-  handle.
-- Resume requires the recorded model to be available and authenticated.
-  If Pi reports an SDK model fallback on any run, the run fails before
-  prompting instead of silently using a substitute.
-- `pi-submarine`'s wrapper text does not add session-file paths,
-  activity-log paths, stack traces, child transcripts, or the Markdown
-  activity log to model-visible success, interruption, or recovery
-  text. The original provider or extension error message is preserved
-  and may contain its own details.
-- Manifest and activity-log append failures are logged and do not fail
-  an otherwise successful child episode. Continuation needs the
-  current-root manifest start record, so resume is not guaranteed
-  after a degraded manifest write.
-- In one Pi process, `pi-submarine` rejects concurrent attempts to
-  append to the same child session, including `subagent_resume` while
-  the original `subagent` is still active. This is not a cross-process
-  lock.
-- Nested subagents share the Node.js event loop and Pi extension
-  runtime. Nesting deeper than 4 is rejected to stop accidental
-  circular delegation.
-- `pi-submarine` does not add a wall-clock timeout around Pi's
-  `session.prompt()`.
-- Forked children start from the current branch and may see the
-  current parent turn. Phrase fork tasks so parent-only final-answer
-  markers do not conflict with what the child should produce.
-
-## Install
-
-```bash
-pi install npm:pi-submarine
-```
-
-Requires Pi `0.79.1` or newer. The package manifest registers
-`./src/index.ts`, which Pi loads through its TypeScript extension
-loader. The npm package contains `src/`, `README.md`, and npm's
-automatic `package.json`.
+Partial updates report activity, turns, context usage, and nested children. Structured `details.run` includes `sessionId`, `episodeId`, status, activity-log path, context usage, and child run metadata. Multiple episodes can share one child session ID. Unknown context usage appears as `? ctx`.
 
 ## Development
 
-For local development, load the extension directly:
+Load the local extension:
 
 ```bash
 pi -e ./src/index.ts
 ```
 
-Run the checks with:
+Run the checks:
 
 ```bash
-npm install
+npm install --ignore-scripts --no-package-lock
 npm run typecheck
 npm test
 npm run build
 npm run smoke:registration
 ```
 
-The model-facing tool labels, descriptions, schema descriptions,
-guidelines, and prompt envelope helpers live in `src/tool-prompts.ts`.
-Keep that file, `src/index.ts`, and this README in sync when the tool
-contract changes.
+Development tests pin Pi SDK `0.79.1`. Pi loads the published TypeScript source through `./src/index.ts`. Keep `src/tool-prompts.ts`, `src/index.ts`, and this README in sync when arguments change.

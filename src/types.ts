@@ -7,13 +7,12 @@ export const DEFAULT_AGENT_ALIAS = "default";
 export type SubagentContextMode = "fresh" | "fork";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-export type ThinkingLevelValue = (typeof THINKING_LEVELS)[number];
 
 export interface SubagentParams {
   agent?: string;
   task: string;
   model?: string;
-  thinkingLevel?: string;
+  agentsMd?: AgentResourceMode;
   context?: SubagentContextMode;
   cwd?: string;
 }
@@ -43,7 +42,6 @@ export interface MarkdownAgent {
   filePath: string;
   body: string;
   model?: string;
-  thinkingLevel?: string;
   agentsMd: AgentResourceMode;
   skills: SkillResourceMode;
 }
@@ -90,6 +88,7 @@ export interface ManifestStartedRecord {
   activityLog: string;
   startedAt: string;
   agentFile?: string | null;
+  agentsMdOverride?: AgentResourceMode;
 }
 
 export interface ManifestFinishedRecord {

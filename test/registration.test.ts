@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { IsObject } from "typebox";
 import { afterEach, assert, describe, expect, it } from "vitest";
@@ -45,11 +46,15 @@ describe("pi-submarine extension registration", () => {
         agent: { type: "string" },
         task: { type: "string", minLength: 1 },
         model: { type: "string", minLength: 1 },
-        thinkingLevel: { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+        agentsMd: { type: "string", enum: ["none", "auto"] },
         context: { type: "string", enum: ["fresh", "fork"], default: "fresh" },
         cwd: { type: "string" },
       },
     });
+
+    assert(subagent && IsObject(subagent.parameters));
+    expect(Object.keys(subagent.parameters.properties).sort()).toEqual(["agent", "agentsMd", "context", "cwd", "model", "task"]);
+    expect(subagent.parameters.properties.agentsMd).not.toHaveProperty("default");
 
     expect(subagentResume?.parameters).toMatchObject({
       type: "object",
@@ -68,6 +73,23 @@ describe("pi-submarine extension registration", () => {
         cwd: { type: "string" },
       },
     });
+    assert(subagentResume && IsObject(subagentResume.parameters));
+    assert(subagentList && IsObject(subagentList.parameters));
+    expect(Object.keys(subagentResume.parameters.properties).sort()).toEqual(["message", "sessionId"]);
+    expect(Object.keys(subagentList.parameters.properties)).toEqual(["cwd"]);
+  });
+
+  it.each([
+    { task: "review", thinkingLevel: "low" },
+    { task: "review", agentsMd: "bogus" },
+    { task: "review", unknown: true },
+  ])("rejects invalid public arguments through Pi's validator (%j)", (args) => {
+    expect(() => validateToolArguments(subagentTool, { type: "toolCall", id: "invalid", name: "subagent", arguments: args })).toThrow();
+  });
+
+  it.each(["none", "auto"])("accepts agentsMd %s through Pi's validator", (agentsMd) => {
+    const args = { task: "review", agentsMd };
+    expect(validateToolArguments(subagentTool, { type: "toolCall", id: "valid", name: "subagent", arguments: args })).toEqual(args);
   });
 
   it("supplies model-facing help for every tool and parameter", () => {
