@@ -6,20 +6,20 @@ export type SubagentModelRegistry = Pick<ModelRegistry, "getAll" | "hasConfigure
 
 export interface ModelCandidate {
   reference: string;
-  level?: string;
+  level: (typeof THINKING_LEVELS)[number];
 }
 
 export function parseModelChain(raw: string, fail: (reason: string) => never = (reason) => { throw new Error(reason); }): ModelCandidate[] {
-  const parts = raw.split(",");
-  if (parts.length > 3) fail("model chain must contain at most three candidates");
-  return parts.map((part) => {
+  return raw.split(",").map((part) => {
     // Only @ in the final path segment separates a thinking suffix.
-    const [reference, level, extra] = part.trim().split(/@(?=[^/]*$)/);
+    const [reference, suffix, extra] = part.trim().split(/@(?=[^/]*$)/);
     if (!reference?.trim() || extra !== undefined) fail("model chain contains an empty or invalid candidate");
-    if (level !== undefined && !(THINKING_LEVELS as readonly string[]).includes(level.trim())) {
-      fail(`model candidate thinking level '${level?.trim()}' must be one of: ${THINKING_LEVELS.join(", ")}`);
+    if (suffix === undefined) fail(`model candidate '${reference.trim()}' requires an explicit @effort suffix`);
+    const level = THINKING_LEVELS.find((candidate) => candidate === suffix.trim());
+    if (level === undefined) {
+      fail(`model candidate thinking level '${suffix.trim()}' must be one of: ${THINKING_LEVELS.join(", ")}`);
     }
-    return { reference: reference.trim(), ...(level === undefined ? {} : { level: level.trim() }) };
+    return { reference: reference.trim(), level };
   });
 }
 
@@ -85,18 +85,14 @@ export function resolveSubagentModel(
 }
 
 export function resolveSubagentThinkingLevel(
-  rawLevel: string | undefined,
-  model: Model<Api> | undefined,
-): string | undefined {
-  if (rawLevel === undefined) return undefined;
-
-  if (model !== undefined) {
-    const supportedLevels = getSupportedThinkingLevels(model);
-    if (!supportedLevels.includes(rawLevel as ModelThinkingLevel)) {
-      throw new Error(
-        `Subagent thinking level '${rawLevel}' is not supported by model '${model.provider}/${model.id}'. Supported levels: ${supportedLevels.join(", ")}.`,
-      );
-    }
+  rawLevel: ModelCandidate["level"],
+  model: Model<Api>,
+): ModelCandidate["level"] {
+  const supportedLevels = getSupportedThinkingLevels(model);
+  if (!supportedLevels.includes(rawLevel as ModelThinkingLevel)) {
+    throw new Error(
+      `Subagent thinking level '${rawLevel}' is not supported by model '${model.provider}/${model.id}'. Supported levels: ${supportedLevels.join(", ")}.`,
+    );
   }
 
   return rawLevel;

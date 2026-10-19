@@ -1,16 +1,20 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { IsObject } from "typebox";
-import { afterEach, assert, describe, expect, it } from "vitest";
+import { afterEach, assert, describe, expect, it, vi } from "vitest";
 import register, { subagentListTool, subagentResumeTool, subagentTool } from "../src/index.js";
+import * as runner from "../src/runner.js";
+import { TOOL_PROMPTS } from "../src/tool-prompts.js";
 
 type RegisteredTool = Parameters<ExtensionAPI["registerTool"]>[0];
 
 const tempRoots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -34,6 +38,35 @@ describe("pi-submarine extension registration", () => {
     expect(tools.map((tool) => tool.label)).toEqual(["Subagent", "Resume subagent", "List subagents"]);
   });
 
+  it("reads each parent runtime's current effort when its subagent tool executes", async () => {
+    const stopped = new Error("Stop before execution");
+    const run = vi.spyOn(runner, "runSubagent").mockRejectedValue(stopped);
+    const ctx = {} as ExtensionContext;
+    const toolsFor = (getThinkingLevel: ExtensionAPI["getThinkingLevel"]) => {
+      const tools: RegisteredTool[] = [];
+      register({ registerTool: (tool: RegisteredTool) => tools.push(tool), getThinkingLevel } as unknown as ExtensionAPI);
+      const tool = tools.find((candidate) => candidate.name === "subagent");
+      assert(tool);
+      return tool;
+    };
+    const parentEffort = vi.fn<ExtensionAPI["getThinkingLevel"]>().mockReturnValue("high");
+    const childEffort = vi.fn<ExtensionAPI["getThinkingLevel"]>().mockReturnValue("low");
+    const parentTool = toolsFor(parentEffort);
+    const childTool = toolsFor(childEffort);
+    expect(parentEffort).not.toHaveBeenCalled();
+    expect(childEffort).not.toHaveBeenCalled();
+
+    await expect(parentTool.execute("parent-1", { task: "review" }, undefined, undefined, ctx)).rejects.toBe(stopped);
+    expect(run.mock.calls.at(-1)?.[4]).toMatchObject({ parentThinkingLevel: "high" });
+    parentEffort.mockReturnValue("off");
+    await expect(childTool.execute("child", { task: "review" }, undefined, undefined, ctx)).rejects.toBe(stopped);
+    expect(run.mock.calls.at(-1)?.[4]).toMatchObject({ parentThinkingLevel: "low" });
+    await expect(parentTool.execute("parent-2", { task: "review" }, undefined, undefined, ctx)).rejects.toBe(stopped);
+    expect(run.mock.calls.at(-1)?.[4]).toMatchObject({ parentThinkingLevel: "off" });
+    expect(parentEffort).toHaveBeenCalledTimes(2);
+    expect(childEffort).toHaveBeenCalledTimes(1);
+  });
+
   it("registers strict parameter schemas for all tools", () => {
     const [subagent, subagentResume, subagentList] = registeredToolsFromFactory();
 
@@ -45,11 +78,15 @@ describe("pi-submarine extension registration", () => {
         agent: { type: "string" },
         task: { type: "string", minLength: 1 },
         model: { type: "string", minLength: 1 },
-        thinkingLevel: { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+        agentsMd: { type: "string", enum: ["none", "auto"] },
         context: { type: "string", enum: ["fresh", "fork"], default: "fresh" },
         cwd: { type: "string" },
       },
     });
+
+    assert(subagent && IsObject(subagent.parameters));
+    expect(Object.keys(subagent.parameters.properties).sort()).toEqual(["agent", "agentsMd", "context", "cwd", "model", "task"]);
+    expect(subagent.parameters.properties.agentsMd).not.toHaveProperty("default");
 
     expect(subagentResume?.parameters).toMatchObject({
       type: "object",
@@ -68,19 +105,50 @@ describe("pi-submarine extension registration", () => {
         cwd: { type: "string" },
       },
     });
+    assert(subagentResume && IsObject(subagentResume.parameters));
+    assert(subagentList && IsObject(subagentList.parameters));
+    expect(Object.keys(subagentResume.parameters.properties).sort()).toEqual(["message", "sessionId"]);
+    expect(Object.keys(subagentList.parameters.properties)).toEqual(["cwd"]);
   });
 
-  it("supplies model-facing help for every tool and parameter", () => {
-    for (const tool of registeredToolsFromFactory()) {
-      expect(tool.description).toMatch(/\S/);
-      expect(tool.promptSnippet).toMatch(/\S/);
+  it.each([
+    { task: "review", thinkingLevel: "low" },
+    { task: "review", agentsMd: "bogus" },
+    { task: "review", unknown: true },
+  ])("rejects invalid public arguments through Pi's validator (%j)", (args) => {
+    expect(() => validateToolArguments(subagentTool, { type: "toolCall", id: "invalid", name: "subagent", arguments: args })).toThrow();
+  });
+
+  it.each(["none", "auto"])("accepts agentsMd %s through Pi's validator", (agentsMd) => {
+    const args = { task: "review", agentsMd };
+    expect(validateToolArguments(subagentTool, { type: "toolCall", id: "valid", name: "subagent", arguments: args })).toEqual(args);
+  });
+
+  it("registers model-facing help from TOOL_PROMPTS for every tool and parameter", () => {
+    const tools = registeredToolsFromFactory();
+    for (const [name, prompt] of [
+      ["subagent", TOOL_PROMPTS.subagent],
+      ["subagent_resume", TOOL_PROMPTS.subagentResume],
+      ["subagent_list", TOOL_PROMPTS.subagentList],
+    ] as const) {
+      const tool = tools.find((tool) => tool.name === name);
+      assert(tool && IsObject(tool.parameters));
+      expect(tool.description.trim().length).toBeGreaterThan(0);
+      expect(tool.promptSnippet?.trim().length).toBeGreaterThan(0);
       expect(tool.promptGuidelines?.length).toBeGreaterThan(0);
-      for (const guideline of tool.promptGuidelines ?? []) {
-        expect(guideline).toMatch(/\S/);
-      }
-      assert(IsObject(tool.parameters));
-      for (const parameter of Object.values(tool.parameters.properties)) {
-        expect(parameter).toMatchObject({ description: expect.stringMatching(/\S/) });
+      expect(tool.promptGuidelines?.every((guideline) => guideline.trim().length > 0)).toBe(true);
+      expect(tool).toMatchObject({
+        description: prompt.description,
+        promptSnippet: prompt.promptSnippet,
+        promptGuidelines: prompt.promptGuidelines,
+      });
+      expect(Object.keys(tool.parameters.properties).sort()).toEqual(
+        Object.keys(prompt.parameterDescriptions).sort(),
+      );
+      for (const [parameterName, description] of Object.entries(prompt.parameterDescriptions)) {
+        const parameter = tool.parameters.properties[parameterName];
+        expect(parameter).toHaveProperty("description", expect.stringMatching(/\S/));
+        expect(parameter).toMatchObject({ description });
       }
     }
   });

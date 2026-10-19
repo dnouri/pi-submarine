@@ -3,7 +3,6 @@ import path from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   DefaultResourceLoader,
-  buildSessionContext,
   createAgentSession,
   getAgentDir,
   SessionManager,
@@ -21,11 +20,11 @@ import { MissingMarkdownAgentError, resolveMarkdownAgent } from "./agents.js";
 import { cloneRunView, createActivityState, createInitialRunView, reduceActivityEvent } from "./activity.js";
 import { QueuedActivityLogWriter, appendActivityLogFinished, appendActivityLogStarted, ensureActivityLogHeader, type DegradedActivityLogOptions } from "./activity-log.js";
 import { appendManifestRecord, findLatestEpisodeStartedRecordBySessionFile, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
-import { parseModelChain, resolveRecordedSubagentModel, resolveSubagentModel, resolveSubagentThinkingLevel } from "./models.js";
+import { parseModelChain, resolveRecordedSubagentModel, resolveSubagentModel, resolveSubagentThinkingLevel, type ModelCandidate } from "./models.js";
 import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult } from "./render.js";
 import { assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
 import { buildSubagentPromptEnvelope } from "./tool-prompts.js";
-import { DEFAULT_AGENT_ALIAS, OMITTED_AGENT_LABEL, type AgentSelection, type MarkdownAgent, type SubagentContextMode, type SubagentContextUsage, type SubagentParams, type SubagentResumeParams, type SubagentToolDetails, type TextToolResult } from "./types.js";
+import { DEFAULT_AGENT_ALIAS, OMITTED_AGENT_LABEL, type AgentResourceMode, type AgentSelection, type MarkdownAgent, type SubagentContextMode, type SubagentContextUsage, type SubagentParams, type SubagentResumeParams, type SubagentToolDetails, type TextToolResult } from "./types.js";
 
 type DefaultResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
 type ProjectTrustedSettingsManager = ReturnType<typeof SettingsManager.create>;
@@ -39,14 +38,14 @@ export interface SubagentPromptProfile {
   agentFile?: string;
   agentBody?: string;
   model?: string;
-  thinkingLevel?: string;
-  agentsMd: "none" | "auto";
+  agentsMd: AgentResourceMode;
   skills: MarkdownAgent["skills"];
 }
 
 export interface RunnerOptions {
   deps?: Partial<RunnerDependencies>;
   extensionFactories?: ExtensionFactory[];
+  parentThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
 }
 
 export interface RunnerDependencies {
@@ -82,6 +81,7 @@ interface BaseRunPlan {
 
 interface FreshRunPlan extends BaseRunPlan {
   context: "fresh";
+  agentsMdOverride?: AgentResourceMode;
 }
 
 interface ForkRunPlan extends BaseRunPlan {
@@ -93,7 +93,7 @@ interface ForkRunPlan extends BaseRunPlan {
 type RunPlan = FreshRunPlan | ForkRunPlan;
 
 type ChildSessionPlan = Pick<BaseRunPlan, "effectiveCwd" | "agentDir" | "settingsManager" | "resourceLoader" | "model" | "thinkingLevel">;
-type ModelChoice = { model: Model<Api>; thinkingLevel: string | undefined };
+type ModelChoice = { model: Model<Api>; thinkingLevel: ModelCandidate["level"] };
 
 interface ResumeRunPlan extends ChildSessionPlan {
   profile: SubagentPromptProfile;
@@ -174,13 +174,12 @@ export function namedSubagentProfile(agent: MarkdownAgent): SubagentPromptProfil
     agentFile: agent.filePath,
     agentBody: agent.body,
     ...(agent.model === undefined ? {} : { model: agent.model }),
-    ...(agent.thinkingLevel === undefined ? {} : { thinkingLevel: agent.thinkingLevel }),
     agentsMd: agent.agentsMd,
     skills: agent.skills,
   };
 }
 
-export function buildFreshResourceLoaderOptions(profile: SubagentPromptProfile, options: { cwd: string; agentDir: string; settingsManager?: ProjectTrustedSettingsManager; extensionFactories?: ExtensionFactory[] }): DefaultResourceLoaderOptions {
+export function buildFreshResourceLoaderOptions(profile: SubagentPromptProfile, options: { cwd: string; agentDir: string; settingsManager?: ProjectTrustedSettingsManager; extensionFactories?: ExtensionFactory[] }, agentsMdOverride?: AgentResourceMode): DefaultResourceLoaderOptions {
   const loaderOptions: DefaultResourceLoaderOptions = {
     cwd: options.cwd,
     agentDir: options.agentDir,
@@ -188,7 +187,7 @@ export function buildFreshResourceLoaderOptions(profile: SubagentPromptProfile, 
 
   if (options.settingsManager) loaderOptions.settingsManager = options.settingsManager;
   if (options.extensionFactories && options.extensionFactories.length > 0) loaderOptions.extensionFactories = options.extensionFactories;
-  if (profile.agentsMd === "none") loaderOptions.noContextFiles = true;
+  if ((agentsMdOverride ?? profile.agentsMd) === "none") loaderOptions.noContextFiles = true;
   if (profile.skills === "none") {
     loaderOptions.noSkills = true;
   } else if (typeof profile.skills === "object") {
@@ -253,7 +252,7 @@ export async function runSubagent(
   let activityLogWriter: QueuedActivityLogWriter | undefined;
 
   try {
-    plan = await prepareRun(params, signal, ctx, deps, options.extensionFactories);
+    plan = await prepareRun(params, signal, ctx, deps, options);
     throwIfAborted(signal, "Subagent run was aborted before child execution.");
 
     startedRun = await startRunArtifacts(plan, deps);
@@ -315,7 +314,7 @@ export async function runSubagent(
         if (prePromptLeaf === null) startedRun.childSessionManager.resetLeaf();
         else startedRun.childSessionManager.branch(prePromptLeaf);
         startedRun.childSessionManager.appendModelChange(next.model.provider, next.model.id);
-        if (next.thinkingLevel !== undefined) startedRun.childSessionManager.appendThinkingLevelChange(next.thinkingLevel);
+        startedRun.childSessionManager.appendThinkingLevelChange(next.thinkingLevel);
         // Disposing an AgentSession invalidates its extension runtime.
         await plan.resourceLoader.reload();
         throwIfInterrupted(signal);
@@ -346,7 +345,7 @@ export async function runSubagent(
     const interrupted = isSubagentInterruptedError(error);
     await activityLogWriter?.drain();
     if (run && childSession) refreshContextUsage(run, childSession);
-    if (startedRun && plan) preservePlannedModel(plan, startedRun.childSessionManager);
+    if (startedRun && plan) preservePlannedSelection(plan, startedRun.childSessionManager);
     if (startedRun) await materializeChildSessionFile(startedRun.childSessionManager);
     if (startedRun && plan) {
       if (interrupted) await abortRun(plan.manifestPath, startedRun, deps, onUpdate, activityLogWriter);
@@ -470,11 +469,11 @@ async function prepareRun(
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
   deps: RunnerDependencies,
-  extensionFactories: ExtensionFactory[] | undefined,
+  options: RunnerOptions,
 ): Promise<RunPlan> {
   const context = params.context ?? "fresh";
-  if (context === "fresh") return prepareFreshRun(params, signal, ctx, deps, extensionFactories);
-  if (context === "fork") return prepareForkRun(params, signal, ctx, deps, extensionFactories);
+  if (context === "fresh") return prepareFreshRun(params, signal, ctx, deps, options);
+  if (context === "fork") return prepareForkRun(params, signal, ctx, deps, options);
   throw new Error(`Unsupported subagent context: ${String(context)}`);
 }
 
@@ -521,7 +520,11 @@ async function prepareResumeRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveResumeProfile(startedRecord, effectiveCwd, userAgentsDir);
-  const recordedModel = childSessionManager.buildSessionContext().model;
+  const recordedContext = childSessionManager.buildSessionContext();
+  const recordedModel = recordedContext.model;
+  const thinkingLevel = childSessionManager.getBranch().some((entry) => entry.type === "thinking_level_change")
+    ? recordedContext.thinkingLevel
+    : undefined;
   const model = recordedModel
     ? resolveRecordedSubagentModel(recordedModel.provider, recordedModel.modelId, ctx.modelRegistry)
     : undefined;
@@ -529,7 +532,7 @@ async function prepareResumeRun(
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
   const resourceLoader = deps.createResourceLoader(startedRecord.context === "fresh"
-    ? buildFreshResourceLoaderOptions(profile, loaderContext)
+    ? buildFreshResourceLoaderOptions(profile, loaderContext, startedRecord.agentsMdOverride)
     : buildForkResourceLoaderOptions(loaderContext));
   await resourceLoader.reload();
 
@@ -550,7 +553,7 @@ async function prepareResumeRun(
     resourceLoader,
     userPrompt: params.message,
     model,
-    thinkingLevel: undefined,
+    thinkingLevel,
   };
 }
 
@@ -559,7 +562,7 @@ async function prepareFreshRun(
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
   deps: RunnerDependencies,
-  extensionFactories: ExtensionFactory[] | undefined,
+  { extensionFactories, parentThinkingLevel }: RunnerOptions,
 ): Promise<FreshRunPlan> {
   throwIfAborted(signal, "Subagent run was aborted before child execution.");
 
@@ -574,17 +577,17 @@ async function prepareFreshRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, profileResolutionOptions(userAgentsDir, params, ctx));
-  const parentModel = ctx.model;
-  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, parentModel, "fresh");
+  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, parentThinkingLevel);
   const { root, manifestPath, parentDepth, parentPath } = await resolveArtifactRoot(parentSessionFile);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
-  const resourceLoader = deps.createResourceLoader(buildFreshResourceLoaderOptions(profile, loaderContext));
+  const resourceLoader = deps.createResourceLoader(buildFreshResourceLoaderOptions(profile, loaderContext, params.agentsMd));
   await resourceLoader.reload();
 
   return {
     context: "fresh",
+    ...(params.agentsMd === undefined ? {} : { agentsMdOverride: params.agentsMd }),
     effectiveCwd,
     profile,
     root,
@@ -606,9 +609,10 @@ async function prepareForkRun(
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
   deps: RunnerDependencies,
-  extensionFactories: ExtensionFactory[] | undefined,
+  { extensionFactories, parentThinkingLevel }: RunnerOptions,
 ): Promise<ForkRunPlan> {
   if (params.cwd !== undefined) throw new Error("cwd is not supported with context 'fork'.");
+  if (params.agentsMd !== undefined) throw new Error("agentsMd is not supported with context 'fork'. Use it only with fresh runs.");
   throwIfAborted(signal, "Subagent run was aborted before child execution.");
 
   const parentSessionFile = ctx.sessionManager.getSessionFile();
@@ -618,8 +622,7 @@ async function prepareForkRun(
   if (!currentLeafId) throw new Error("subagent fork execution requires a current session leaf.");
 
   const { root, manifestPath, parentDepth, parentPath } = await resolveArtifactRoot(parentSessionFile);
-  const sourceSessionManager = deps.openSessionManager(parentSessionFile, root.subagentsDir);
-  const effectiveCwd = sourceSessionManager.getCwd();
+  const effectiveCwd = ctx.sessionManager.getCwd();
   await assertDirectoryExists(effectiveCwd);
   throwIfAborted(signal, "Subagent run was aborted before child execution.");
 
@@ -627,15 +630,8 @@ async function prepareForkRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, { userAgentsDir });
-  // A fork with no explicit model still has a model on its copied branch.
-  // Validate requested thinking against that model before SDK clamping can occur.
-  const needsInheritedModel = params.model === undefined && profile.model === undefined
-    && (params.thinkingLevel ?? profile.thinkingLevel) !== undefined;
-  const recorded = needsInheritedModel ? buildSessionContext(sourceSessionManager.getBranch(currentLeafId)).model : undefined;
-  const inheritedModel = recorded
-    ? resolveRecordedSubagentModel(recorded.provider, recorded.modelId, ctx.modelRegistry)
-    : ctx.model;
-  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, ctx.model, "fork", inheritedModel);
+  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, parentThinkingLevel);
+  const sourceSessionManager = deps.openSessionManager(parentSessionFile, root.subagentsDir);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
@@ -666,23 +662,17 @@ function resolveRunModelChoices(
   params: SubagentParams,
   profile: SubagentPromptProfile,
   ctx: ExtensionContext,
-  parentModel: Model<Api> | undefined,
-  context: SubagentContextMode,
-  forkInheritedModel?: Model<Api>,
+  parentThinkingLevel: RunnerOptions["parentThinkingLevel"],
 ): { model: Model<Api> | undefined; thinkingLevel: string | undefined; fallbacks: ModelChoice[] } {
   // A call-level model replaces the chain, not just its first candidate.
   const selectedModel = params.model ?? profile.model;
   const candidates = selectedModel === undefined ? [] : parseModelChain(selectedModel);
   const choices = candidates.map(({ reference, level }) => {
-    const model = resolveSubagentModel(reference, ctx.modelRegistry, parentModel?.provider)!;
-    return { model, thinkingLevel: resolveSubagentThinkingLevel(params.thinkingLevel ?? level ?? profile.thinkingLevel, model) };
+    const model = resolveSubagentModel(reference, ctx.modelRegistry, ctx.model?.provider)!;
+    return { model, thinkingLevel: resolveSubagentThinkingLevel(level, model) };
   });
-  const model = choices[0]?.model ?? (context === "fresh" ? parentModel : undefined);
-  const requestedLevel = params.thinkingLevel ?? profile.thinkingLevel;
-  if (requestedLevel !== undefined && !model && !forkInheritedModel) {
-    throw new Error(`Cannot validate subagent thinking level '${requestedLevel}' without a resolved model. Specify a model first.`);
-  }
-  const thinkingLevel = choices[0]?.thinkingLevel ?? resolveSubagentThinkingLevel(requestedLevel, model ?? forkInheritedModel);
+  const model = choices[0]?.model ?? ctx.model;
+  const thinkingLevel = choices[0]?.thinkingLevel ?? parentThinkingLevel;
   return { model, thinkingLevel, fallbacks: choices.slice(1) };
 }
 
@@ -760,7 +750,9 @@ function assertUsableStartedRecord(record: StartedManifestRecord, sessionId: str
     || typeof record.cwd !== "string"
     || (record.context !== "fresh" && record.context !== "fork")
     || typeof record.sessionFile !== "string"
-    || typeof record.activityLog !== "string") {
+    || typeof record.activityLog !== "string"
+    || (Object.hasOwn(record, "agentsMdOverride")
+      && (record.context !== "fresh" || (record.agentsMdOverride !== "none" && record.agentsMdOverride !== "auto")))) {
     throw new Error(`Subagent session '${sessionId}' has an invalid manifest record.`);
   }
 }
@@ -867,8 +859,9 @@ async function startRunArtifacts(
   const activityLog = plan.root.activityLogPath;
   const activityPath = [...plan.parentPath, plan.profile.agentName];
   const childSessionManager = createChildSessionManager(plan, deps);
-  if (plan.context === "fork" && plan.model) {
-    childSessionManager.appendModelChange(plan.model.provider, plan.model.id);
+  if (plan.context === "fork") {
+    if (plan.model) childSessionManager.appendModelChange(plan.model.provider, plan.model.id);
+    if (plan.thinkingLevel !== undefined) childSessionManager.appendThinkingLevelChange(plan.thinkingLevel);
   }
   const childSessionFile = childSessionManager.getSessionFile();
   if (!childSessionFile) throw new Error("Could not create a persisted child subagent session.");
@@ -885,6 +878,7 @@ async function startRunArtifacts(
     agent: plan.profile.agentName,
     cwd: plan.effectiveCwd,
     context: plan.context,
+    ...(plan.context === "fresh" && plan.agentsMdOverride !== undefined ? { agentsMdOverride: plan.agentsMdOverride } : {}),
     sessionFile: childSessionFile,
     activityLog,
     agentFile: plan.profile.agentFile ?? null,
@@ -950,15 +944,17 @@ async function createChildSession(
   });
 }
 
-function preservePlannedModel(plan: ChildSessionPlan, childSessionManager: SessionManager): void {
-  if (!plan.model) return;
-
+function preservePlannedSelection(plan: ChildSessionPlan, childSessionManager: SessionManager): void {
   try {
-    const recordedModel = childSessionManager.buildSessionContext().model;
-    if (recordedModel) return;
-    childSessionManager.appendModelChange(plan.model.provider, plan.model.id);
+    if (plan.model && !childSessionManager.buildSessionContext().model) {
+      childSessionManager.appendModelChange(plan.model.provider, plan.model.id);
+    }
+    if (plan.thinkingLevel !== undefined
+      && !childSessionManager.getBranch().some((entry) => entry.type === "thinking_level_change")) {
+      childSessionManager.appendThinkingLevelChange(plan.thinkingLevel);
+    }
   } catch (error: unknown) {
-    console.error("subagent child model persistence failed", error);
+    console.error("subagent child selection persistence failed", error);
   }
 }
 
