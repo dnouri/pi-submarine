@@ -4,16 +4,16 @@ import { Type } from "typebox";
 import { listSubagents } from "./listing.js";
 import { runSubagent, runSubagentResume } from "./runner.js";
 import { TOOL_PROMPTS } from "./tool-prompts.js";
-import { SUBAGENT_LIST_TOOL_NAME, SUBAGENT_RESUME_TOOL_NAME, SUBAGENT_TOOL_NAME, THINKING_LEVELS } from "./types.js";
+import { SUBAGENT_LIST_TOOL_NAME, SUBAGENT_RESUME_TOOL_NAME, SUBAGENT_TOOL_NAME } from "./types.js";
 
 export const subagentParameters = Type.Object(
   {
     agent: Type.Optional(Type.String({ description: TOOL_PROMPTS.subagent.parameterDescriptions.agent })),
     task: Type.String({ minLength: 1, description: TOOL_PROMPTS.subagent.parameterDescriptions.task }),
     model: Type.Optional(Type.String({ minLength: 1, description: TOOL_PROMPTS.subagent.parameterDescriptions.model })),
-    thinkingLevel: Type.Optional(
-      StringEnum(THINKING_LEVELS, {
-        description: TOOL_PROMPTS.subagent.parameterDescriptions.thinkingLevel,
+    agentsMd: Type.Optional(
+      StringEnum(["none", "auto"] as const, {
+        description: TOOL_PROMPTS.subagent.parameterDescriptions.agentsMd,
       }),
     ),
     context: Type.Optional(
@@ -42,17 +42,24 @@ export const subagentListParameters = Type.Object(
   { additionalProperties: false },
 );
 
-export const subagentTool = defineTool({
-  name: SUBAGENT_TOOL_NAME,
-  label: TOOL_PROMPTS.subagent.label,
-  description: TOOL_PROMPTS.subagent.description,
-  promptSnippet: TOOL_PROMPTS.subagent.promptSnippet,
-  promptGuidelines: [...TOOL_PROMPTS.subagent.promptGuidelines],
-  parameters: subagentParameters,
-  async execute(_toolCallId, params, signal, onUpdate, ctx) {
-    return runSubagent(params, signal, onUpdate, ctx, { extensionFactories: [register] });
-  },
-});
+function createSubagentTool(getParentThinkingLevel?: ExtensionAPI["getThinkingLevel"]) {
+  return defineTool({
+    name: SUBAGENT_TOOL_NAME,
+    label: TOOL_PROMPTS.subagent.label,
+    description: TOOL_PROMPTS.subagent.description,
+    promptSnippet: TOOL_PROMPTS.subagent.promptSnippet,
+    promptGuidelines: [...TOOL_PROMPTS.subagent.promptGuidelines],
+    parameters: subagentParameters,
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      return runSubagent(params, signal, onUpdate, ctx, {
+        extensionFactories: [register],
+        parentThinkingLevel: getParentThinkingLevel?.(),
+      });
+    },
+  });
+}
+
+export const subagentTool = createSubagentTool();
 
 export const subagentResumeTool = defineTool({
   name: SUBAGENT_RESUME_TOOL_NAME,
@@ -79,7 +86,7 @@ export const subagentListTool = defineTool({
 });
 
 export default function register(pi: ExtensionAPI) {
-  pi.registerTool(subagentTool);
+  pi.registerTool(createSubagentTool(() => pi.getThinkingLevel()));
   pi.registerTool(subagentResumeTool);
   pi.registerTool(subagentListTool);
 }

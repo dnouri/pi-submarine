@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { getModel } from "@earendil-works/pi-ai";
-import { SessionManager, SettingsManager, type AgentSession, type AgentSessionEvent, type CreateAgentSessionOptions, type ExtensionContext, type ResourceLoader } from "@earendil-works/pi-coding-agent";
+import { SessionManager, SettingsManager, type AgentSession, type AgentSessionEvent, type CreateAgentSessionOptions, type DefaultResourceLoader, type ExtensionContext, type ResourceLoader, type Skill } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readManifestRecords } from "../src/manifest.js";
 import { runSubagent, runSubagentResume } from "../src/runner.js";
@@ -31,11 +31,11 @@ class FakeSessionManager {
 function fakeContext(
   cwd: string,
   sessionFile?: string,
-  options: { leafId?: string | null; model?: unknown; modelRegistry?: unknown } = {},
+  options: { sessionCwd?: string; leafId?: string | null; model?: unknown; modelRegistry?: unknown } = {},
 ): ExtensionContext {
   return {
     cwd,
-    sessionManager: new FakeSessionManager(sessionFile, cwd, options.leafId),
+    sessionManager: new FakeSessionManager(sessionFile, options.sessionCwd ?? cwd, options.leafId),
     modelRegistry: options.modelRegistry ?? {},
     model: options.model,
   } as unknown as ExtensionContext;
@@ -59,12 +59,12 @@ function fakeModelRegistry(models: unknown[], authenticated: unknown[] = models)
 
 const MODEL_CHAIN = "provider/a@low,provider/b@high";
 
-async function chainFixture(model = MODEL_CHAIN, thinkingLevel?: string, name = "reviewer") {
+async function chainFixture(model = MODEL_CHAIN, name = "reviewer") {
   const root = await tempRoot();
   const cwd = path.join(root, "project");
   const agentPath = path.join(cwd, ".pi", "agents", `${name}.md`);
   await mkdir(path.dirname(agentPath), { recursive: true });
-  await writeFile(agentPath, `---\ndescription: Reviews\nmodel: ${model}\n${thinkingLevel ? `thinkingLevel: ${thinkingLevel}\n` : ""}---\n\nReview the task.\n`, "utf8");
+  await writeFile(agentPath, `---\ndescription: Reviews\nmodel: ${model}\n---\n\nReview the task.\n`, "utf8");
   return { root, cwd, agentPath, parentSession: path.join(root, "sessions", "parent.jsonl") };
 }
 
@@ -209,6 +209,7 @@ function event(value: Record<string, unknown>): AgentSessionEvent {
 class FakeForkSessionManager {
   public branchedFrom: string | undefined;
   public modelChanges: Array<{ provider: string; modelId: string }> = [];
+  public thinkingChanges: string[] = [];
 
   constructor(
     private readonly cwd: string,
@@ -225,6 +226,11 @@ class FakeForkSessionManager {
   appendModelChange(provider: string, modelId: string) {
     this.modelChanges.push({ provider, modelId });
     return "model-change";
+  }
+
+  appendThinkingLevelChange(level: string) {
+    this.thinkingChanges.push(level);
+    return "thinking-change";
   }
 
   createBranchedSession(leafId: string) {
@@ -264,7 +270,7 @@ function fakeDeps(root: string, session?: FakeChildSessionOptions) {
       getAgentDir: vi.fn(() => path.join(root, "agent")),
       createFreshSessionManager: vi.fn((cwd: string, subagentsDir: string) => SessionManager.create(cwd, subagentsDir)),
       openSessionManager: vi.fn((sessionFile: string, subagentsDir: string) => SessionManager.open(sessionFile, subagentsDir)),
-      createResourceLoader: vi.fn(() => ({
+      createResourceLoader: vi.fn((_options: ConstructorParameters<typeof DefaultResourceLoader>[0]) => ({
         reload: vi.fn(async () => undefined),
         getExtensions: vi.fn(),
         getSkills: vi.fn(),
@@ -397,8 +403,9 @@ class FakeChildSession {
   }
 
   setInitialSelection(options: CreateAgentSessionOptions) {
-    this.activeModel = options.model;
-    this.activeThinkingLevel = options.thinkingLevel ?? this.sessionManager?.buildSessionContext?.().thinkingLevel;
+    const recorded = this.sessionManager?.buildSessionContext?.();
+    this.activeModel = options.model ?? (recorded?.model ? { provider: recorded.model.provider, id: recorded.model.modelId } : undefined);
+    this.activeThinkingLevel = options.thinkingLevel ?? recorded?.thinkingLevel;
   }
 
   emit(event: AgentSessionEvent) {
@@ -931,7 +938,7 @@ describe("subagent runner", () => {
     const cwd = path.join(root, "project");
     const agentPath = path.join(cwd, ".pi", "agents", "reviewer.md");
     await mkdir(path.dirname(agentPath), { recursive: true });
-    await writeFile(agentPath, "---\ndescription: Reviews\nmodel: zai/new-reviewer-model\nagentsMd: auto\nskills: none\n---\n\nFresh reviewer body.\n", "utf8");
+    await writeFile(agentPath, "---\ndescription: Reviews\nmodel: zai/new-reviewer-model@off\nagentsMd: auto\nskills: none\n---\n\nFresh reviewer body.\n", "utf8");
     const parentSession = path.join(root, "sessions", "parent.jsonl");
     const childSession = path.join(`${parentSession}.subagents`, "child.jsonl");
     const oldAgentPath = path.join(root, "old-agents", "reviewer.md");
@@ -1194,12 +1201,137 @@ describe("subagent runner", () => {
     expect(sessionOptions?.model).toBe(parentModel);
   });
 
+  describe("fresh context-file requests", () => {
+    const cases = [
+      [undefined, "none", undefined],
+      [undefined, "none", "none"],
+      [undefined, "none", "auto"],
+      ["reviewer", "none", undefined],
+      ["reviewer", "none", "none"],
+      ["reviewer", "none", "auto"],
+      ["reviewer", "auto", undefined],
+      ["reviewer", "auto", "none"],
+      ["reviewer", "auto", "auto"],
+    ] as const;
+
+    it.each(cases)("preserves request provenance and live resources across repeated resume (%s, %s, %s)", async (agent, profileMode, agentsMd) => {
+      const root = await tempRoot();
+      const cwd = path.join(root, "project");
+      const agentPath = path.join(cwd, ".pi", "agents", "reviewer.md");
+      await mkdir(path.dirname(agentPath), { recursive: true });
+      await writeFile(agentPath, `---\ndescription: Reviews\nagentsMd: ${profileMode}\nskills: none\n---\n\nOriginal named body.\n`, "utf8");
+      const parentSession = path.join(root, "sessions", "parent.jsonl");
+      const initial = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
+      const model = thinkingModel("provider", "resource-test");
+      const ctx = fakeContext(cwd, parentSession, { model, modelRegistry: fakeModelRegistry([model]) });
+      const result = await runSubagent({ task: "review", ...(agent === undefined ? {} : { agent, context: "fresh" }), ...(agentsMd === undefined ? {} : { agentsMd }) }, undefined, undefined, ctx, { deps: initial.deps });
+      const initialOptions = initial.deps.createResourceLoader.mock.calls[0]?.[0];
+      expect(initialOptions).toMatchObject({ cwd });
+      expect(initialOptions?.noContextFiles).toBe((agentsMd ?? profileMode) === "none" ? true : undefined);
+      expect(initialOptions?.noSkills).toBe(agent === undefined ? undefined : true);
+      expect(initialOptions?.systemPromptOverride).toBeUndefined();
+      expect(initialOptions?.appendSystemPromptOverride).toBeUndefined();
+      expect(initialOptions?.noExtensions).toBeUndefined();
+      expect(initial.fakeSession.promptedWith).toBe(expectedPromptEnvelope("fresh", "review", agent === undefined ? {} : { agentName: agent, agentBody: "Original named body." }));
+
+      const audit: Skill = { name: "audit", description: "Audit", filePath: "/skills/audit/SKILL.md", baseDir: "/skills/audit", sourceInfo: { path: "/skills/audit/SKILL.md", source: "local", scope: "project", origin: "top-level" }, disableModelInvocation: false };
+      for (const [index, mode] of (["auto", "none", "auto"] as const).entries()) {
+        await writeFile(agentPath, `---\ndescription: Reviews\nagentsMd: ${mode}\nskills: ${index === 1 ? "none" : "audit"}\n---\n\nChanged named body.\n`, "utf8");
+        const resumed = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
+        resumed.deps.createEpisodeId = vi.fn(() => `resume-${index}`);
+        const next = await runSubagentResume({ sessionId: result.details.run.sessionId, message: `continue ${index}` }, undefined, undefined, ctx, { deps: resumed.deps });
+        const loaderOptions = resumed.deps.createResourceLoader.mock.calls[0]?.[0];
+        expect(next.details.run.sessionId).toBe(result.details.run.sessionId);
+        expect(resumed.fakeSession.promptedWith).toBe(`continue ${index}`);
+        expect(loaderOptions?.noContextFiles).toBe((agentsMd ?? (agent === undefined ? "none" : mode)) === "none" ? true : undefined);
+        expect(loaderOptions?.noSkills).toBe(agent !== undefined && index === 1 ? true : undefined);
+        if (agent !== undefined && index !== 1) {
+          expect(loaderOptions?.skillsOverride?.({ skills: [audit], diagnostics: [] }).skills).toEqual([audit]);
+        } else {
+          expect(loaderOptions?.skillsOverride).toBeUndefined();
+        }
+      }
+
+      const records = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
+      const original = records[0];
+      expect(records.map((record) => record.type)).toEqual(["started", "finished", "resume_started", "resume_finished", "resume_started", "resume_finished", "resume_started", "resume_finished"]);
+      if (agentsMd === undefined) expect(original).not.toHaveProperty("agentsMdOverride");
+      else expect(original).toHaveProperty("agentsMdOverride", agentsMd);
+      for (const record of records.slice(1)) expect(record).not.toHaveProperty("agentsMdOverride");
+    });
+
+    it.each(["none", "auto"] as const)("recovers an interrupted child with the original explicit %s request", async (agentsMd) => {
+      const { root, cwd, parentSession, agentPath } = await chainFixture();
+      await writeFile(agentPath, `---\ndescription: Reviews\nagentsMd: ${agentsMd}\n---\n\nReview body.\n`, "utf8");
+      const controller = new AbortController();
+      const initial = fakeDeps(root, { promptImpl: async () => new Promise<void>(() => undefined) });
+      const running = runSubagent({ agent: "reviewer", task: "review", agentsMd }, controller.signal, undefined, fakeContext(cwd, parentSession), { deps: initial.deps });
+      await vi.waitFor(() => expect(initial.fakeSession.promptCount).toBe(1));
+      controller.abort();
+      const message = await rejectedMessage(running);
+      const records = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
+      const original = records[0];
+      if (original?.type !== "started") throw new Error("Expected original start record");
+      expectInterruptedCapsule(message, original.sessionId, "## Subagent reviewer interrupted");
+      expect(original.agentsMdOverride).toBe(agentsMd);
+      expect(records[1]).toMatchObject({ type: "finished", status: "aborted" });
+      await writeFile(agentPath, `---\ndescription: Reviews\nagentsMd: ${agentsMd === "none" ? "auto" : "none"}\nskills: none\n---\n\nChanged body.\n`, "utf8");
+      const resumed = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
+      const result = await runSubagentResume({ sessionId: original.sessionId, message: "Recover the interrupted task." }, undefined, undefined, fakeContext(cwd, parentSession), { deps: resumed.deps });
+      expect(result.details.run.sessionId).toBe(original.sessionId);
+      expect(resumed.deps.createResourceLoader.mock.calls[0]?.[0]).toMatchObject({ noSkills: true });
+      expect(resumed.deps.createResourceLoader.mock.calls[0]?.[0]?.noContextFiles).toBe(agentsMd === "none" ? true : undefined);
+    });
+
+    it.each([
+      ["fresh", null], ["fresh", true], ["fresh", "bogus"], ["fresh", ""], ["fresh", 0],
+      ["fork", "none"], ["fork", "auto"],
+    ] as const)("rejects persisted override %s/%s before writing or opening the child", async (context, agentsMdOverride) => {
+      const root = await tempRoot();
+      const cwd = path.join(root, "project");
+      await mkdir(cwd, { recursive: true });
+      const parentSession = path.join(root, "parent.jsonl");
+      const childSession = path.join(`${parentSession}.subagents`, "child.jsonl");
+      await writeChildSessionHeader(childSession, "invalid-policy", cwd);
+      await writeManifestRecord(parentSession, { ...startedManifestRecord({ sessionId: "invalid-policy", cwd, context, sessionFile: childSession }), agentsMdOverride });
+      await writeFile(`${parentSession}.subagents.md`, "Existing log.\n", "utf8");
+      const paths = [childSession, `${parentSession}.subagents/manifest.jsonl`, `${parentSession}.subagents.md`];
+      const before = await Promise.all(paths.map((file) => readFile(file, "utf8")));
+      const { deps } = fakeDeps(root);
+      const message = await rejectedMessage(runSubagentResume({ sessionId: "invalid-policy", message: "continue" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
+      expect(message).toContain("invalid manifest record");
+      expectNoRecoveryHandle(message);
+      expect(deps.openSessionManager).not.toHaveBeenCalled();
+      expect(deps.createResourceLoader).not.toHaveBeenCalled();
+      expect(deps.createAgentSession).not.toHaveBeenCalled();
+      expect(await Promise.all(paths.map((file) => readFile(file, "utf8")))).toEqual(before);
+      expect((await readdir(`${parentSession}.subagents`)).sort()).toEqual(["child.jsonl", "manifest.jsonl"]);
+    });
+
+    it.each(["none", "auto"] as const)("still rejects removed frontmatter on initial and resumed named calls with override %s", async (agentsMd) => {
+      const { root, cwd, parentSession, agentPath } = await chainFixture("provider/a@low");
+      await writeFile(agentPath, "---\ndescription: Reviews\nthinkingLevel: low\n---\n\nReview body.\n", "utf8");
+      const { deps } = fakeDeps(root);
+      const model = thinkingModel("provider", "a");
+      await expect(runSubagent({ agent: "reviewer", task: "review", agentsMd, model: "provider/a@low" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([model]) }), { deps })).rejects.toThrow("unknown key 'thinkingLevel'");
+      expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+      await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
+      const childSession = path.join(`${parentSession}.subagents`, "child.jsonl");
+      await writeChildSessionHeader(childSession, "invalid-profile", cwd);
+      await writeManifestRecord(parentSession, { ...startedManifestRecord({ sessionId: "invalid-profile", agent: "reviewer", cwd, sessionFile: childSession, agentFile: agentPath }), agentsMdOverride: agentsMd });
+      const before = await readFile(`${parentSession}.subagents/manifest.jsonl`, "utf8");
+      await expect(runSubagentResume({ sessionId: "invalid-profile", message: "continue" }, undefined, undefined, fakeContext(cwd, parentSession), { deps })).rejects.toThrow("unknown key 'thinkingLevel'");
+      expect(await readFile(`${parentSession}.subagents/manifest.jsonl`, "utf8")).toBe(before);
+      expect(deps.createAgentSession).not.toHaveBeenCalled();
+    });
+  });
+
   it("uses a named agent's default model for a fresh child", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     const agentPath = path.join(cwd, ".pi", "agents", "vision.md");
     await mkdir(path.dirname(agentPath), { recursive: true });
-    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: zai/glm-5v-turbo\n---\n\nRead the image.\n", "utf8");
+    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: zai/glm-5v-turbo@off\n---\n\nRead the image.\n", "utf8");
     const parentSession = path.join(root, "sessions", "parent.jsonl");
     const visionModel = fakeModel("zai", "glm-5v-turbo");
     const { deps } = fakeDeps(root);
@@ -1214,6 +1346,7 @@ describe("subagent runner", () => {
 
     const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
     expect(sessionOptions?.model).toBe(visionModel);
+    expect(sessionOptions?.thinkingLevel).toBe("off");
   });
 
   it("lets a call-level model override a named agent default", async () => {
@@ -1221,13 +1354,13 @@ describe("subagent runner", () => {
     const cwd = path.join(root, "project");
     const agentPath = path.join(cwd, ".pi", "agents", "vision.md");
     await mkdir(path.dirname(agentPath), { recursive: true });
-    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: unavailable/default\n---\n\nRead the image.\n", "utf8");
+    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: unavailable/default@off\n---\n\nRead the image.\n", "utf8");
     const parentSession = path.join(root, "sessions", "parent.jsonl");
     const overrideModel = fakeModel("zai", "glm-5v-turbo");
     const { deps } = fakeDeps(root);
 
     await runSubagent(
-      { agent: "vision", task: "read screenshot.png", model: "zai/glm-5v-turbo" },
+      { agent: "vision", task: "read screenshot.png", model: "zai/glm-5v-turbo@off" },
       undefined,
       undefined,
       fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([overrideModel]) }),
@@ -1247,7 +1380,7 @@ describe("subagent runner", () => {
     const { deps } = fakeDeps(root);
 
     await runSubagent(
-      { task: "read screenshot.png", model: "glm-5v-turbo" },
+      { task: "read screenshot.png", model: "glm-5v-turbo@off" },
       undefined,
       undefined,
       fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([visionModel]) }),
@@ -1256,14 +1389,15 @@ describe("subagent runner", () => {
 
     const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
     expect(sessionOptions?.model).toBe(visionModel);
+    expect(sessionOptions?.thinkingLevel).toBe("off");
   });
 
-  it("uses a named agent's default thinkingLevel for a fresh child", async () => {
+  it("uses a named agent's model suffix for SDK effort in a fresh child", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     const agentPath = path.join(cwd, ".pi", "agents", "vision.md");
     await mkdir(path.dirname(agentPath), { recursive: true });
-    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: zai/glm-5.3\nthinkingLevel: low\n---\n\nRead the image.\n", "utf8");
+    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: zai/glm-5.3@low\n---\n\nRead the image.\n", "utf8");
     const parentSession = path.join(root, "sessions", "parent.jsonl");
     const flash = thinkingModel("zai", "glm-5.3");
     const { deps } = fakeDeps(root);
@@ -1280,18 +1414,18 @@ describe("subagent runner", () => {
     expect(sessionOptions?.thinkingLevel).toBe("low");
   });
 
-  it("lets a call-level thinkingLevel override a named agent default", async () => {
+  it("uses a call model suffix instead of a named model suffix", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     const agentPath = path.join(cwd, ".pi", "agents", "vision.md");
     await mkdir(path.dirname(agentPath), { recursive: true });
-    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: zai/glm-5.3\nthinkingLevel: low\n---\n\nRead the image.\n", "utf8");
+    await writeFile(agentPath, "---\ndescription: Reads images\nmodel: zai/glm-5.3@low\n---\n\nRead the image.\n", "utf8");
     const parentSession = path.join(root, "sessions", "parent.jsonl");
     const flash = thinkingModel("zai", "glm-5.3");
     const { deps } = fakeDeps(root);
 
     await runSubagent(
-      { agent: "vision", task: "read screenshot.png", thinkingLevel: "high" },
+      { agent: "vision", task: "read screenshot.png", model: "zai/glm-5.3@high" },
       undefined,
       undefined,
       fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([flash]) }),
@@ -1302,26 +1436,29 @@ describe("subagent runner", () => {
     expect(sessionOptions?.thinkingLevel).toBe("high");
   });
 
-  it("omits thinkingLevel when neither call nor agent provides one", async () => {
+  it.each([undefined, "reviewer"])("inherits the parent's current model and effort for fresh children (%s)", async (agent) => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
-    await mkdir(cwd, { recursive: true });
+    const agentPath = path.join(cwd, ".pi", "agents", "reviewer.md");
+    await mkdir(path.dirname(agentPath), { recursive: true });
+    await writeFile(agentPath, "---\ndescription: Reviews\n---\n\nReview the task.\n", "utf8");
     const parentSession = path.join(root, "sessions", "parent.jsonl");
-    const { deps } = fakeDeps(root);
+    const parentModel = thinkingModel("provider", "parent");
+    const { deps, fakeSession } = fakeDeps(root);
 
     await runSubagent(
-      { task: "read screenshot.png" },
+      { ...(agent === undefined ? {} : { agent }), task: "read screenshot.png" },
       undefined,
       undefined,
-      fakeContext(cwd, parentSession),
-      { deps },
+      fakeContext(cwd, parentSession, { model: parentModel }),
+      { deps, parentThinkingLevel: "high" },
     );
 
-    const sessionOptions = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
-    expect(sessionOptions?.thinkingLevel).toBeUndefined();
+    expect(deps.createAgentSession.mock.calls[0]?.[0]).toMatchObject({ model: parentModel, thinkingLevel: "high" });
+    expect(fakeSession.promptSettings).toEqual([{ model: parentModel, thinkingLevel: "high" }]);
   });
 
-  it("rejects an unsupported thinkingLevel before creating child artifacts", async () => {
+  it("rejects an unsupported effort suffix before creating child artifacts", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     await mkdir(cwd, { recursive: true });
@@ -1330,7 +1467,7 @@ describe("subagent runner", () => {
     const { deps } = fakeDeps(root);
 
     const message = await rejectedMessage(runSubagent(
-      { task: "read screenshot.png", model: "zai/glm-5.3-flash", thinkingLevel: "high" },
+      { task: "read screenshot.png", model: "zai/glm-5.3-flash@high" },
       undefined,
       undefined,
       fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([flash]) }),
@@ -1344,23 +1481,6 @@ describe("subagent runner", () => {
     await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
   });
 
-  it("rejects an explicit level when there is no resolved model to validate", async () => {
-    const root = await tempRoot();
-    const cwd = path.join(root, "project");
-    await mkdir(cwd, { recursive: true });
-    const parentSession = path.join(root, "sessions", "parent.jsonl");
-    const { deps } = fakeDeps(root);
-
-    const message = await rejectedMessage(runSubagent(
-      { task: "review", thinkingLevel: "max" }, undefined, undefined,
-      fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([]) }), { deps },
-    ));
-
-    expect(message).toContain("Cannot validate subagent thinking level 'max' without a resolved model");
-    expectNoRecoveryHandle(message);
-    expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
-  });
-
   it("rejects an unknown explicit model before creating child artifacts", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
@@ -1369,7 +1489,7 @@ describe("subagent runner", () => {
     const { deps } = fakeDeps(root);
 
     const message = await rejectedMessage(runSubagent(
-      { task: "read screenshot.png", model: "missing-model" },
+      { task: "read screenshot.png", model: "missing-model@off" },
       undefined,
       undefined,
       fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([]) }),
@@ -1386,6 +1506,8 @@ describe("subagent runner", () => {
     const first = thinkingModel("provider", "a");
     const second = thinkingModel("provider", "b");
     const registry = fakeModelRegistry([first, second]);
+    const longChainModels = [first, second, ...["c", "d", "e"].map((id) => thinkingModel("provider", id))];
+    const longChain = longChainModels.map((model, index) => `${model.provider}/${model.id}@${index % 2 === 0 ? "low" : "high"}`).join(",");
     const chainSources = [
       ["markdown", "reviewer"],
       ["omitted call", undefined],
@@ -1394,7 +1516,7 @@ describe("subagent runner", () => {
 
     it.each(chainSources)("retries a first-turn model error on the next candidate in the same child session and episode (%s)", async (source, agent) => {
       const { root, cwd, parentSession, agentPath } = await chainFixture(
-        source === "markdown" ? MODEL_CHAIN : "provider/a", undefined, agent,
+        source === "markdown" ? MODEL_CHAIN : "provider/a@low", agent,
       );
       const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] });
 
@@ -1403,6 +1525,7 @@ describe("subagent runner", () => {
           ...(agent === undefined ? {} : { agent }),
           ...(source === "markdown" ? {} : { model: MODEL_CHAIN }),
           task: "review this",
+          agentsMd: "auto",
         },
         undefined,
         undefined,
@@ -1431,9 +1554,10 @@ describe("subagent runner", () => {
       expect(deps.createEpisodeId).toHaveBeenCalledTimes(1);
       const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
       expect(manifest).toEqual([
-        expect.objectContaining({ type: "started", episodeId: "run-1", sessionId: result.details.run.sessionId, agentFile: agent === undefined ? null : agentPath }),
+        expect.objectContaining({ type: "started", episodeId: "run-1", sessionId: result.details.run.sessionId, agentFile: agent === undefined ? null : agentPath, agentsMdOverride: "auto" }),
         expect.objectContaining({ type: "finished", episodeId: "run-1", status: "completed" }),
       ]);
+      expect(deps.createResourceLoader.mock.calls[0]?.[0]).not.toHaveProperty("noContextFiles");
       const childFile = manifest[0]?.type === "started" ? manifest[0].sessionFile : "";
       const restored = SessionManager.open(childFile, `${parentSession}.subagents`).buildSessionContext();
       expect(restored).toMatchObject({ model: { provider: "provider", modelId: "b" }, thinkingLevel: "high" });
@@ -1452,7 +1576,7 @@ describe("subagent runner", () => {
       const third = thinkingModel("provider", "c");
       const chain = "provider/a@low,provider/b@high,provider/c@low";
       const { root, cwd, parentSession, agentPath } = await chainFixture(
-        source === "markdown" ? chain : "provider/a", undefined, agent,
+        source === "markdown" ? chain : "provider/a@low", agent,
       );
       const { deps, sessions } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] },
         { messagesByPrompt: [[{ ...firstModelError, errorMessage: "second provider failed" }]] },
@@ -1504,6 +1628,68 @@ describe("subagent runner", () => {
       expect(resumed.fakeSession.promptSettings).toEqual([{ model: third, thinkingLevel: "low" }]);
     });
 
+    describe.each(["fresh", "fork"] as const)("%s long chains", (context) => {
+      it.each(["markdown", "call"])("succeeds on the sixth model in order in one child session and episode (%s)", async (source) => {
+        const models = Array.from({ length: 6 }, (_, index) => thinkingModel("provider", `candidate-${index + 1}`));
+        const levels = models.map((_, index) => index % 2 === 0 ? "low" : "high");
+        const chain = models.map((model, index) => `${model.provider}/${model.id}@${levels[index]}`).join(",");
+        const { root, cwd, agentPath } = await chainFixture(source === "markdown" ? chain : "provider/a@low");
+        const parentManager = SessionManager.create(cwd, path.join(root, "sessions"));
+        parentManager.appendMessage({ role: "user", content: "Start here" } as Parameters<SessionManager["appendMessage"]>[0]);
+        parentManager.appendMessage({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Ready" }] } as Parameters<SessionManager["appendMessage"]>[0]);
+        const parentSession = parentManager.getSessionFile()!;
+        const parentHistory = parentManager.buildSessionContext().messages;
+        const parentText = await readFile(parentSession, "utf8");
+        const attempts = models.map((model, index) => ({ messagesByPrompt: [[index === models.length - 1
+          ? fallbackAnswer
+          : { ...firstModelError, errorMessage: `${model.id} provider failed` }]] }));
+        const { deps, sessions } = fakeChainDeps(root, attempts[0]!, ...attempts.slice(1));
+        const createBranchedSession = vi.spyOn(SessionManager.prototype, "createBranchedSession");
+
+        const result = await runSubagent(
+          { agent: "reviewer", task: "review", context, ...(source === "call" ? { model: chain } : {}) },
+          undefined,
+          undefined,
+          fakeContext(cwd, parentSession, { leafId: parentManager.getLeafId(), modelRegistry: fakeModelRegistry(models) }),
+          { deps },
+        );
+
+        const failures = models.slice(0, -1).map((model) => `provider/${model.id} (${model.id} provider failed)`).join(", ");
+        expectSubagentResult(result, "## Subagent reviewer result", "child answer", `Model: provider/candidate-6 — after failed attempts: ${failures}`);
+        expect(deps.createAgentSession.mock.calls.map(([options]) => [options.model, options.thinkingLevel]))
+          .toEqual(models.map((model, index) => [model, levels[index]]));
+        expect(new Set(deps.createAgentSession.mock.calls.map(([options]) => options.sessionManager)).size).toBe(1);
+        expect(deps.openSessionManager).toHaveBeenCalledTimes(context === "fork" ? 1 : 0);
+        expect(createBranchedSession).toHaveBeenCalledTimes(context === "fork" ? 1 : 0);
+        expect(deps.createFreshSessionManager).toHaveBeenCalledTimes(context === "fresh" ? 1 : 0);
+        expect(deps.createEpisodeId).toHaveBeenCalledTimes(1);
+        expect(deps.createResourceLoader.mock.results[0]?.value.reload).toHaveBeenCalledTimes(models.length);
+        const prompt = expectedPromptEnvelope(context, "review", { agentName: "reviewer", agentBody: "Review the task." });
+        sessions.forEach((session, index) => {
+          expect(session.prompts).toEqual([prompt]);
+          expect(session.promptSettings).toEqual([{ model: models[index], thinkingLevel: levels[index] }]);
+          expect(session.disposeCount).toBe(1);
+        });
+        const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
+        expect(manifest).toEqual([
+          expect.objectContaining({ type: "started", episodeId: "run-1", sessionId: result.details.run.sessionId, context, agentFile: agentPath }),
+          expect.objectContaining({ type: "finished", episodeId: "run-1", status: "completed" }),
+        ]);
+        const childFile = manifest[0]?.type === "started" ? manifest[0].sessionFile : "";
+        const restored = SessionManager.open(childFile, `${parentSession}.subagents`).buildSessionContext();
+        expect(restored).toMatchObject({ model: { provider: "provider", modelId: "candidate-6" }, thinkingLevel: "high" });
+        expect(restored.messages).toEqual([
+          ...(context === "fork" ? parentHistory : []),
+          expect.objectContaining({ role: "user", content: prompt }),
+          expect.objectContaining({ ...fallbackAnswer, provider: "provider", model: "candidate-6" }),
+        ]);
+        const entries = (await readFile(childFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+        expect(entries.filter((entry) => entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "error")).toHaveLength(models.length - 1);
+        expect((await readdir(`${parentSession}.subagents`)).filter((file) => file.endsWith(".jsonl") && file !== "manifest.jsonl")).toEqual([path.basename(childFile)]);
+        expect(await readFile(parentSession, "utf8")).toBe(parentText);
+      });
+    });
+
     it("records failed attempts in the activity log and names the serving model in the result", async () => {
       const third = thinkingModel("provider", "c");
       const { root, cwd, parentSession } = await chainFixture("provider/a@low,provider/b@high,provider/c@low");
@@ -1522,7 +1708,7 @@ describe("subagent runner", () => {
     });
 
     it.each(["markdown", "call"])("stays on the first model when the first turn succeeds (%s)", async (source) => {
-      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a@low");
       const { deps, fakeSession } = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
 
       const result = await runSubagent(
@@ -1540,7 +1726,7 @@ describe("subagent runner", () => {
     });
 
     it.each(["markdown", "call"])("does not fall back when prompt rejects before a terminal assistant error (%s)", async (source) => {
-      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a@low");
       const { deps, firstSession, secondSession } = fakeChainDeps(root, {
         promptImpl: async () => { throw new Error("prompt preflight failed"); },
       });
@@ -1586,7 +1772,7 @@ describe("subagent runner", () => {
     });
 
     it.each(["markdown", "call"])("does not retry an all-error assistant sequence after tool activity (%s)", async (source) => {
-      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a@low");
       const { deps, firstSession, secondSession } = fakeChainDeps(root, {
         messagesByPrompt: [[firstModelError]],
         events: [event({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} })],
@@ -1618,7 +1804,7 @@ describe("subagent runner", () => {
     });
 
     it.each(["markdown", "call"])("does not fall back on a child-aborted first turn (%s)", async (source) => {
-      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a@low");
       const { deps, fakeSession } = fakeDeps(root, { messagesByPrompt: [[{ role: "assistant", stopReason: "aborted" }]] });
 
       const message = await rejectedMessage(runSubagent(
@@ -1636,7 +1822,7 @@ describe("subagent runner", () => {
     });
 
     it.each(["markdown", "call"])("does not fall back after a parent abort during the first attempt (%s)", async (source) => {
-      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a@low");
       const controller = new AbortController();
       const { deps, fakeSession } = fakeDeps(root, {
         messagesByPrompt: [[firstModelError]],
@@ -1716,93 +1902,105 @@ describe("subagent runner", () => {
       expect(manifest[1]).toMatchObject({ type: "finished", status: "failed", error: "third provider failed" });
     });
 
-    describe.each(["markdown", "call"])("%s chain preflight", (source) => {
-      it.each([
-        ["empty candidate", "provider/a@low,,provider/b@high", registry, /empty|invalid/i],
-        ["invalid level", "provider/a@turbo,provider/b@high", registry, /thinking.*turbo|turbo.*thinking/i],
-        ["missing second model", MODEL_CHAIN, fakeModelRegistry([first]), /model 'provider\/b' not found/i],
-        ["unauthenticated second model", MODEL_CHAIN, fakeModelRegistry([first, second], [first]), /No authentication configured for subagent model 'provider\/b'/i],
-        ["unsupported second level", MODEL_CHAIN, fakeModelRegistry([first, fakeModel("provider", "b")]), /thinking level 'high' is not supported by model 'provider\/b'/i],
-        ["unsupported max in this SDK", "provider/a@low,provider/b@max", registry, /thinking level 'max' is not supported by model 'provider\/b'/i],
-        ["missing third model", "provider/a@low,provider/b@high,provider/c@low", registry, /model 'provider\/c' not found/i],
-        ["unauthenticated third model", "provider/a@low,provider/b@high,provider/c@low", fakeModelRegistry([first, second, thinkingModel("provider", "c")], [first, second]), /No authentication configured for subagent model 'provider\/c'/i],
-        ["more than three models", "provider/a,provider/b,provider/c,provider/d", registry, /at most three candidates/i],
-      ])("rejects %s in the whole chain before creating child artifacts", async (_case, chain, models, reason) => {
-        const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a@low");
-        const { deps } = fakeDeps(root);
+    describe.each(["fresh", "fork"])("%s chain preflight", (context) => {
+      describe.each(["markdown", "call"])("%s chains", (source) => {
+        it.each([
+          ["empty candidate", "provider/a@low,,provider/b@high", registry, /empty|invalid/i],
+          ["invalid level", "provider/a@turbo,provider/b@high", registry, /thinking.*turbo|turbo.*thinking/i],
+          ["missing second model", MODEL_CHAIN, fakeModelRegistry([first]), /model 'provider\/b' not found/i],
+          ["unauthenticated second model", MODEL_CHAIN, fakeModelRegistry([first, second], [first]), /No authentication configured for subagent model 'provider\/b'/i],
+          ["unsupported second level", MODEL_CHAIN, fakeModelRegistry([first, fakeModel("provider", "b")]), /thinking level 'high' is not supported by model 'provider\/b'/i],
+          ["unsupported max in this SDK", "provider/a@low,provider/b@max", registry, /thinking level 'max' is not supported by model 'provider\/b'/i],
+          ["unsupported third level", "provider/a@low,provider/b@high,provider/c@high", fakeModelRegistry([first, second, fakeModel("provider", "c")]), /thinking level 'high' is not supported by model 'provider\/c'/i],
+          ["missing third model", "provider/a@low,provider/b@high,provider/c@low", registry, /model 'provider\/c' not found/i],
+          ["unauthenticated third model", "provider/a@low,provider/b@high,provider/c@low", fakeModelRegistry([first, second, thinkingModel("provider", "c")], [first, second]), /No authentication configured for subagent model 'provider\/c'/i],
+          ["missing fifth model", longChain, fakeModelRegistry(longChainModels.slice(0, -1)), /model 'provider\/e' not found/i],
+          ["unauthenticated fifth model", longChain, fakeModelRegistry(longChainModels, longChainModels.slice(0, -1)), /No authentication configured for subagent model 'provider\/e'/i],
+          ["unsupported fifth level", longChain, fakeModelRegistry([...longChainModels.slice(0, -1), fakeModel("provider", "e")]), /thinking level 'low' is not supported by model 'provider\/e'/i],
+        ])("rejects %s in the whole chain before creating child artifacts", async (_case, chain, models, reason) => {
+          const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a@low");
+          await writeChildSessionHeader(parentSession, "parent-session", cwd);
+          const parentText = await readFile(parentSession, "utf8");
+          const { deps, fakeSession } = fakeDeps(root);
 
-        const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review", ...(source === "call" ? { model: chain } : {}) }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: models }), { deps }));
+          const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review", context: context === "fork" ? "fork" : "fresh", ...(source === "call" ? { model: chain } : {}) }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: models }), { deps }));
 
-        expect(message).toMatch(reason);
-        expectNoRecoveryHandle(message);
-        expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
-        expect(deps.createAgentSession).not.toHaveBeenCalled();
-        await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
-        await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
+          expect(message).toMatch(reason);
+          expectNoRecoveryHandle(message);
+          expect(deps.openSessionManager).not.toHaveBeenCalled();
+          expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+          expect(deps.createResourceLoader).not.toHaveBeenCalled();
+          expect(deps.createAgentSession).not.toHaveBeenCalled();
+          expect(fakeSession.promptCount).toBe(0);
+          expect(await readFile(parentSession, "utf8")).toBe(parentText);
+          await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
+          await expect(readFile(`${parentSession}.subagents/manifest.jsonl`, "utf8")).rejects.toThrow();
+          await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
+        });
       });
     });
 
-    it("still validates the named agent file when a call selects a valid model", async () => {
-      const { root, cwd, parentSession } = await chainFixture("provider/a,,provider/b");
-      const { deps } = fakeDeps(root);
+    it.each(["fresh", "fork"])("still validates the named agent file when a call selects a valid model in %s runs", async (context) => {
+      const { root, cwd, parentSession } = await chainFixture("provider/a@low,,provider/b@high");
+      await writeChildSessionHeader(parentSession, "parent-session", cwd);
+      const parentText = await readFile(parentSession, "utf8");
+      const { deps, fakeSession } = fakeDeps(root);
 
-      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review", model: MODEL_CHAIN }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps }));
+      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review", model: MODEL_CHAIN, context: context === "fork" ? "fork" : "fresh" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps }));
 
       expect(message).toContain("Invalid agent file");
       expectNoRecoveryHandle(message);
+      expect(deps.openSessionManager).not.toHaveBeenCalled();
       expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+      expect(deps.createResourceLoader).not.toHaveBeenCalled();
       expect(deps.createAgentSession).not.toHaveBeenCalled();
+      expect(fakeSession.promptCount).toBe(0);
+      expect(await readFile(parentSession, "utf8")).toBe(parentText);
       await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
+      await expect(readFile(`${parentSession}.subagents/manifest.jsonl`, "utf8")).rejects.toThrow();
+      await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
     });
 
-    it("preflights an explicit level against the inherited fork model even without a model override", async () => {
+    it("inherits the live parent model and effort while copying an older fork branch", async () => {
       const { root, cwd } = await chainFixture();
       const parentManager = SessionManager.create(cwd, path.join(root, "sessions"));
       parentManager.appendModelChange(first.provider, first.id);
-      const parentSession = parentManager.getSessionFile()!;
-      const { deps } = fakeDeps(root);
-
-      const message = await rejectedMessage(runSubagent(
-        { task: "review", context: "fork", thinkingLevel: "max" }, undefined, undefined,
-        fakeContext(cwd, parentSession, { leafId: parentManager.getLeafId(), model: first, modelRegistry: registry }), { deps },
-      ));
-
-      expect(message).toContain("thinking level 'max' is not supported by model 'provider/a'");
-      expectNoRecoveryHandle(message);
-      expect(deps.createAgentSession).not.toHaveBeenCalled();
-      expect(await readdir(`${parentSession}.subagents`)).toEqual([]);
-    });
-
-    it("validates fork thinking against the selected parent branch, not the latest branch", async () => {
-      const { root, cwd } = await chainFixture();
-      const parentManager = SessionManager.create(cwd, path.join(root, "sessions"));
-      parentManager.appendModelChange(first.provider, first.id);
+      parentManager.appendThinkingLevelChange("high");
       parentManager.appendMessage({ role: "assistant", provider: first.provider, model: first.id, stopReason: "stop", content: [{ type: "text", text: "Ready" }] } as Parameters<SessionManager["appendMessage"]>[0]);
       const selectedLeaf = parentManager.appendMessage({ role: "user", content: "older branch" } as Parameters<SessionManager["appendMessage"]>[0]);
       parentManager.appendModelChange("provider", "plain");
+      parentManager.appendThinkingLevelChange("off");
       const parentSession = parentManager.getSessionFile()!;
-      const models = fakeModelRegistry([first, fakeModel("provider", "plain")]);
+      const parentText = await readFile(parentSession, "utf8");
+      const parentModel = fakeModel("provider", "plain");
+      const models = fakeModelRegistry([first, parentModel]);
       const { deps, fakeSession } = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
 
       const result = await runSubagent(
-        { task: "review", context: "fork", thinkingLevel: "high" }, undefined, undefined,
-        fakeContext(cwd, parentSession, { leafId: selectedLeaf, modelRegistry: models }), { deps },
+        { task: "review", context: "fork" }, undefined, undefined,
+        fakeContext(root, parentSession, { sessionCwd: parentManager.getCwd(), leafId: selectedLeaf, model: parentModel, modelRegistry: models }),
+        { deps, parentThinkingLevel: "off" },
       );
 
-      expectSubagentResult(result);
-      expect(deps.createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ thinkingLevel: "high" }));
+      expectSubagentResult(result, "## Subagent result", "child answer", "Model: provider/plain");
+      const options = deps.createAgentSession.mock.calls[0]?.[0];
+      expect(options).toMatchObject({ model: parentModel, thinkingLevel: "off" });
+      expect(options?.cwd).toBe(parentManager.getCwd());
+      expect(options?.sessionManager?.buildSessionContext()).toMatchObject({ model: { provider: "provider", modelId: "plain" }, thinkingLevel: "off" });
+      expect(fakeSession.promptSettings).toEqual([{ model: parentModel, thinkingLevel: "off" }]);
       expect(fakeSession.promptCount).toBe(1);
+      expect(await readFile(parentSession, "utf8")).toBe(parentText);
     });
 
     it.each([
-      ["provider/override", false],
-      ["provider/override,provider/b", true],
+      ["provider/override@high", false],
+      ["provider/override@high,provider/b@high", true],
     ])("lets a call-level model replace the entire markdown chain, even if the chain is unavailable (%s)", async (model, isChain) => {
       const { root, cwd, parentSession } = await chainFixture("missing/a@low,missing/b@high,missing/c@low");
       const override = thinkingModel("provider", "override");
       const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[isChain ? firstModelError : fallbackAnswer]] });
 
-      const result = await runSubagent({ agent: "reviewer", task: "review", model, thinkingLevel: "high" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([override, second]) }), { deps });
+      const result = await runSubagent({ agent: "reviewer", task: "review", model }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([override, second]) }), { deps });
 
       expectSubagentResult(result, "## Subagent reviewer result", "child answer", isChain
         ? "Model: provider/b — after failed attempts: provider/override (first provider failed)"
@@ -1823,7 +2021,7 @@ describe("subagent runner", () => {
       const override = thinkingModel("provider", "override");
       const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] });
 
-      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review", model: "provider/override" }, undefined, undefined,
+      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review", model: "provider/override@high" }, undefined, undefined,
         fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, override]) }), { deps }));
 
       const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
@@ -1846,11 +2044,11 @@ describe("subagent runner", () => {
         "@cf/openai/gpt-oss-120b",
         "cloudflare-workers-ai/@cf/openai/gpt-oss-120b",
       ])("preserves the full catalog ID in a scalar call override (%s)", async (reference) => {
-        const { root, cwd, parentSession } = await chainFixture("provider/a", "high");
+        const { root, cwd, parentSession } = await chainFixture("provider/a@high");
         const { deps, fakeSession } = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
 
         const result = await runSubagent(
-          { agent: "reviewer", task: "review", model: reference },
+          { agent: "reviewer", task: "review", model: `${reference}@high` },
           undefined,
           undefined,
           fakeContext(cwd, parentSession, { modelRegistry: namespaceRegistry }),
@@ -1869,10 +2067,10 @@ describe("subagent runner", () => {
 
       describe.each(["markdown", "call"])("%s chains", (source) => {
         it.each([
-          ["unsuffixed", "@cf/openai/gpt-oss-120b,cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.5", "low", ["low", "low"]],
-          ["suffixed", "cloudflare-workers-ai/@cf/openai/gpt-oss-120b@low,workers-ai/@cf/moonshotai/kimi-k2.5@high", "medium", ["low", "high"]],
-        ] as const)("uses literal namespace IDs and effective levels through fallback (%s)", async (_case, chain, defaultLevel, levels) => {
-          const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a", defaultLevel);
+          ["unqualified", "@cf/openai/gpt-oss-120b@low,cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.5@high", ["low", "high"]],
+          ["suffixed", "cloudflare-workers-ai/@cf/openai/gpt-oss-120b@low,workers-ai/@cf/moonshotai/kimi-k2.5@high", ["low", "high"]],
+        ] as const)("uses literal namespace IDs and suffixes through fallback (%s)", async (_case, chain, levels) => {
+          const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a@low");
           const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] });
 
           const result = await runSubagent(
@@ -1913,15 +2111,16 @@ describe("subagent runner", () => {
         });
 
         it.each([
+          ["missing", "@cf/openai/gpt-oss-120b,cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.5", "requires an explicit @effort suffix"],
           ["empty", "cloudflare-workers-ai/@cf/openai/gpt-oss-120b@", "thinking level ''"],
           ["unknown", "cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.5@turbo", "thinking level 'turbo'"],
           ["duplicate", "cloudflare-workers-ai/@cf/openai/gpt-oss-120b@low@high", "empty or invalid candidate"],
-        ])("rejects a terminal %s suffix even with a call thinking override", async (_case, chain, reason) => {
-          const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a", "high");
+        ])("rejects a terminal %s suffix", async (_case, chain, reason) => {
+          const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a@low");
           const { deps } = fakeDeps(root);
 
           const message = await rejectedMessage(runSubagent(
-            { agent: "reviewer", task: "review", thinkingLevel: "low", ...(source === "call" ? { model: chain } : {}) },
+            { agent: "reviewer", task: "review", ...(source === "call" ? { model: chain } : {}) },
             undefined,
             undefined,
             fakeContext(cwd, parentSession, { modelRegistry: namespaceRegistry }),
@@ -1952,13 +2151,10 @@ describe("subagent runner", () => {
     });
 
     it.each([
-      ["markdown", MODEL_CHAIN, "high", ["low", "high"]],
-      ["markdown", "provider/a,provider/b", "low", ["low", "low"]],
-      ["call", MODEL_CHAIN, "high", ["low", "high"]],
-      ["call", "provider/a@low,provider/b", "high", ["low", "high"]],
-      ["call", "provider/a,provider/b@high", "low", ["low", "high"]],
-    ])("uses per-candidate levels before a named default, and the default for unsuffixed models (%s: %s)", async (source, chain, defaultLevel, levels) => {
-      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a", defaultLevel);
+      ["markdown", MODEL_CHAIN, ["low", "high"]],
+      ["call", MODEL_CHAIN, ["low", "high"]],
+    ] as const)("uses each explicit candidate's requested effort (%s: %s)", async (source, chain, levels) => {
+      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a@high");
       const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] });
 
       await runSubagent(
@@ -1975,36 +2171,53 @@ describe("subagent runner", () => {
       expect(secondSession.promptSettings).toEqual([{ model: second, thinkingLevel: levels[1] }]);
     });
 
-    it.each([
-      ["markdown", "provider/a@low,provider/b@high,provider/c@high"],
-      ["call", "provider/a@low,provider/b@high,provider/c@high"],
-      ["call", "provider/a@max,provider/b@max,provider/c@max"],
-    ])("applies a call-level thinking override to every selected candidate (%s: %s)", async (source, chain) => {
-      const third = thinkingModel("provider", "c");
-      const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a", "high");
-      const { deps, sessions } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] },
-        { messagesByPrompt: [[firstModelError]] }, { messagesByPrompt: [[fallbackAnswer]] });
+    describe.each(["fresh", "fork"])("missing effort in %s runs", (context) => {
+      describe.each([
+        { source: "markdown", agent: "reviewer" },
+        { source: "call", agent: undefined },
+        { source: "call", agent: "reviewer" },
+        { source: "call", agent: "subagent" },
+      ])("$source with agent $agent", ({ source, agent }) => {
+        it.each([
+          "provider/a",
+          "provider/a,provider/b",
+          "provider/a,provider/b@high",
+          "provider/a@low,provider/b",
+          "provider/a,provider/b@high,provider/c@low",
+          "provider/a@low,provider/b,provider/c@low",
+          "provider/a@low,provider/b@high,provider/c",
+        ])("rejects %s before child or provider effects", async (chain) => {
+          const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a@high", agent);
+          await writeChildSessionHeader(parentSession, "parent-session", cwd);
+          const parentText = await readFile(parentSession, "utf8");
+          const { deps, fakeSession } = fakeDeps(root);
+          const getAllModels = vi.spyOn(registry, "getAll");
+          const hasConfiguredAuth = vi.spyOn(registry, "hasConfiguredAuth");
 
-      await runSubagent(
-        { agent: "reviewer", task: "review", thinkingLevel: "low", ...(source === "call" ? { model: chain } : {}) },
-        undefined,
-        undefined,
-        fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, third]) }),
-        { deps },
-      );
+          const message = await rejectedMessage(runSubagent(
+            { ...(agent === undefined ? {} : { agent }), task: "review", context: context === "fork" ? "fork" : "fresh", ...(source === "call" ? { model: chain } : {}) },
+            undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps },
+          ));
 
-      expect(deps.createAgentSession.mock.calls.map(([options]) => [options.model, options.thinkingLevel]))
-        .toEqual([[first, "low"], [second, "low"], [third, "low"]]);
-      expect(sessions.map((session) => session.promptSettings)).toEqual([
-        [{ model: first, thinkingLevel: "low" }],
-        [{ model: second, thinkingLevel: "low" }],
-        [{ model: third, thinkingLevel: "low" }],
-      ]);
-      expect(sessions.every((session) => session.modelSelections.length === 0)).toBe(true);
+          expect(message).toContain("requires an explicit @effort suffix");
+          expectNoRecoveryHandle(message);
+          expect(deps.openSessionManager).not.toHaveBeenCalled();
+          expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+          expect(deps.createResourceLoader).not.toHaveBeenCalled();
+          expect(deps.createAgentSession).not.toHaveBeenCalled();
+          expect(fakeSession.promptCount).toBe(0);
+          expect(getAllModels).not.toHaveBeenCalled();
+          expect(hasConfiguredAuth).not.toHaveBeenCalled();
+          expect(await readFile(parentSession, "utf8")).toBe(parentText);
+          await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
+          await expect(readFile(`${parentSession}.subagents/manifest.jsonl`, "utf8")).rejects.toThrow();
+          await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
+        });
+      });
     });
 
     it.each(["markdown", "call"])("uses a named chain on a fork without branching again for the fallback (%s)", async (source) => {
-      const { root, cwd } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a");
+      const { root, cwd } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a@low");
       const parentManager = SessionManager.create(cwd, path.join(root, "sessions"));
       parentManager.appendMessage({ role: "user", content: "Start here" } as Parameters<SessionManager["appendMessage"]>[0]);
       parentManager.appendMessage({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Ready" }] } as Parameters<SessionManager["appendMessage"]>[0]);
@@ -2045,7 +2258,7 @@ describe("subagent runner", () => {
     it.each(["markdown", "call"])("keeps a triple-chain fork on one child branch without leaking either failed attempt (%s)", async (source) => {
       const third = thinkingModel("provider", "c");
       const chain = "provider/a@low,provider/b@high,provider/c@low";
-      const { root, cwd } = await chainFixture(source === "markdown" ? chain : "provider/a");
+      const { root, cwd } = await chainFixture(source === "markdown" ? chain : "provider/a@low");
       const parentManager = SessionManager.create(cwd, path.join(root, "sessions"));
       parentManager.appendMessage({ role: "user", content: "Start here" } as Parameters<SessionManager["appendMessage"]>[0]);
       parentManager.appendMessage({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Ready" }] } as Parameters<SessionManager["appendMessage"]>[0]);
@@ -2088,11 +2301,16 @@ describe("subagent runner", () => {
       expect(await readFile(parentSession, "utf8")).toBe(parentText);
     });
 
-    it("resumes the fallback model and thinking recorded in the child, not a changed markdown default", async () => {
+    it("resumes the fallback model, effort, and explicit context-file request rather than changed profile defaults", async () => {
       const { root, cwd, parentSession, agentPath } = await chainFixture();
+      await writeFile(agentPath, `---\ndescription: Reviews\nmodel: ${MODEL_CHAIN}\nagentsMd: auto\nskills: none\n---\n\nReview the task.\n`, "utf8");
       const initial = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] });
-      const firstRun = await runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps: initial.deps });
-      await writeFile(agentPath, "---\ndescription: Reviews\nmodel: provider/a\nthinkingLevel: low\n---\n\nReview the task.\n", "utf8");
+      const firstRun = await runSubagent({ agent: "reviewer", task: "review", agentsMd: "none" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps: initial.deps });
+      expect(initial.deps.createResourceLoader.mock.calls[0]?.[0]).toMatchObject({ noContextFiles: true, noSkills: true });
+      expect(initial.deps.createResourceLoader.mock.results[0]?.value.reload).toHaveBeenCalledTimes(2);
+      expect(initial.firstSession.promptedWith).toContain("Review the task.");
+      expect(initial.secondSession.promptedWith).toBe(initial.firstSession.promptedWith);
+      await writeFile(agentPath, "---\ndescription: Reviews\nmodel: provider/a@low\nagentsMd: auto\n---\n\nReview the task.\n", "utf8");
       const resumed = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
       resumed.deps.createEpisodeId = vi.fn(() => "resume-1");
 
@@ -2102,8 +2320,13 @@ describe("subagent runner", () => {
       expect(result.details.run).toMatchObject({ episodeId: "resume-1", sessionId: firstRun.details.run.sessionId, status: "completed" });
       expect(resumed.fakeSession.promptSettings).toEqual([{ model: second, thinkingLevel: "high" }]);
       expect(resumed.fakeSession.modelSelections).toEqual([]);
+      expect(resumed.deps.createAgentSession.mock.calls[0]?.[0]).toHaveProperty("thinkingLevel", "high");
+      expect(resumed.deps.createResourceLoader.mock.calls[0]?.[0]).toMatchObject({ noContextFiles: true });
+      expect(resumed.deps.createResourceLoader.mock.calls[0]?.[0]?.noSkills).toBeUndefined();
       const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
       expect(manifest.map((record) => record.type)).toEqual(["started", "finished", "resume_started", "resume_finished"]);
+      expect(manifest[0]).toHaveProperty("agentsMdOverride", "none");
+      expect(manifest[2]).not.toHaveProperty("agentsMdOverride");
     });
   });
 
@@ -2459,12 +2682,12 @@ describe("subagent runner", () => {
     expect(result.details.run).toMatchObject({ episodeId: "resume-1", sessionId, status: "completed" });
   });
 
-  it("preserves the inherited model across an early fresh failure and resume", async () => {
+  it("preserves inherited model and effort across an early fresh failure and resume", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     await mkdir(cwd, { recursive: true });
     const parentSession = path.join(root, "sessions", "parent.jsonl");
-    const inheritedModel = fakeModel("zai", "glm-5v-turbo");
+    const inheritedModel = thinkingModel("zai", "glm-5.3");
     const laterParentModel = fakeModel("openai", "gpt-5");
     const readParentModel = vi.fn()
       .mockReturnValueOnce(inheritedModel)
@@ -2479,7 +2702,7 @@ describe("subagent runner", () => {
       undefined,
       undefined,
       context,
-      { deps: failed.deps },
+      { deps: failed.deps, parentThinkingLevel: "high" },
     ));
 
     expect(readParentModel).toHaveBeenCalledTimes(1);
@@ -2495,8 +2718,9 @@ describe("subagent runner", () => {
     expect(childEntries).toContainEqual(expect.objectContaining({
       type: "model_change",
       provider: "zai",
-      modelId: "glm-5v-turbo",
+      modelId: "glm-5.3",
     }));
+    expect(childEntries).toContainEqual(expect.objectContaining({ type: "thinking_level_change", thinkingLevel: "high" }));
 
     const resumed = fakeDeps(root);
     resumed.deps.createEpisodeId = vi.fn(() => "resume-1");
@@ -2512,16 +2736,17 @@ describe("subagent runner", () => {
       { sessionId: started!.sessionId, message: "continue" },
       undefined,
       undefined,
-      fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([inheritedModel]) }),
-      { deps: resumed.deps },
+      fakeContext(cwd, parentSession, { model: laterParentModel, modelRegistry: fakeModelRegistry([inheritedModel]) }),
+      { deps: resumed.deps, parentThinkingLevel: "low" },
     );
 
     expectSubagentResult(result);
     const sessionOptions = (resumed.deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]?.[0];
     expect(sessionOptions?.model).toBe(inheritedModel);
+    expect(sessionOptions?.thinkingLevel).toBe("high");
   });
 
-  it("does not overwrite a child's model change during failure cleanup", async () => {
+  it("does not overwrite a child's model or effort changes during failure cleanup", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     await mkdir(cwd, { recursive: true });
@@ -2530,6 +2755,7 @@ describe("subagent runner", () => {
     const { deps } = fakeDeps(root);
     deps.createAgentSession = vi.fn(async (options: { sessionManager: SessionManager }) => {
       options.sessionManager.appendModelChange("openai", "gpt-5");
+      options.sessionManager.appendThinkingLevelChange("low");
       return {
         session: new FakeChildSession({
           promptImpl: async () => { throw new Error("failed after model switch"); },
@@ -2542,20 +2768,22 @@ describe("subagent runner", () => {
       undefined,
       undefined,
       fakeContext(cwd, parentSession, { model: inheritedModel }),
-      { deps },
+      { deps, parentThinkingLevel: "high" },
     ));
 
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     const started = manifest[0]?.type === "started" ? manifest[0] : undefined;
     expect(started).toBeDefined();
     expectRecoverableFailure(message, started!.sessionId, "failed after model switch");
-    const modelChanges = (await readFile(started!.sessionFile, "utf8"))
+    const entries = (await readFile(started!.sessionFile, "utf8"))
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as Record<string, unknown>)
-      .filter((entry) => entry.type === "model_change");
-    expect(modelChanges).toEqual([
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(entries.filter((entry) => entry.type === "model_change")).toEqual([
       expect.objectContaining({ provider: "openai", modelId: "gpt-5" }),
+    ]);
+    expect(entries.filter((entry) => entry.type === "thinking_level_change")).toEqual([
+      expect.objectContaining({ thinkingLevel: "low" }),
     ]);
   });
 
@@ -2854,6 +3082,21 @@ describe("subagent runner", () => {
     expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [undefined, "none"], [undefined, "auto"], ["reviewer", "none"], ["reviewer", "auto"],
+  ] as const)("rejects explicit agentsMd on fork before resource lookup or artifacts (%s, %s)", async (agent, agentsMd) => {
+    const root = await tempRoot();
+    const parentSession = path.join(root, "parent.jsonl");
+    const { deps } = fakeDeps(root);
+    await expect(runSubagent({ task: "fork", context: "fork", agentsMd, ...(agent === undefined ? {} : { agent }) }, undefined, undefined, fakeContext(root, parentSession), { deps })).rejects.toThrow("agentsMd is not supported with context 'fork'");
+    expect(deps.openSessionManager).not.toHaveBeenCalled();
+    expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+    expect(deps.createResourceLoader).not.toHaveBeenCalled();
+    expect(deps.createAgentSession).not.toHaveBeenCalled();
+    await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
+    await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
+  });
+
   it("requires a current leaf for fork runs", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
@@ -2865,6 +3108,27 @@ describe("subagent runner", () => {
 
     expect(deps.openSessionManager).not.toHaveBeenCalled();
     expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing parent session cwd before opening a fork even when the caller cwd exists", async () => {
+    const root = await tempRoot();
+    const sessionCwd = path.join(root, "missing-project");
+    const parentSession = path.join(root, "sessions", "parent.jsonl");
+    await writeChildSessionHeader(parentSession, "parent-session", sessionCwd);
+    const parentText = await readFile(parentSession, "utf8");
+    const { deps, fakeSession } = fakeDeps(root);
+
+    await expect(runSubagent({ task: "fork", context: "fork" }, undefined, undefined, fakeContext(root, parentSession, { sessionCwd }), { deps })).rejects.toThrow("cwd does not exist or is not a directory");
+
+    expect(deps.openSessionManager).not.toHaveBeenCalled();
+    expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+    expect(deps.createResourceLoader).not.toHaveBeenCalled();
+    expect(deps.createAgentSession).not.toHaveBeenCalled();
+    expect(fakeSession.promptCount).toBe(0);
+    expect(await readFile(parentSession, "utf8")).toBe(parentText);
+    await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
+    await expect(readFile(`${parentSession}.subagents/manifest.jsonl`, "utf8")).rejects.toThrow();
+    await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
   });
 
   it("reports stale fork leaf failures with the leaf id", async () => {
@@ -2909,7 +3173,7 @@ describe("subagent runner", () => {
     const cwd = path.join(root, "project");
     const agentPath = path.join(cwd, ".pi", "agents", "vision.md");
     await mkdir(path.dirname(agentPath), { recursive: true });
-    await writeFile(agentPath, "---\ndescription: Inspects images\nmodel: zai/glm-5v-turbo\nagentsMd: none\nskills: none\n---\n\nInspect carefully.\n", "utf8");
+    await writeFile(agentPath, "---\ndescription: Inspects images\nmodel: zai/glm-5v-turbo@off\nagentsMd: none\nskills: none\n---\n\nInspect carefully.\n", "utf8");
     const parentManager = SessionManager.create(cwd, path.join(root, "sessions"));
     parentManager.appendMessage({ role: "user", content: "Inspect this branch." } as Parameters<SessionManager["appendMessage"]>[0]);
     parentManager.appendMessage({ role: "assistant", content: [{ type: "text", text: "Ready." }], stopReason: "stop" } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
@@ -2939,7 +3203,7 @@ describe("subagent runner", () => {
     const persisted = SessionManager.open(started!.sessionFile, `${parentSession}.subagents`).buildSessionContext().model;
     expect(persisted).toEqual({ provider: "zai", modelId: "glm-5v-turbo" });
 
-    await writeFile(agentPath, "---\ndescription: Inspects images\nmodel: openai/gpt-5\nagentsMd: none\nskills: none\n---\n\nInspect carefully.\n", "utf8");
+    await writeFile(agentPath, "---\ndescription: Inspects images\nmodel: openai/gpt-5@off\nagentsMd: none\nskills: none\n---\n\nInspect carefully.\n", "utf8");
     const resumed = fakeDeps(root, {
       persistPromptWithModel: { provider: "zai", modelId: "glm-5v-turbo" },
     });
@@ -2985,7 +3249,7 @@ describe("subagent runner", () => {
     expect(fakeSession.disposeCount).toBe(1);
   });
 
-  it("runs named-agent fork prompt envelopes without fresh resource overrides or model overrides", async () => {
+  it("inherits parent selection for named forks using the parent cwd and normal fork resources", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     const agentPath = path.join(cwd, ".pi", "agents", "reviewer.md");
@@ -2997,10 +3261,12 @@ describe("subagent runner", () => {
     const createSettingsManager = vi.spyOn(SettingsManager, "create");
     deps.openSessionManager = vi.fn(() => forkManager as unknown as SessionManager);
 
-    const result = await runSubagent({ agent: "reviewer", task: "inspect the branch", context: "fork" }, undefined, undefined, fakeContext(cwd, parentSession, { model: { id: "parent-model" } }), { deps });
+    const parentModel = thinkingModel("provider", "parent-model");
+    const result = await runSubagent({ agent: "reviewer", task: "inspect the branch", context: "fork" }, undefined, undefined,
+      fakeContext(root, parentSession, { sessionCwd: cwd, model: parentModel }), { deps, parentThinkingLevel: "high" });
 
     expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fork", "inspect the branch", { agentName: "reviewer", agentBody: "Review body." }));
-    expectSubagentResult(result, "## Subagent reviewer result");
+    expectSubagentResult(result, "## Subagent reviewer result", "child answer", "Model: provider/parent-model");
 
     const loaderCalls = (deps.createResourceLoader as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
     const loaderOptions = loaderCalls[0]?.[0];
@@ -3016,7 +3282,9 @@ describe("subagent runner", () => {
     const sessionCalls = (deps.createAgentSession as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
     const sessionOptions = sessionCalls[0]?.[0];
     expect(sessionOptions).toBeDefined();
-    expect(sessionOptions).not.toHaveProperty("model");
+    expect(sessionOptions).toMatchObject({ model: parentModel, thinkingLevel: "high" });
+    expect(forkManager.modelChanges).toEqual([{ provider: parentModel.provider, modelId: parentModel.id }]);
+    expect(forkManager.thinkingChanges).toEqual(["high"]);
     expect(createSettingsManager).toHaveBeenCalledWith(cwd, path.join(root, "agent"), { projectTrusted: true });
     expectProjectTrustedSettingsManager(loaderOptions?.settingsManager);
     expect(sessionOptions?.settingsManager).toBe(loaderOptions?.settingsManager);

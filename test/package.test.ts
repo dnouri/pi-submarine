@@ -11,8 +11,9 @@ describe("package metadata", () => {
     expect(packageJson.keywords).toEqual(expect.arrayContaining(["pi-package", "pi-extension", "subagent", "pi"]));
   });
 
-  it("declares npm provenance and package gallery metadata", async () => {
+  it("declares npm provenance and keeps media links on the package release", async () => {
     const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+    const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
     const releaseTag = packageJson.version.replace(/\.0$/, "");
     const galleryBaseUrl = `https://raw.githubusercontent.com/dnouri/pi-submarine/${releaseTag}/media/pi-submarine`;
 
@@ -25,6 +26,7 @@ describe("package metadata", () => {
     expect(packageJson.bugs).toEqual({ url: "https://github.com/dnouri/pi-submarine/issues" });
     expect(packageJson.pi.video).toBeUndefined();
     expect(packageJson.pi.image).toBe(`${galleryBaseUrl}.jpg`);
+    expect(readme).toContain(`src="${galleryBaseUrl}.gif"`);
   });
 
   it("uses Pi peer dependencies without bundling Pi runtime packages", async () => {

@@ -10,7 +10,7 @@ const namedAgent: MarkdownAgent = {
   source: "project",
   filePath: "/repo/.pi/agents/reviewer.md",
   body: "Review carefully.",
-  model: "zai/glm-5v-turbo",
+  model: "zai/glm-5v-turbo@off",
   agentsMd: "none",
   skills: { names: ["audit"] },
 };
@@ -34,21 +34,30 @@ describe("subagent prompt-resource profiles", () => {
     const options = buildFreshResourceLoaderOptions(profile, { cwd: "/repo", agentDir: "/agent" });
 
     expect(profile.selection).toEqual({ kind: "named", name: "reviewer", agentFile: namedAgent.filePath });
-    expect(profile.model).toBe("zai/glm-5v-turbo");
+    expect(profile.model).toBe("zai/glm-5v-turbo@off");
     expect(options.noContextFiles).toBe(true);
     expect(options.appendSystemPromptOverride).toBeUndefined();
   });
 
-  it("carries a named agent's thinkingLevel through the profile", () => {
-    const profile = namedSubagentProfile({ ...namedAgent, thinkingLevel: "low" });
+  it.each(["none", "auto"] as const)("overrides context loading without changing the named body or skills (%s)", (agentsMd) => {
+    const profile = namedSubagentProfile({ ...namedAgent, agentsMd: agentsMd === "none" ? "auto" : "none", skills: "none" });
+    const options = buildFreshResourceLoaderOptions(profile, { cwd: "/repo", agentDir: "/agent" }, agentsMd);
 
-    expect(profile.thinkingLevel).toBe("low");
+    expect(options.noContextFiles).toBe(agentsMd === "none" ? true : undefined);
+    expect(options.noSkills).toBe(true);
+    expect(profile.agentBody).toBe("Review carefully.");
+    expect(profile.agentsMd).not.toBe(agentsMd);
+    expect(options.systemPromptOverride).toBeUndefined();
+    expect(options.appendSystemPromptOverride).toBeUndefined();
+    expect(options.noExtensions).toBeUndefined();
   });
 
-  it("omits thinkingLevel when the agent does not set one", () => {
-    const profile = namedSubagentProfile(namedAgent);
+  it.each(["none", "auto"] as const)("overrides unnamed context loading while preserving normal skills (%s)", (agentsMd) => {
+    const options = buildFreshResourceLoaderOptions(omittedSubagentProfile(), { cwd: "/repo", agentDir: "/agent" }, agentsMd);
 
-    expect("thinkingLevel" in profile).toBe(false);
+    expect(options.noContextFiles).toBe(agentsMd === "none" ? true : undefined);
+    expect(options.noSkills).toBeUndefined();
+    expect(options.skillsOverride).toBeUndefined();
   });
 
   it("leaves normal context-file discovery enabled for agentsMd auto", () => {
