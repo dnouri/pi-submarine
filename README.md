@@ -1,9 +1,9 @@
 # pi-submarine
 
-`pi-submarine` is a Pi extension for delegating tasks to child Pi
-sessions, also known as *subagents*. Each call waits for the child's
-answer and returns its session ID without copying the child transcript
-into the parent.
+And now for something completely delegated.
+
+`pi-submarine` sends tasks to [Pi](https://pi.dev/) child sessions and
+brings back their answers.  It also tries to stay out of the way.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/dnouri/pi-submarine/0.5/media/pi-submarine.gif" alt="pi-submarine animation" width="480">
@@ -13,8 +13,8 @@ into the parent.
 
 - Fresh child sessions without parent conversation history, or forked
   child sessions that inherit the current conversation branch.
-- Named agents defined by simple markdown files with four frontmatter
-  keys: `description`, `model`, `agentsMd`, and `skills`.
+- Named agents defined by markdown files with four frontmatter keys:
+  `description`, `model`, `agentsMd`, and `skills`.
 - Per-agent model chains with explicit effort levels and first-turn
   fallback. Call-level `model` overrides work for both unnamed and
   named agents.
@@ -125,10 +125,9 @@ keeps failed attempts in the child's JSONL file but excludes them from
 the active conversation.
 
 Fresh runs create a new child session below the current root session's
-`.subagents/` directory; nested subagents share that directory. The
-tail-able Markdown activity log is the sibling
-`<parent-session>.jsonl.subagents.md` file. Fork runs branch from the
-current conversation leaf into the same `.subagents/` directory.
+`.subagents/` directory; nested subagents share that directory. Fork
+runs branch from the current conversation leaf into the same
+`.subagents/` directory.
 
 If a named agent cannot be found from an explicit `cwd` but would have
 been found from the caller cwd, `subagent` fails with a hint to omit
