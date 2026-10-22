@@ -1,4 +1,4 @@
-import { mkdir, open, writeFile } from "node:fs/promises";
+import { mkdir, open, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
@@ -45,7 +45,6 @@ export interface SubagentPromptProfile {
 export interface RunnerOptions {
   deps?: Partial<RunnerDependencies>;
   extensionFactories?: ExtensionFactory[];
-  parentThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
 }
 
 export interface RunnerDependencies {
@@ -96,6 +95,7 @@ type ChildSessionPlan = Pick<BaseRunPlan, "effectiveCwd" | "agentDir" | "setting
 type ModelChoice = { model: Model<Api>; thinkingLevel: ModelCandidate["level"] };
 
 interface ResumeRunPlan extends ChildSessionPlan {
+  root: SubagentsRoot;
   profile: SubagentPromptProfile;
   manifestPath: string;
   parentEpisodeId: string | null;
@@ -109,11 +109,21 @@ interface ResumeRunPlan extends ChildSessionPlan {
   userPrompt: string;
 }
 
+interface OwnedSave {
+  root: string;
+  absoluteFile: string;
+  file: string;
+  sessionId: string;
+  cwd: string;
+  label?: string;
+}
+
 interface StartedRun {
   run: SubagentToolDetails["run"];
   childSessionManager: SessionManager;
   childSessionFile: string;
   activityPath: string[];
+  ownedSave: OwnedSave | undefined;
 }
 
 const MAX_SUBAGENT_DEPTH = 4;
@@ -238,7 +248,7 @@ export async function runSubagent(
   onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
   ctx: ExtensionContext,
   options: RunnerOptions = {},
-): Promise<TextToolResult & { details: SubagentToolDetails }> {
+): Promise<TextToolResult<SubagentToolDetails>> {
   const deps = { ...productionRunnerDependencies, ...options.deps };
   const requestedSelection = params.agent === undefined ? omittedAgentSelection() : namedAgentSelection(params.agent.trim() || params.agent);
   let plan: RunPlan | undefined;
@@ -255,13 +265,14 @@ export async function runSubagent(
     plan = await prepareRun(params, signal, ctx, deps, options);
     throwIfAborted(signal, "Subagent run was aborted before child execution.");
 
-    startedRun = await startRunArtifacts(plan, deps);
+    startedRun = createStartedRun(plan, deps);
     run = startedRun.run;
     reservedChildSessionFile = reserveActiveChildSession(startedRun.childSessionFile, run.sessionId);
+    await startRunArtifacts(plan, startedRun, deps);
     throwIfInterrupted(signal);
-    emitUpdate(onUpdate, run);
+    emitUpdate(onUpdate, toolDetails(run, startedRun.ownedSave));
 
-    const created = await createChildSession(plan, startedRun.childSessionManager, deps, ctx);
+    const created = await createChildSession(plan, startedRun.childSessionManager, deps);
     childSession = created.session;
     throwIfModelFallback(created.modelFallbackMessage);
     childExtensionsStarted = true;
@@ -280,7 +291,7 @@ export async function runSubagent(
       if (reduction.changed) {
         refreshContextUsage(activityState.run, session);
         activityLogWriter?.appendStatus(activityState.run.lastActivityAt, activityState.run.activity);
-        emitUpdate(onUpdate, activityState.run);
+        emitUpdate(onUpdate, toolDetails(activityState.run, startedRun?.ownedSave));
       }
     });
     unsubscribe = subscribe(activeChildSession);
@@ -318,7 +329,7 @@ export async function runSubagent(
         // Disposing an AgentSession invalidates its extension runtime.
         await plan.resourceLoader.reload();
         throwIfInterrupted(signal);
-        const createdFallback = await createChildSession({ ...plan, ...next }, startedRun.childSessionManager, deps, ctx);
+        const createdFallback = await createChildSession({ ...plan, ...next }, startedRun.childSessionManager, deps);
         childSession = createdFallback.session;
         throwIfModelFallback(createdFallback.modelFallbackMessage);
         childExtensionsStarted = true;
@@ -332,13 +343,15 @@ export async function runSubagent(
     }
     refreshContextUsage(run, activeChildSession);
     await activityLogWriter.drain();
-    await completeRun(plan.manifestPath, startedRun, deps, onUpdate, activityLogWriter);
+    await finishRun(plan.manifestPath, startedRun, "completed", deps.now(), deps, activityLogWriter);
+    const details = await bestEffortTerminalDetails(run, startedRun.ownedSave);
+    emitUpdate(onUpdate, details);
     forgetRuntimeEpisode(startedRun.run.episodeId);
 
     return {
       content: [{ type: "text", text: renderSubagentResult(plan.profile.selection, run.sessionId, answer,
         formatModelNote(attemptModel(plan, failedAttempts.length), failedAttempts)) }],
-      details: { run: cloneRunView(run) },
+      details,
     };
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
@@ -348,15 +361,23 @@ export async function runSubagent(
     if (startedRun && plan) preservePlannedSelection(plan, startedRun.childSessionManager);
     if (startedRun) await materializeChildSessionFile(startedRun.childSessionManager);
     if (startedRun && plan) {
-      if (interrupted) await abortRun(plan.manifestPath, startedRun, deps, onUpdate, activityLogWriter);
-      else await failRun(plan.manifestPath, startedRun, message, deps, onUpdate, activityLogWriter);
+      await finishRun(plan.manifestPath, startedRun, interrupted ? "aborted" : "failed", deps.now(), deps, activityLogWriter,
+        interrupted ? PARENT_ABORT_ERROR : message);
     }
-    if (run) forgetRuntimeEpisode(run.episodeId);
-    const fallbackSelection = plan?.profile.selection ?? requestedSelection;
-    const selection = run ? agentSelectionFromRun(run, fallbackSelection) : fallbackSelection;
-    if (interrupted && run) throw new Error(renderSubagentInterrupted(selection, run.sessionId));
-    if (run) throw new Error(renderSubagentRecoverableError(selection, run.sessionId, message));
-    throw new Error(`${errorHeading(selection)}\n\n${message}`);
+    if (run) {
+      const details = await bestEffortTerminalDetails(run, startedRun?.ownedSave);
+      emitUpdate(onUpdate, details);
+      forgetRuntimeEpisode(run.episodeId);
+      const selection = agentSelectionFromRun(run, plan?.profile.selection ?? requestedSelection);
+      return {
+        content: [{ type: "text", text: interrupted
+          ? renderSubagentInterrupted(selection, run.sessionId)
+          : renderSubagentRecoverableError(selection, run.sessionId, message) }],
+        details,
+        isError: true,
+      };
+    }
+    throw new Error(`${errorHeading(plan?.profile.selection ?? requestedSelection)}\n\n${message}`, { cause: error });
   } finally {
     runCleanup("remove subagent abort listener", detachAbortHandler);
     runCleanup("unsubscribe subagent activity listener", unsubscribe);
@@ -371,10 +392,11 @@ export async function runSubagentResume(
   onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
   ctx: ExtensionContext,
   options: RunnerOptions = {},
-): Promise<TextToolResult & { details: SubagentToolDetails }> {
+): Promise<TextToolResult<SubagentToolDetails>> {
   const deps = { ...productionRunnerDependencies, ...options.deps };
   let plan: ResumeRunPlan | undefined;
   let run: SubagentToolDetails["run"] | undefined;
+  let ownedSave: OwnedSave | undefined;
   let childSession: ChildAgentSession | undefined;
   let childExtensionsStarted = false;
   let unsubscribe: (() => void) | undefined;
@@ -394,6 +416,7 @@ export async function runSubagentResume(
       activityLog: plan.activityLogPath,
       now: startedAt,
     });
+    ownedSave = captureOwnedSave(plan.root.subagentsDir, plan.childSessionManager, plan.profile.agentName);
     await ensureActivityLogHeader(run.activityLog, plan.rootSessionFile, startedAt, deps.artifactOptions?.activityLog);
     await appendActivityLogStarted(run.activityLog, { timestamp: startedAt, path: plan.activityPath, episodeId: run.episodeId, sessionFile: plan.childSessionFile }, deps.artifactOptions?.activityLog);
     await appendManifestRecord(plan.manifestPath, {
@@ -411,10 +434,10 @@ export async function runSubagentResume(
     }, deps.artifactOptions?.manifest);
     rememberRuntimeEpisode(plan.childSessionFile, run.episodeId, plan.parentDepth + 1, plan.activityPath);
     activityLogWriter = new QueuedActivityLogWriter(run.activityLog, plan.activityPath, plan.childSessionFile, deps.artifactOptions?.activityLog);
-    emitUpdate(onUpdate, run);
+    emitUpdate(onUpdate, toolDetails(run, ownedSave));
     throwIfInterrupted(signal);
 
-    const created = await createChildSession(plan, plan.childSessionManager, deps, ctx);
+    const created = await createChildSession(plan, plan.childSessionManager, deps);
     childSession = created.session;
     throwIfModelFallback(created.modelFallbackMessage);
     childExtensionsStarted = true;
@@ -428,18 +451,20 @@ export async function runSubagentResume(
       if (reduction.changed) {
         refreshContextUsage(activityState.run, activeChildSession);
         activityLogWriter?.appendStatus(activityState.run.lastActivityAt, activityState.run.activity);
-        emitUpdate(onUpdate, activityState.run);
+        emitUpdate(onUpdate, toolDetails(activityState.run, ownedSave));
       }
     });
 
     const answer = await promptChildAndExtractAnswer(activeChildSession, plan.childSessionManager, plan.userPrompt, abortState);
     refreshContextUsage(run, activeChildSession);
     await activityLogWriter.drain();
-    await completeResumeRun(plan.manifestPath, run, deps.now(), deps, onUpdate, activityLogWriter);
+    await finishResumeRun(plan.manifestPath, run, "completed", deps.now(), deps, activityLogWriter);
+    const details = await bestEffortTerminalDetails(run, ownedSave);
+    emitUpdate(onUpdate, details);
 
     return {
       content: [{ type: "text", text: renderSubagentResult(plan.profile.selection, run.sessionId, answer) }],
-      details: { run: cloneRunView(run) },
+      details,
     };
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
@@ -448,13 +473,20 @@ export async function runSubagentResume(
     if (run && childSession) refreshContextUsage(run, childSession);
     if (plan) await materializeChildSessionFile(plan.childSessionManager);
     if (run && plan) {
-      if (interrupted) await abortResumeRun(plan.manifestPath, run, deps.now(), deps, onUpdate, activityLogWriter);
-      else await failResumeRun(plan.manifestPath, run, deps.now(), message, deps, onUpdate, activityLogWriter);
+      await finishResumeRun(plan.manifestPath, run, interrupted ? "aborted" : "failed", deps.now(), deps, activityLogWriter,
+        interrupted ? PARENT_ABORT_ERROR : message);
+      const details = await bestEffortTerminalDetails(run, ownedSave);
+      emitUpdate(onUpdate, details);
+      return {
+        content: [{ type: "text", text: interrupted
+          ? renderSubagentInterrupted(plan.profile.selection, run.sessionId)
+          : renderSubagentRecoverableError(plan.profile.selection, run.sessionId, message) }],
+        details,
+        isError: true,
+      };
     }
-    if (interrupted && run && plan) throw new Error(renderSubagentInterrupted(plan.profile.selection, run.sessionId));
-    if (run && plan) throw new Error(renderSubagentRecoverableError(plan.profile.selection, run.sessionId, message));
     const heading = plan ? errorHeading(plan.profile.selection) : "## Subagent resume error";
-    throw new Error(`${heading}\n\n${message}`);
+    throw new Error(`${heading}\n\n${message}`, { cause: error });
   } finally {
     if (run) forgetRuntimeEpisode(run.episodeId);
     runCleanup("remove subagent resume abort listener", detachAbortHandler);
@@ -537,6 +569,7 @@ async function prepareResumeRun(
   await resourceLoader.reload();
 
   return {
+    root,
     effectiveCwd,
     profile,
     manifestPath,
@@ -562,7 +595,7 @@ async function prepareFreshRun(
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
   deps: RunnerDependencies,
-  { extensionFactories, parentThinkingLevel }: RunnerOptions,
+  { extensionFactories }: RunnerOptions,
 ): Promise<FreshRunPlan> {
   throwIfAborted(signal, "Subagent run was aborted before child execution.");
 
@@ -577,7 +610,7 @@ async function prepareFreshRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, profileResolutionOptions(userAgentsDir, params, ctx));
-  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, parentThinkingLevel);
+  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx);
   const { root, manifestPath, parentDepth, parentPath } = await resolveArtifactRoot(parentSessionFile);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
@@ -609,7 +642,7 @@ async function prepareForkRun(
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
   deps: RunnerDependencies,
-  { extensionFactories, parentThinkingLevel }: RunnerOptions,
+  { extensionFactories }: RunnerOptions,
 ): Promise<ForkRunPlan> {
   if (params.cwd !== undefined) throw new Error("cwd is not supported with context 'fork'.");
   if (params.agentsMd !== undefined) throw new Error("agentsMd is not supported with context 'fork'. Use it only with fresh runs.");
@@ -630,7 +663,7 @@ async function prepareForkRun(
   const settingsManager = createProjectTrustedSettingsManager(effectiveCwd, agentDir);
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, { userAgentsDir });
-  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx, parentThinkingLevel);
+  const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx);
   const sourceSessionManager = deps.openSessionManager(parentSessionFile, root.subagentsDir);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
@@ -662,7 +695,6 @@ function resolveRunModelChoices(
   params: SubagentParams,
   profile: SubagentPromptProfile,
   ctx: ExtensionContext,
-  parentThinkingLevel: RunnerOptions["parentThinkingLevel"],
 ): { model: Model<Api> | undefined; thinkingLevel: string | undefined; fallbacks: ModelChoice[] } {
   // A call-level model replaces the chain, not just its first candidate.
   const selectedModel = params.model ?? profile.model;
@@ -672,7 +704,7 @@ function resolveRunModelChoices(
     return { model, thinkingLevel: resolveSubagentThinkingLevel(level, model) };
   });
   const model = choices[0]?.model ?? ctx.model;
-  const thinkingLevel = choices[0]?.thinkingLevel ?? parentThinkingLevel;
+  const thinkingLevel = choices[0]?.thinkingLevel ?? ctx.thinkingLevel;
   return { model, thinkingLevel, fallbacks: choices.slice(1) };
 }
 
@@ -850,24 +882,28 @@ async function resolveArtifactRoot(parentSessionFile: string): Promise<{ root: S
   return { root, manifestPath: manifestPathForSubagentsRoot(root.subagentsDir), parentDepth, parentPath: parentPath ?? [], records };
 }
 
-async function startRunArtifacts(
-  plan: RunPlan,
-  deps: RunnerDependencies,
-): Promise<StartedRun> {
+function createStartedRun(plan: RunPlan, deps: RunnerDependencies): StartedRun {
   const episodeId = deps.createEpisodeId();
   const startedAt = deps.now();
   const activityLog = plan.root.activityLogPath;
   const activityPath = [...plan.parentPath, plan.profile.agentName];
   const childSessionManager = createChildSessionManager(plan, deps);
-  if (plan.context === "fork") {
-    if (plan.model) childSessionManager.appendModelChange(plan.model.provider, plan.model.id);
-    if (plan.thinkingLevel !== undefined) childSessionManager.appendThinkingLevelChange(plan.thinkingLevel);
-  }
   const childSessionFile = childSessionManager.getSessionFile();
   if (!childSessionFile) throw new Error("Could not create a persisted child subagent session.");
   const sessionId = childSessionManager.getSessionId();
 
   const run = createInitialRunView({ episodeId, sessionId, agent: plan.profile.agentName, activityLog, now: startedAt });
+  return { run, childSessionManager, childSessionFile, activityPath,
+    ownedSave: captureOwnedSave(plan.root.subagentsDir, childSessionManager, plan.profile.agentName) };
+}
+
+async function startRunArtifacts(plan: RunPlan, started: StartedRun, deps: RunnerDependencies): Promise<void> {
+  const { run, childSessionManager, childSessionFile, activityPath } = started;
+  const { episodeId, sessionId, activityLog, lastActivityAt: startedAt } = run;
+  if (plan.context === "fork") {
+    if (plan.model) childSessionManager.appendModelChange(plan.model.provider, plan.model.id);
+    if (plan.thinkingLevel !== undefined) childSessionManager.appendThinkingLevelChange(plan.thinkingLevel);
+  }
   await ensureActivityLogHeader(activityLog, plan.root.rootSessionFile, startedAt, deps.artifactOptions?.activityLog);
   await appendActivityLogStarted(activityLog, { timestamp: startedAt, path: activityPath, episodeId, sessionFile: childSessionFile }, deps.artifactOptions?.activityLog);
   await appendManifestRecord(plan.manifestPath, {
@@ -885,8 +921,6 @@ async function startRunArtifacts(
     startedAt,
   }, deps.artifactOptions?.manifest);
   rememberRuntimeEpisode(childSessionFile, episodeId, plan.parentDepth + 1, activityPath);
-
-  return { run, childSessionManager, childSessionFile, activityPath };
 }
 
 function createChildSessionManager(plan: RunPlan, deps: RunnerDependencies): SessionManager {
@@ -917,9 +951,8 @@ async function materializeChildSessionFile(childSessionManager: SessionManager):
     const entries = [header, ...inspectable.getEntries()];
     await mkdir(path.dirname(sessionFile), { recursive: true });
     await writeFile(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-    // Pi defers writing new sessions until the first assistant message. On early failure
-    // there may be a valid public session ID but no JSONL file yet, so flush the
-    // current header/entries and keep SessionManager's append bookkeeping consistent.
+    // Pi defers session persistence. Early failure can leave a public session ID
+    // without a file, so keep append bookkeeping consistent with this saved snapshot.
     inspectable.flushed = true;
   } catch (error: unknown) {
     console.error("subagent child session materialization failed", error);
@@ -930,12 +963,10 @@ async function createChildSession(
   plan: ChildSessionPlan,
   childSessionManager: SessionManager,
   deps: RunnerDependencies,
-  ctx: ExtensionContext,
 ): Promise<ChildSessionResult> {
   return deps.createAgentSession({
     cwd: plan.effectiveCwd,
     agentDir: plan.agentDir,
-    modelRegistry: ctx.modelRegistry,
     ...(plan.model === undefined ? {} : { model: plan.model }),
     ...(plan.thinkingLevel === undefined ? {} : { thinkingLevel: plan.thinkingLevel as NonNullable<CreateAgentSessionOptions["thinkingLevel"]> }),
     settingsManager: plan.settingsManager,
@@ -1103,44 +1134,12 @@ async function promptChildAndExtractAnswer(
 
 type TerminalRunStatus = Exclude<SubagentToolDetails["run"]["status"], "running">;
 
-async function completeRun(
-  manifestPath: string,
-  started: StartedRun,
-  deps: RunnerDependencies,
-  onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
-  activityLogWriter?: QueuedActivityLogWriter,
-): Promise<void> {
-  await finishRun(manifestPath, started, "completed", deps.now(), deps, onUpdate, activityLogWriter);
-}
-
-async function failRun(
-  manifestPath: string,
-  started: StartedRun,
-  message: string,
-  deps: RunnerDependencies,
-  onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
-  activityLogWriter?: QueuedActivityLogWriter,
-): Promise<void> {
-  await finishRun(manifestPath, started, "failed", deps.now(), deps, onUpdate, activityLogWriter, message);
-}
-
-async function abortRun(
-  manifestPath: string,
-  started: StartedRun,
-  deps: RunnerDependencies,
-  onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
-  activityLogWriter?: QueuedActivityLogWriter,
-): Promise<void> {
-  await finishRun(manifestPath, started, "aborted", deps.now(), deps, onUpdate, activityLogWriter, PARENT_ABORT_ERROR);
-}
-
 async function finishRun(
   manifestPath: string,
   started: StartedRun,
   status: TerminalRunStatus,
   finishedAt: string,
   deps: RunnerDependencies,
-  onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
   activityLogWriter: QueuedActivityLogWriter | undefined,
   errorMessage?: string,
 ): Promise<void> {
@@ -1161,41 +1160,6 @@ async function finishRun(
     finishedAt,
     ...(errorMessage === undefined ? {} : { error: errorMessage }),
   }, deps.artifactOptions?.manifest);
-  emitUpdate(onUpdate, run);
-}
-
-async function completeResumeRun(
-  manifestPath: string,
-  run: SubagentToolDetails["run"],
-  completedAt: string,
-  deps: RunnerDependencies,
-  onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
-  activityLogWriter: QueuedActivityLogWriter,
-): Promise<void> {
-  await finishResumeRun(manifestPath, run, "completed", completedAt, deps, onUpdate, activityLogWriter);
-}
-
-async function failResumeRun(
-  manifestPath: string,
-  run: SubagentToolDetails["run"],
-  failedAt: string,
-  errorMessage: string,
-  deps: RunnerDependencies,
-  onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
-  activityLogWriter: QueuedActivityLogWriter | undefined,
-): Promise<void> {
-  await finishResumeRun(manifestPath, run, "failed", failedAt, deps, onUpdate, activityLogWriter, errorMessage);
-}
-
-async function abortResumeRun(
-  manifestPath: string,
-  run: SubagentToolDetails["run"],
-  abortedAt: string,
-  deps: RunnerDependencies,
-  onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
-  activityLogWriter: QueuedActivityLogWriter | undefined,
-): Promise<void> {
-  await finishResumeRun(manifestPath, run, "aborted", abortedAt, deps, onUpdate, activityLogWriter, PARENT_ABORT_ERROR);
 }
 
 async function finishResumeRun(
@@ -1204,7 +1168,6 @@ async function finishResumeRun(
   status: TerminalRunStatus,
   finishedAt: string,
   deps: RunnerDependencies,
-  onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
   activityLogWriter: QueuedActivityLogWriter | undefined,
   errorMessage?: string,
 ): Promise<void> {
@@ -1223,7 +1186,6 @@ async function finishResumeRun(
     finishedAt,
     ...(errorMessage === undefined ? {} : { error: errorMessage }),
   }, deps.artifactOptions?.manifest);
-  emitUpdate(onUpdate, run);
 }
 
 function terminalActivity(status: TerminalRunStatus): string {
@@ -1336,13 +1298,78 @@ const productionRunnerDependencies: RunnerDependencies = {
   createAgentSession,
 };
 
-function emitUpdate(onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined, run: SubagentToolDetails["run"]): void {
+function safeReferenceText(value: string): boolean {
+  return value.length > 0 && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
+}
+
+function containedFile(root: string, file: string): boolean {
+  const relative = path.relative(root, file);
+  return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function captureOwnedSave(root: string, manager: SessionManager, label: string): OwnedSave | undefined {
+  try {
+    const header = manager.getHeader();
+    const absoluteFile = manager.getSessionFile();
+    const sessionId = manager.getSessionId();
+    if (!header || header.type !== "session" || header.version !== 3 || header.id !== sessionId
+      || !absoluteFile || !path.isAbsolute(root) || root === path.parse(root).root
+      || !path.isAbsolute(absoluteFile) || !path.isAbsolute(header.cwd)
+      || ![root, absoluteFile, sessionId, header.cwd].every(safeReferenceText)
+      || !containedFile(root, absoluteFile)) return undefined;
+    const file = path.relative(root, absoluteFile).split(path.sep).join("/");
+    if (file.startsWith("~") || file.includes("\\") || file.split("/").some((part) => part === "" || part === "." || part === "..")) return undefined;
+    return { root, absoluteFile, file, sessionId, cwd: header.cwd, ...(safeReferenceText(label) ? { label } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
+function toolDetails(run: SubagentToolDetails["run"], save: OwnedSave | undefined): SubagentToolDetails {
+  return {
+    run: cloneRunView(run),
+    ...(save === undefined ? {} : { savedConversations: {
+      version: 1 as const,
+      root: save.root,
+      items: [{ sessionId: save.sessionId, file: save.file, ...(save.label === undefined ? {} : { label: save.label }) }],
+    } }),
+  };
+}
+
+async function bestEffortTerminalDetails(run: SubagentToolDetails["run"], save: OwnedSave | undefined): Promise<SubagentToolDetails> {
+  let readable: OwnedSave | undefined;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    const root = save ? await realpath(save.root) : undefined;
+    if (save && root && root !== path.parse(root).root && containedFile(root, await realpath(save.absoluteFile))) {
+      handle = await open(save.absoluteFile, "r");
+      const chunks: Buffer[] = [];
+      for (;;) {
+        const buffer = Buffer.alloc(4096);
+        const { bytesRead } = await handle.read(buffer);
+        if (bytesRead === 0) break;
+        const newline = buffer.subarray(0, bytesRead).indexOf(10);
+        chunks.push(buffer.subarray(0, newline === -1 ? bytesRead : newline));
+        if (newline === -1) continue;
+        const header: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (isObject(header) && header.type === "session" && header.version === 3
+          && header.id === save.sessionId && header.cwd === save.cwd) readable = save;
+        break;
+      }
+    }
+  } catch {
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+  return toolDetails(run, readable);
+}
+
+function emitUpdate(onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined, details: SubagentToolDetails): void {
   if (!onUpdate) return;
-  const snapshot = cloneRunView(run);
   try {
     onUpdate({
-      content: [{ type: "text", text: renderSubagentProgress(snapshot) }],
-      details: { run: snapshot },
+      content: [{ type: "text", text: renderSubagentProgress(details.run) }],
+      details: structuredClone(details),
     });
   } catch (error: unknown) {
     console.error("subagent partial update callback failed", error);

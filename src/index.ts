@@ -42,24 +42,17 @@ export const subagentListParameters = Type.Object(
   { additionalProperties: false },
 );
 
-function createSubagentTool(getParentThinkingLevel?: ExtensionAPI["getThinkingLevel"]) {
-  return defineTool({
-    name: SUBAGENT_TOOL_NAME,
-    label: TOOL_PROMPTS.subagent.label,
-    description: TOOL_PROMPTS.subagent.description,
-    promptSnippet: TOOL_PROMPTS.subagent.promptSnippet,
-    promptGuidelines: [...TOOL_PROMPTS.subagent.promptGuidelines],
-    parameters: subagentParameters,
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      return runSubagent(params, signal, onUpdate, ctx, {
-        extensionFactories: [register],
-        parentThinkingLevel: getParentThinkingLevel?.(),
-      });
-    },
-  });
-}
-
-export const subagentTool = createSubagentTool();
+export const subagentTool = defineTool({
+  name: SUBAGENT_TOOL_NAME,
+  label: TOOL_PROMPTS.subagent.label,
+  description: TOOL_PROMPTS.subagent.description,
+  promptSnippet: TOOL_PROMPTS.subagent.promptSnippet,
+  promptGuidelines: [...TOOL_PROMPTS.subagent.promptGuidelines],
+  parameters: subagentParameters,
+  async execute(_toolCallId, params, signal, onUpdate, ctx) {
+    return runSubagent(params, signal, onUpdate, ctx, { extensionFactories: [register] });
+  },
+});
 
 export const subagentResumeTool = defineTool({
   name: SUBAGENT_RESUME_TOOL_NAME,
@@ -86,7 +79,7 @@ export const subagentListTool = defineTool({
 });
 
 export default function register(pi: ExtensionAPI) {
-  pi.registerTool(createSubagentTool(() => pi.getThinkingLevel()));
+  pi.registerTool(subagentTool);
   pi.registerTool(subagentResumeTool);
   pi.registerTool(subagentListTool);
 }

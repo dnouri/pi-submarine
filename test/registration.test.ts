@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { validateToolArguments } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { IsObject } from "typebox";
 import { afterEach, assert, describe, expect, it, vi } from "vitest";
 import register, { subagentListTool, subagentResumeTool, subagentTool } from "../src/index.js";
@@ -21,6 +21,7 @@ afterEach(async () => {
 function registeredToolsFromFactory(): RegisteredTool[] {
   const tools: RegisteredTool[] = [];
   const fakePi = {
+    on: vi.fn(),
     registerTool(tool: RegisteredTool) {
       tools.push(tool);
     },
@@ -38,33 +39,24 @@ describe("pi-submarine extension registration", () => {
     expect(tools.map((tool) => tool.label)).toEqual(["Subagent", "Resume subagent", "List subagents"]);
   });
 
-  it("reads each parent runtime's current effort when its subagent tool executes", async () => {
+  it("registers the exported tools directly without result or shutdown handlers", () => {
+    const registerTool = vi.fn();
+    const on = vi.fn();
+    register({ registerTool, on } as unknown as ExtensionAPI);
+    expect(registerTool.mock.calls.map(([tool]) => tool)).toEqual([subagentTool, subagentResumeTool, subagentListTool]);
+    expect(on).not.toHaveBeenCalled();
+  });
+
+  it("passes the current context effort to the runner at execution time", async () => {
     const stopped = new Error("Stop before execution");
     const run = vi.spyOn(runner, "runSubagent").mockRejectedValue(stopped);
-    const ctx = {} as ExtensionContext;
-    const toolsFor = (getThinkingLevel: ExtensionAPI["getThinkingLevel"]) => {
-      const tools: RegisteredTool[] = [];
-      register({ registerTool: (tool: RegisteredTool) => tools.push(tool), getThinkingLevel } as unknown as ExtensionAPI);
-      const tool = tools.find((candidate) => candidate.name === "subagent");
-      assert(tool);
-      return tool;
-    };
-    const parentEffort = vi.fn<ExtensionAPI["getThinkingLevel"]>().mockReturnValue("high");
-    const childEffort = vi.fn<ExtensionAPI["getThinkingLevel"]>().mockReturnValue("low");
-    const parentTool = toolsFor(parentEffort);
-    const childTool = toolsFor(childEffort);
-    expect(parentEffort).not.toHaveBeenCalled();
-    expect(childEffort).not.toHaveBeenCalled();
-
-    await expect(parentTool.execute("parent-1", { task: "review" }, undefined, undefined, ctx)).rejects.toBe(stopped);
-    expect(run.mock.calls.at(-1)?.[4]).toMatchObject({ parentThinkingLevel: "high" });
-    parentEffort.mockReturnValue("off");
-    await expect(childTool.execute("child", { task: "review" }, undefined, undefined, ctx)).rejects.toBe(stopped);
-    expect(run.mock.calls.at(-1)?.[4]).toMatchObject({ parentThinkingLevel: "low" });
-    await expect(parentTool.execute("parent-2", { task: "review" }, undefined, undefined, ctx)).rejects.toBe(stopped);
-    expect(run.mock.calls.at(-1)?.[4]).toMatchObject({ parentThinkingLevel: "off" });
-    expect(parentEffort).toHaveBeenCalledTimes(2);
-    expect(childEffort).toHaveBeenCalledTimes(1);
+    const tool = registeredToolsFromFactory()[0]!;
+    for (const thinkingLevel of ["high", "low", "off"] as const) {
+      const ctx = { thinkingLevel } as ExtensionToolContext;
+      await expect(tool.execute("call", { task: "review" }, undefined, undefined, ctx)).rejects.toBe(stopped);
+      expect(run.mock.calls.at(-1)?.[3]).toBe(ctx);
+      expect(run.mock.calls.at(-1)?.[4]).toEqual({ extensionFactories: [register] });
+    }
   });
 
   it("registers strict parameter schemas for all tools", () => {
@@ -164,7 +156,7 @@ describe("pi-submarine extension registration", () => {
         return await subagentListTool.execute("tool-call-2", {}, undefined, undefined, {
           cwd,
           modelRegistry: { getAll: () => [], hasConfiguredAuth: () => false },
-        } as unknown as ExtensionContext);
+        } as unknown as ExtensionToolContext);
       } finally {
         if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -176,13 +168,13 @@ describe("pi-submarine extension registration", () => {
       sessionManager: { getSessionFile: () => undefined },
       modelRegistry: {},
       model: undefined,
-    } as unknown as ExtensionContext)).rejects.toThrow("requires a persisted parent Pi session");
+    } as unknown as ExtensionToolContext)).rejects.toThrow("requires a persisted parent Pi session");
     await expect(subagentResumeTool.execute("tool-call-resume", { sessionId: "session-1", message: "continue" }, undefined, undefined, {
       cwd,
       sessionManager: { getSessionFile: () => undefined },
       modelRegistry: {},
       model: undefined,
-    } as unknown as ExtensionContext)).rejects.toThrow("subagent_resume requires a persisted parent Pi session");
+    } as unknown as ExtensionToolContext)).rejects.toThrow("subagent_resume requires a persisted parent Pi session");
     expect(listResult.content[0]).toMatchObject({
       type: "text",
       text: expect.stringContaining(`Available subagents for ${cwd}:`),
