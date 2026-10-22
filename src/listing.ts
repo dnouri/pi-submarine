@@ -2,6 +2,7 @@ import { stat } from "node:fs/promises";
 import path from "node:path";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import type { ScopedModel } from "@earendil-works/pi-coding-agent";
 import { discoverMarkdownAgents, findNearestProjectAgentsDir, type AgentDiscoveryOptions } from "./agents.js";
 import type { SubagentModelRegistry } from "./models.js";
 import type { MarkdownAgent, SubagentListParams, TextToolResult } from "./types.js";
@@ -26,6 +27,7 @@ export interface ListingContext {
   cwd?: string;
   modelRegistry: SubagentModelRegistry;
   model?: Model<Api> | null | undefined;
+  scopedModels?: readonly ScopedModel[];
 }
 
 export interface ListSubagentsOptions {
@@ -108,8 +110,11 @@ export async function listSubagents(params: SubagentListParams, ctx: ListingCont
 }
 
 function listCallableModels(ctx: ListingContext): CallableModelInfo[] {
-  return ctx.modelRegistry
-    .getAll()
+  const models =
+    ctx.scopedModels && ctx.scopedModels.length > 0
+      ? ctx.scopedModels.map((scoped) => scoped.model)
+      : ctx.modelRegistry.getAll();
+  return models
     .filter((model) => ctx.modelRegistry.hasConfiguredAuth(model))
     .sort((left, right) => `${left.provider}/${left.id}`.localeCompare(`${right.provider}/${right.id}`))
     .map((model) => ({
