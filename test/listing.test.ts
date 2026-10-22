@@ -209,6 +209,45 @@ describe("subagent_list callable models", () => {
     ]);
   });
 
+  it("prefers scopedModels over the full registry when scoping is configured", async () => {
+    const root = await tempRoot();
+    await mkdir(root, { recursive: true });
+
+    const registry = fakeRegistry([glm, glmFlash, other], [glm, glmFlash, other]);
+    const result = await listSubagents(
+      {},
+      {
+        cwd: root,
+        modelRegistry: registry,
+        scopedModels: [{ model: glmFlash }],
+      },
+      { userAgentsDir: path.join(root, "missing-user-agents") },
+    );
+    const text = result.content[0]?.text ?? "";
+
+    expect(text).toContain("Callable models:\n- zai/glm-5.3-flash — thinking: off");
+    expect(text).not.toContain("zai/glm-5.3 —");
+    expect(text).not.toContain("other/other-model");
+    expect(result.details.models).toEqual([
+      { provider: "zai", id: "glm-5.3-flash", name: "GLM 5.3 Flash", reasoning: false, thinkingLevels: ["off"] },
+    ]);
+  });
+
+  it("falls back to the full registry when scopedModels is empty", async () => {
+    const root = await tempRoot();
+    await mkdir(root, { recursive: true });
+
+    const registry = fakeRegistry([glm, glmFlash], [glm, glmFlash]);
+    const result = await listSubagents(
+      {},
+      { cwd: root, modelRegistry: registry, scopedModels: [] },
+      { userAgentsDir: path.join(root, "missing-user-agents") },
+    );
+    const text = result.content[0]?.text ?? "";
+
+    expect(text).toContain("Callable models:\n- zai/glm-5.3 — thinking: low, high\n- zai/glm-5.3-flash — thinking: off");
+  });
+
   it("marks the current model in text and details", async () => {
     const root = await tempRoot();
     await mkdir(root, { recursive: true });
