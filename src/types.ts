@@ -26,9 +26,10 @@ export interface SubagentListParams {
   cwd?: string;
 }
 
-export interface TextToolResult {
+export interface TextToolResult<TDetails = Record<string, unknown>> {
   content: Array<{ type: "text"; text: string }>;
-  details: Record<string, unknown>;
+  details: TDetails;
+  isError?: boolean;
 }
 
 export type AgentResourceMode = "none" | "auto";
@@ -74,6 +75,11 @@ export interface SubagentRunView {
 
 export interface SubagentToolDetails {
   run: SubagentRunView;
+  savedConversations?: {
+    version: 1;
+    root: string;
+    items: [{ sessionId: string; file: string; label?: string }];
+  };
 }
 
 export interface ManifestStartedRecord {

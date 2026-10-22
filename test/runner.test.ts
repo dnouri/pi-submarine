@@ -1,12 +1,13 @@
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { getModel } from "@earendil-works/pi-ai";
+import { getBuiltinModel as getModel } from "@earendil-works/pi-ai/providers/all";
 import { SessionManager, SettingsManager, type AgentSession, type AgentSessionEvent, type CreateAgentSessionOptions, type DefaultResourceLoader, type ExtensionContext, type ResourceLoader, type Skill } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readManifestRecords } from "../src/manifest.js";
 import { runSubagent, runSubagentResume } from "../src/runner.js";
-import type { SubagentContextUsage } from "../src/types.js";
+import type { SubagentContextUsage, SubagentToolDetails, TextToolResult } from "../src/types.js";
 
 const tempRoots: string[] = [];
 
@@ -31,13 +32,14 @@ class FakeSessionManager {
 function fakeContext(
   cwd: string,
   sessionFile?: string,
-  options: { sessionCwd?: string; leafId?: string | null; model?: unknown; modelRegistry?: unknown } = {},
+  options: { sessionCwd?: string; leafId?: string | null; model?: unknown; modelRegistry?: unknown; thinkingLevel?: ExtensionContext["thinkingLevel"] } = {},
 ): ExtensionContext {
   return {
     cwd,
     sessionManager: new FakeSessionManager(sessionFile, options.sessionCwd ?? cwd, options.leafId),
     modelRegistry: options.modelRegistry ?? {},
     model: options.model,
+    thinkingLevel: options.thinkingLevel,
   } as unknown as ExtensionContext;
 }
 
@@ -94,6 +96,23 @@ async function rejectedMessage(promise: Promise<unknown>): Promise<string> {
   throw new Error("Expected promise to reject.");
 }
 
+async function failedMessage(promise: Promise<TextToolResult<SubagentToolDetails>>, status = "failed"): Promise<string> {
+  const result = await promise;
+  expect(result.isError).toBe(true);
+  expect(result).not.toHaveProperty("terminate");
+  expect(result.details.run.status).toBe(status);
+  expect(result.content).toEqual([{ type: "text", text: expect.any(String) }]);
+  expect(result.details).not.toHaveProperty("pilish");
+  const saved = result.details.savedConversations;
+  if (saved) {
+    const item = saved.items[0];
+    expect(item.sessionId).toBe(result.details.run.sessionId);
+    const header = JSON.parse((await readFile(path.join(saved.root, item.file), "utf8")).split("\n")[0]!);
+    expect(header).toMatchObject({ type: "session", version: 3, id: item.sessionId });
+  }
+  return result.content[0]!.text;
+}
+
 function expectNoModelVisiblePaths(text: string): void {
   expect(text).not.toMatch(/\.jsonl|\.subagents|Activity log|stack|runId|episodeId/i);
 }
@@ -115,8 +134,11 @@ function expectedPromptEnvelope(context: "fresh" | "fork", task: string, options
 }
 
 function expectInterruptedCapsule(text: string, sessionId: string, heading = "## Subagent interrupted"): void {
-  expect(text).toContain(heading);
-  expect(text).toContain("No final answer was produced.");
+  expect(text).toBe([
+    heading, "", "No final answer was produced.", "", `Subagent session ID: ${sessionId}`, "",
+    "If the interrupted task should continue, call `subagent_resume` with this session ID and a message. Otherwise start a new `subagent`.",
+    "", "Example for `message`:", "- You were interrupted. Continue the original task from where you left off.",
+  ].join("\n"));
   expect(text).toContain(`Subagent session ID: ${sessionId}`);
   expect(text).toContain("If the interrupted task should continue");
   expect(text).toContain("call `subagent_resume` with this session ID");
@@ -128,8 +150,10 @@ function expectInterruptedCapsule(text: string, sessionId: string, heading = "##
 }
 
 function expectRecoverableFailure(text: string, sessionId: string, originalMessage: string, heading = "## Subagent error"): void {
-  expect(text).toContain(heading);
-  expect(text).toContain(originalMessage);
+  expect(text).toBe([
+    heading, "", originalMessage, "", `Subagent session ID: ${sessionId}`, "",
+    "This child session may be recoverable. If the same task should continue after a transient failure, call `subagent_resume` with this session ID and a message. Otherwise start a new `subagent`.",
+  ].join("\n"));
   expect(text).toContain(`Subagent session ID: ${sessionId}`);
   expect(text).toContain("This child session may be recoverable.");
   expect(text).toContain("same task should continue after a transient failure");
@@ -682,7 +706,7 @@ describe("subagent runner", () => {
       lastAssistantText: "old answer",
     });
 
-    const message = await rejectedMessage(runSubagentResume({ sessionId: "stale-answer-session", message: "extension command with no assistant" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
+    const message = await failedMessage(runSubagentResume({ sessionId: "stale-answer-session", message: "extension command with no assistant" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
 
     expectRecoverableFailure(message, "stale-answer-session", "Child subagent finished without a new assistant response.");
   });
@@ -704,7 +728,7 @@ describe("subagent runner", () => {
     await expect(runSubagentResume({ sessionId, message: "continue concurrently" }, undefined, undefined, fakeContext(cwd, parentSession), { deps })).rejects.toThrow(`Subagent session '${sessionId}' is already active`);
 
     abortController.abort();
-    expectInterruptedCapsule(await rejectedMessage(running), sessionId);
+    expectInterruptedCapsule(await failedMessage(running, "aborted"), sessionId);
   });
 
   it("rejects a second resume while the first resume is still active", async () => {
@@ -726,7 +750,7 @@ describe("subagent runner", () => {
     await expect(runSubagentResume({ sessionId: "active-resume-session", message: "second" }, undefined, undefined, fakeContext(cwd, parentSession), { deps })).rejects.toThrow("Subagent session 'active-resume-session' is already active");
 
     abortController.abort();
-    expectInterruptedCapsule(await rejectedMessage(running), "active-resume-session");
+    expectInterruptedCapsule(await failedMessage(running, "aborted"), "active-resume-session");
   });
 
   it("records a failed resume activity entry when child session creation fails", async () => {
@@ -741,7 +765,7 @@ describe("subagent runner", () => {
     deps.createEpisodeId = vi.fn(() => "resume-1");
     deps.createAgentSession = vi.fn(async () => { throw new Error("sdk resume session failed"); });
 
-    const message = await rejectedMessage(runSubagentResume({ sessionId: "resume-create-failure-session", message: "continue" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
+    const message = await failedMessage(runSubagentResume({ sessionId: "resume-create-failure-session", message: "continue" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
 
     expectRecoverableFailure(message, "resume-create-failure-session", "sdk resume session failed");
     const activityText = await readFile(`${parentSession}.subagents.md`, "utf8");
@@ -770,7 +794,7 @@ describe("subagent runner", () => {
       }) as unknown as AgentSession,
     }));
 
-    const message = await rejectedMessage(runSubagentResume({ sessionId: "header-only-resume-session", message: "preserve this follow-up" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
+    const message = await failedMessage(runSubagentResume({ sessionId: "header-only-resume-session", message: "preserve this follow-up" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
 
     expectRecoverableFailure(message, "header-only-resume-session", "resume model failed before assistant");
     const childText = await readFile(childSession, "utf8");
@@ -846,7 +870,7 @@ describe("subagent runner", () => {
     });
     resume.deps.createEpisodeId = vi.fn(() => "resume-1");
 
-    await expect(runSubagentResume({ sessionId: "target-session", message: "continue and delegate" }, undefined, undefined, fakeContext(cwd, currentNestedSession), { deps: resume.deps })).rejects.toThrow("Subagent nesting limit exceeded");
+    expect(await failedMessage(runSubagentResume({ sessionId: "target-session", message: "continue and delegate" }, undefined, undefined, fakeContext(cwd, currentNestedSession), { deps: resume.deps }))).toContain("Subagent nesting limit exceeded");
 
     const manifest = await readManifestRecords(path.join(subagentsDir, "manifest.jsonl"));
     expect(manifest).toContainEqual(expect.objectContaining({ type: "resume_started", episodeId: "resume-1", parentEpisodeId: "run-c", sessionId: "target-session" }));
@@ -1026,7 +1050,7 @@ describe("subagent runner", () => {
     await vi.waitFor(() => expect(fakeSession.promptCount).toBe(1));
     abortController.abort();
 
-    const message = await rejectedMessage(running);
+    const message = await failedMessage(running, "aborted");
     expectInterruptedCapsule(message, "abort-resume-session");
     expect(fakeSession.abortCount).toBe(1);
     expect(fakeSession.unsubscribeCount).toBe(1);
@@ -1268,7 +1292,7 @@ describe("subagent runner", () => {
       const running = runSubagent({ agent: "reviewer", task: "review", agentsMd }, controller.signal, undefined, fakeContext(cwd, parentSession), { deps: initial.deps });
       await vi.waitFor(() => expect(initial.fakeSession.promptCount).toBe(1));
       controller.abort();
-      const message = await rejectedMessage(running);
+      const message = await failedMessage(running, "aborted");
       const records = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
       const original = records[0];
       if (original?.type !== "started") throw new Error("Expected original start record");
@@ -1450,8 +1474,8 @@ describe("subagent runner", () => {
       { ...(agent === undefined ? {} : { agent }), task: "read screenshot.png" },
       undefined,
       undefined,
-      fakeContext(cwd, parentSession, { model: parentModel }),
-      { deps, parentThinkingLevel: "high" },
+      fakeContext(cwd, parentSession, { model: parentModel, thinkingLevel: "high" }),
+      { deps },
     );
 
     expect(deps.createAgentSession.mock.calls[0]?.[0]).toMatchObject({ model: parentModel, thinkingLevel: "high" });
@@ -1559,6 +1583,10 @@ describe("subagent runner", () => {
       ]);
       expect(deps.createResourceLoader.mock.calls[0]?.[0]).not.toHaveProperty("noContextFiles");
       const childFile = manifest[0]?.type === "started" ? manifest[0].sessionFile : "";
+      const declaration = result.details.savedConversations!;
+      expect(declaration.items).toHaveLength(1);
+      expect(declaration.items[0].sessionId).toBe(result.details.run.sessionId);
+      expect(path.join(declaration.root, declaration.items[0].file)).toBe(childFile);
       const restored = SessionManager.open(childFile, `${parentSession}.subagents`).buildSessionContext();
       expect(restored).toMatchObject({ model: { provider: "provider", modelId: "b" }, thinkingLevel: "high" });
       expect(restored.messages).toEqual([
@@ -1731,7 +1759,7 @@ describe("subagent runner", () => {
         promptImpl: async () => { throw new Error("prompt preflight failed"); },
       });
 
-      const message = await rejectedMessage(runSubagent(
+      const message = await failedMessage(runSubagent(
         { agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) },
         undefined,
         undefined,
@@ -1761,7 +1789,7 @@ describe("subagent runner", () => {
       ] : [event({ type: "turn_end", message: messages[0], toolResults: [] })];
       const { deps, fakeSession } = fakeDeps(root, { messagesByPrompt: [messages], events });
 
-      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps }));
+      const message = await failedMessage(runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps }));
 
       expect(message).toContain("first provider failed");
       expect(fakeSession.promptCount).toBe(1);
@@ -1778,7 +1806,7 @@ describe("subagent runner", () => {
         events: [event({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} })],
       });
 
-      const message = await rejectedMessage(runSubagent(
+      const message = await failedMessage(runSubagent(
         { agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) },
         undefined,
         undefined,
@@ -1807,7 +1835,7 @@ describe("subagent runner", () => {
       const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a@low");
       const { deps, fakeSession } = fakeDeps(root, { messagesByPrompt: [[{ role: "assistant", stopReason: "aborted" }]] });
 
-      const message = await rejectedMessage(runSubagent(
+      const message = await failedMessage(runSubagent(
         { agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) },
         undefined,
         undefined,
@@ -1829,13 +1857,13 @@ describe("subagent runner", () => {
         promptImpl: async () => { controller.abort(); },
       });
 
-      const message = await rejectedMessage(runSubagent(
+      const message = await failedMessage(runSubagent(
         { agent: "reviewer", task: "review", ...(source === "call" ? { model: MODEL_CHAIN } : {}) },
         controller.signal,
         undefined,
         fakeContext(cwd, parentSession, { modelRegistry: registry }),
         { deps },
-      ));
+      ), "aborted");
 
       const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
       const sessionId = manifest[0]?.type === "started" ? manifest[0].sessionId : "";
@@ -1855,7 +1883,7 @@ describe("subagent runner", () => {
           events: [event({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} })] },
         { messagesByPrompt: [[fallbackAnswer]] });
 
-      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined,
+      const message = await failedMessage(runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined,
         fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, third]) }), { deps }));
 
       expect(message).toContain("second provider failed");
@@ -1868,7 +1896,7 @@ describe("subagent runner", () => {
       const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] },
         { messagesByPrompt: [[{ role: "assistant", stopReason: "error", errorMessage: "second provider failed" }]] });
 
-      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps }));
+      const message = await failedMessage(runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined, fakeContext(cwd, parentSession, { modelRegistry: registry }), { deps }));
 
       const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
       const sessionId = manifest[0]?.type === "started" ? manifest[0].sessionId : "";
@@ -1891,7 +1919,7 @@ describe("subagent runner", () => {
         { messagesByPrompt: [[{ ...firstModelError, errorMessage: "second provider failed" }]] },
         { messagesByPrompt: [[{ ...firstModelError, errorMessage: "third provider failed" }]] });
 
-      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined,
+      const message = await failedMessage(runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined,
         fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, third]) }), { deps }));
 
       const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
@@ -1910,7 +1938,7 @@ describe("subagent runner", () => {
           ["missing second model", MODEL_CHAIN, fakeModelRegistry([first]), /model 'provider\/b' not found/i],
           ["unauthenticated second model", MODEL_CHAIN, fakeModelRegistry([first, second], [first]), /No authentication configured for subagent model 'provider\/b'/i],
           ["unsupported second level", MODEL_CHAIN, fakeModelRegistry([first, fakeModel("provider", "b")]), /thinking level 'high' is not supported by model 'provider\/b'/i],
-          ["unsupported max in this SDK", "provider/a@low,provider/b@max", registry, /thinking level 'max' is not supported by model 'provider\/b'/i],
+          ["unsupported model effort", "provider/a@low,provider/b@max", registry, /thinking level 'max' is not supported by model 'provider\/b'/i],
           ["unsupported third level", "provider/a@low,provider/b@high,provider/c@high", fakeModelRegistry([first, second, fakeModel("provider", "c")]), /thinking level 'high' is not supported by model 'provider\/c'/i],
           ["missing third model", "provider/a@low,provider/b@high,provider/c@low", registry, /model 'provider\/c' not found/i],
           ["unauthenticated third model", "provider/a@low,provider/b@high,provider/c@low", fakeModelRegistry([first, second, thinkingModel("provider", "c")], [first, second]), /No authentication configured for subagent model 'provider\/c'/i],
@@ -1978,8 +2006,8 @@ describe("subagent runner", () => {
 
       const result = await runSubagent(
         { task: "review", context: "fork" }, undefined, undefined,
-        fakeContext(root, parentSession, { sessionCwd: parentManager.getCwd(), leafId: selectedLeaf, model: parentModel, modelRegistry: models }),
-        { deps, parentThinkingLevel: "off" },
+        fakeContext(root, parentSession, { sessionCwd: parentManager.getCwd(), leafId: selectedLeaf, model: parentModel, modelRegistry: models, thinkingLevel: "off" }),
+        { deps },
       );
 
       expectSubagentResult(result, "## Subagent result", "child answer", "Model: provider/plain");
@@ -2021,7 +2049,7 @@ describe("subagent runner", () => {
       const override = thinkingModel("provider", "override");
       const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] });
 
-      const message = await rejectedMessage(runSubagent({ agent: "reviewer", task: "review", model: "provider/override@high" }, undefined, undefined,
+      const message = await failedMessage(runSubagent({ agent: "reviewer", task: "review", model: "provider/override@high" }, undefined, undefined,
         fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, override]) }), { deps }));
 
       const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
@@ -2037,7 +2065,7 @@ describe("subagent runner", () => {
 
     describe("catalog namespace IDs", () => {
       const workersAI = getModel("cloudflare-workers-ai", "@cf/openai/gpt-oss-120b");
-      const gateway = getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.5");
+      const gateway = getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6");
       const namespaceRegistry = fakeModelRegistry([first, workersAI, gateway]);
 
       it.each([
@@ -2067,8 +2095,8 @@ describe("subagent runner", () => {
 
       describe.each(["markdown", "call"])("%s chains", (source) => {
         it.each([
-          ["unqualified", "@cf/openai/gpt-oss-120b@low,cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.5@high", ["low", "high"]],
-          ["suffixed", "cloudflare-workers-ai/@cf/openai/gpt-oss-120b@low,workers-ai/@cf/moonshotai/kimi-k2.5@high", ["low", "high"]],
+          ["unqualified", "@cf/openai/gpt-oss-120b@low,cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.6@high", ["low", "high"]],
+          ["suffixed", "cloudflare-workers-ai/@cf/openai/gpt-oss-120b@low,workers-ai/@cf/moonshotai/kimi-k2.6@high", ["low", "high"]],
         ] as const)("uses literal namespace IDs and suffixes through fallback (%s)", async (_case, chain, levels) => {
           const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a@low");
           const { deps, firstSession, secondSession } = fakeChainDeps(root, { messagesByPrompt: [[firstModelError]] });
@@ -2084,12 +2112,12 @@ describe("subagent runner", () => {
           expect(deps.createAgentSession.mock.calls.map(([options]) => [options.model?.provider, options.model?.id, options.thinkingLevel]))
             .toEqual([
               ["cloudflare-workers-ai", "@cf/openai/gpt-oss-120b", levels[0]],
-              ["cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.5", levels[1]],
+              ["cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6", levels[1]],
             ]);
           expect(firstSession.promptSettings).toEqual([{ model: workersAI, thinkingLevel: levels[0] }]);
           expect(secondSession.promptSettings).toEqual([{ model: gateway, thinkingLevel: levels[1] }]);
           expectSubagentResult(result, "## Subagent reviewer result", "child answer",
-            "Model: cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.5 — after failed attempts: cloudflare-workers-ai/@cf/openai/gpt-oss-120b (first provider failed)");
+            "Model: cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.6 — after failed attempts: cloudflare-workers-ai/@cf/openai/gpt-oss-120b (first provider failed)");
           expect(new Set(deps.createAgentSession.mock.calls.map(([options]) => options.sessionManager)).size).toBe(1);
           expect(deps.createFreshSessionManager).toHaveBeenCalledTimes(1);
           expect(deps.createEpisodeId).toHaveBeenCalledTimes(1);
@@ -2101,19 +2129,19 @@ describe("subagent runner", () => {
           const childFile = manifest[0]?.type === "started" ? manifest[0].sessionFile : "";
           const restored = SessionManager.open(childFile, `${parentSession}.subagents`).buildSessionContext();
           expect(restored).toMatchObject({
-            model: { provider: "cloudflare-ai-gateway", modelId: "workers-ai/@cf/moonshotai/kimi-k2.5" },
+            model: { provider: "cloudflare-ai-gateway", modelId: "workers-ai/@cf/moonshotai/kimi-k2.6" },
             thinkingLevel: levels[1],
           });
           expect(restored.messages.at(-1)).toMatchObject({
-            ...fallbackAnswer, provider: "cloudflare-ai-gateway", model: "workers-ai/@cf/moonshotai/kimi-k2.5",
+            ...fallbackAnswer, provider: "cloudflare-ai-gateway", model: "workers-ai/@cf/moonshotai/kimi-k2.6",
           });
           expect(restored.messages).not.toContainEqual(expect.objectContaining(firstModelError));
         });
 
         it.each([
-          ["missing", "@cf/openai/gpt-oss-120b,cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.5", "requires an explicit @effort suffix"],
+          ["missing", "@cf/openai/gpt-oss-120b,cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.6", "requires an explicit @effort suffix"],
           ["empty", "cloudflare-workers-ai/@cf/openai/gpt-oss-120b@", "thinking level ''"],
-          ["unknown", "cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.5@turbo", "thinking level 'turbo'"],
+          ["unknown", "cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.6@turbo", "thinking level 'turbo'"],
           ["duplicate", "cloudflare-workers-ai/@cf/openai/gpt-oss-120b@low@high", "empty or invalid candidate"],
         ])("rejects a terminal %s suffix", async (_case, chain, reason) => {
           const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? chain : "provider/a@low");
@@ -2590,7 +2618,7 @@ describe("subagent runner", () => {
     const parentSession = path.join(root, "sessions", "parent.jsonl");
     const { deps } = fakeDeps(root, { messages: [{ role: "assistant", stopReason: "aborted" }] });
 
-    const message = await rejectedMessage(runSubagent({ task: "abort" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
+    const message = await failedMessage(runSubagent({ task: "abort" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
 
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     const sessionId = manifest[0]?.type === "started" ? manifest[0].sessionId : "";
@@ -2640,7 +2668,7 @@ describe("subagent runner", () => {
     });
     const updates: any[] = [];
 
-    const message = await rejectedMessage(runSubagent({ task: "fail after retries" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession), { deps }));
+    const message = await failedMessage(runSubagent({ task: "fail after retries" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession), { deps }));
 
     expect(updates.some((update) => update.details.run.activity === "retry pending")).toBe(true);
     expect(updates.at(-1)).toMatchObject({ details: { run: { status: "failed" } } });
@@ -2662,7 +2690,7 @@ describe("subagent runner", () => {
     const { deps, fakeSession } = fakeDeps(root, { promptImpl: async () => { throw new Error("model auth failed"); } });
     const updates: unknown[] = [];
 
-    const message = await rejectedMessage(runSubagent({ task: "fail" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession), { deps }));
+    const message = await failedMessage(runSubagent({ task: "fail" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession), { deps }));
 
     expect(fakeSession.unsubscribeCount).toBe(1);
     expect(fakeSession.disposeCount).toBe(1);
@@ -2697,12 +2725,13 @@ describe("subagent runner", () => {
     const failed = fakeDeps(root);
     failed.deps.createAgentSession = vi.fn(async () => { throw new Error("sdk failed before recording model"); });
 
-    const message = await rejectedMessage(runSubagent(
+    context.thinkingLevel = "high";
+    const message = await failedMessage(runSubagent(
       { task: "fail early" },
       undefined,
       undefined,
       context,
-      { deps: failed.deps, parentThinkingLevel: "high" },
+      { deps: failed.deps },
     ));
 
     expect(readParentModel).toHaveBeenCalledTimes(1);
@@ -2736,8 +2765,8 @@ describe("subagent runner", () => {
       { sessionId: started!.sessionId, message: "continue" },
       undefined,
       undefined,
-      fakeContext(cwd, parentSession, { model: laterParentModel, modelRegistry: fakeModelRegistry([inheritedModel]) }),
-      { deps: resumed.deps, parentThinkingLevel: "low" },
+      fakeContext(cwd, parentSession, { model: laterParentModel, modelRegistry: fakeModelRegistry([inheritedModel]), thinkingLevel: "low" }),
+      { deps: resumed.deps },
     );
 
     expectSubagentResult(result);
@@ -2763,12 +2792,12 @@ describe("subagent runner", () => {
       };
     });
 
-    const message = await rejectedMessage(runSubagent(
+    const message = await failedMessage(runSubagent(
       { task: "switch then fail" },
       undefined,
       undefined,
-      fakeContext(cwd, parentSession, { model: inheritedModel }),
-      { deps, parentThinkingLevel: "high" },
+      fakeContext(cwd, parentSession, { model: inheritedModel, thinkingLevel: "high" }),
+      { deps },
     ));
 
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
@@ -2796,7 +2825,7 @@ describe("subagent runner", () => {
     deps.createAgentSession = vi.fn(async () => { throw new Error("sdk session failed"); });
     const updates: unknown[] = [];
 
-    const message = await rejectedMessage(runSubagent({ task: "create failure" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession), { deps }));
+    const message = await failedMessage(runSubagent({ task: "create failure" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession), { deps }));
 
     expect(updates.at(-1)).toMatchObject({ details: { run: { status: "failed", activity: "failed" } } });
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
@@ -2868,7 +2897,7 @@ describe("subagent runner", () => {
     const parentSession = path.join(root, "sessions", "parent.jsonl");
     const { deps, fakeSession } = fakeDeps(root, { bindImpl: async () => { throw new Error("bind failed"); } });
 
-    const message = await rejectedMessage(runSubagent({ task: "bind failure" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
+    const message = await failedMessage(runSubagent({ task: "bind failure" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
 
     expect(fakeSession.promptCount).toBe(0);
     expect(fakeSession.unsubscribeCount).toBe(0);
@@ -2892,7 +2921,7 @@ describe("subagent runner", () => {
       disposeImpl: () => { throw new Error("dispose failed"); },
     });
 
-    await expect(runSubagent({ task: "cleanup failure" }, undefined, undefined, fakeContext(cwd, parentSession), { deps })).rejects.toThrow("primary failure");
+    expect(await failedMessage(runSubagent({ task: "cleanup failure" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }))).toContain("primary failure");
 
     expect(fakeSession.unsubscribeCount).toBe(1);
     expect(fakeSession.shutdownCount).toBe(1);
@@ -2981,7 +3010,7 @@ describe("subagent runner", () => {
       disposeImpl: () => { lifecycle.push("dispose"); },
     });
 
-    const message = await rejectedMessage(runSubagent({ task: "abortable" }, abortController.signal, undefined, fakeContext(cwd, parentSession), { deps }));
+    const message = await failedMessage(runSubagent({ task: "abortable" }, abortController.signal, undefined, fakeContext(cwd, parentSession), { deps }), "aborted");
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     const sessionId = manifest[0]?.type === "started" ? manifest[0].sessionId : "";
 
@@ -3004,7 +3033,7 @@ describe("subagent runner", () => {
       return { session: fakeSession as unknown as AgentSession };
     });
 
-    const message = await rejectedMessage(runSubagent({ task: "abort race" }, abortController.signal, undefined, fakeContext(cwd, parentSession), { deps }));
+    const message = await failedMessage(runSubagent({ task: "abort race" }, abortController.signal, undefined, fakeContext(cwd, parentSession), { deps }), "aborted");
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     const sessionId = manifest[0]?.type === "started" ? manifest[0].sessionId : "";
 
@@ -3016,7 +3045,7 @@ describe("subagent runner", () => {
     expect(fakeSession.disposeCount).toBe(1);
   });
 
-  it("rejects promptly with a path-free interrupted capsule when parent aborts even if child prompt never settles", async () => {
+  it("returns promptly with a path-free interrupted capsule when parent aborts even if child prompt never settles", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     await mkdir(cwd, { recursive: true });
@@ -3033,7 +3062,7 @@ describe("subagent runner", () => {
     const sessionId = manifestBeforeAbort[0]?.type === "started" ? manifestBeforeAbort[0].sessionId : "";
     abortController.abort();
 
-    const message = await rejectedMessage(running);
+    const message = await failedMessage(running, "aborted");
     expectInterruptedCapsule(message, sessionId);
     expect(fakeSession.abortCount).toBe(1);
     expect(fakeSession.unsubscribeCount).toBe(1);
@@ -3061,7 +3090,7 @@ describe("subagent runner", () => {
       abortImpl: async () => { throw new Error("abort transport failed"); },
     });
 
-    const message = await rejectedMessage(runSubagent({ task: "abort reject" }, abortController.signal, undefined, fakeContext(cwd, parentSession), { deps }));
+    const message = await failedMessage(runSubagent({ task: "abort reject" }, abortController.signal, undefined, fakeContext(cwd, parentSession), { deps }), "aborted");
 
     expect(message).toContain("interrupted");
     expect(fakeSession.abortCount).toBe(1);
@@ -3234,7 +3263,7 @@ describe("subagent runner", () => {
       modelFallbackMessage: "Could not restore model zai/glm-5v-turbo. Using openai/gpt-5",
     }));
 
-    const message = await rejectedMessage(runSubagent(
+    const message = await failedMessage(runSubagent(
       { task: "inspect the branch", context: "fork" },
       undefined,
       undefined,
@@ -3263,7 +3292,7 @@ describe("subagent runner", () => {
 
     const parentModel = thinkingModel("provider", "parent-model");
     const result = await runSubagent({ agent: "reviewer", task: "inspect the branch", context: "fork" }, undefined, undefined,
-      fakeContext(root, parentSession, { sessionCwd: cwd, model: parentModel }), { deps, parentThinkingLevel: "high" });
+      fakeContext(root, parentSession, { sessionCwd: cwd, model: parentModel, thinkingLevel: "high" }), { deps });
 
     expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fork", "inspect the branch", { agentName: "reviewer", agentBody: "Review body." }));
     expectSubagentResult(result, "## Subagent reviewer result", "child answer", "Model: provider/parent-model");
@@ -3288,5 +3317,156 @@ describe("subagent runner", () => {
     expect(createSettingsManager).toHaveBeenCalledWith(cwd, path.join(root, "agent"), { projectTrusted: true });
     expectProjectTrustedSettingsManager(loaderOptions?.settingsManager);
     expect(sessionOptions?.settingsManager).toBe(loaderOptions?.settingsManager);
+  });
+});
+
+describe("owned saved-conversation declarations", () => {
+  it("publishes direct declarations before persistence and isolates callback mutations and exceptions", async () => {
+    const root = await tempRoot();
+    const { deps } = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
+    const updates: SubagentToolDetails[] = [];
+    const existed: boolean[] = [];
+    const logger = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const result = await runSubagent({ task: "Save a child." }, undefined, (update) => {
+      updates.push(structuredClone(update.details));
+      const declaration = update.details.savedConversations!;
+      existed.push(existsSync(path.join(declaration.root, declaration.items[0].file)));
+      update.details.run.sessionId = "callback-corruption";
+      declaration.items[0].sessionId = "callback-corruption";
+      declaration.root = "/callback-corruption";
+      throw new Error("callback failure");
+    }, fakeContext(root, path.join(root, "parent.jsonl")), { deps });
+    expect(existed).toEqual([false, true]);
+    expect(updates.map((details) => details.run.status)).toEqual(["running", "completed"]);
+    expect(updates[0]?.savedConversations).toEqual(result.details.savedConversations);
+    expect(updates.at(-1)).toEqual(result.details);
+    for (const details of [...updates, result.details]) {
+      expect(Object.keys(details).sort()).toEqual(["run", "savedConversations"]);
+    }
+    expect(result.details.run.sessionId).not.toBe("callback-corruption");
+    expect(logger).toHaveBeenCalledTimes(2);
+    const declaration = result.details.savedConversations!;
+    expect(declaration.version).toBe(1);
+    expect(declaration.items).toHaveLength(1);
+    const manager = deps.createFreshSessionManager.mock.results[0]!.value;
+    expect(path.join(declaration.root, declaration.items[0].file)).toBe(manager.getSessionFile());
+    expect(declaration.items[0].sessionId).toBe(manager.getHeader()!.id);
+  });
+
+  it.each(["missing", "wrong-id", "wrong-cwd", "legacy", "symlink", "directory", "unterminated"] as const)("omits terminal metadata after a %s exact-save probe without changing success or rewriting the file", async (damage) => {
+    const root = await tempRoot();
+    const { deps } = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
+    const updates: SubagentToolDetails[] = [];
+    let damagedBytes: string | undefined;
+    let file = "";
+    const openManager = vi.spyOn(SessionManager, "open");
+    const result = await runSubagent({ task: "Save and damage." }, undefined, (update) => { updates.push(update.details); }, fakeContext(root, path.join(root, "parent.jsonl")), {
+      deps: { ...deps, artifactOptions: { manifest: { appendFile: async (manifest, text) => {
+        await appendFile(manifest, text);
+        if (JSON.parse(text).type !== "finished") return;
+        file = deps.createFreshSessionManager.mock.results[0]!.value.getSessionFile()!;
+        if (damage === "missing" || damage === "directory" || damage === "symlink") {
+          const original = await readFile(file, "utf8");
+          await rm(file);
+          if (damage === "directory") await mkdir(file);
+          if (damage === "symlink") {
+            const external = path.join(root, "outside.jsonl");
+            await writeFile(external, original);
+            await symlink(external, file);
+          }
+        } else {
+          const rows = (await readFile(file, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+          if (damage === "wrong-id") rows[0].id = "wrong-id";
+          if (damage === "wrong-cwd") rows[0].cwd = "/wrong-cwd";
+          if (damage === "legacy") rows[0].version = 2;
+          damagedBytes = damage === "unterminated" ? JSON.stringify(rows[0]) : rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
+          await writeFile(file, damagedBytes);
+        }
+      } } } },
+    });
+    expect(result.details.run.status).toBe("completed");
+    expect(updates[0]?.savedConversations).toBeDefined();
+    expect(updates.at(-1)?.savedConversations).toBeUndefined();
+    expect(result.details.savedConversations).toBeUndefined();
+    expect(openManager).not.toHaveBeenCalled();
+    if (damagedBytes) expect(await readFile(file, "utf8")).toBe(damagedBytes);
+  });
+
+  it("keeps final failed run details when no readable terminal save remains", async () => {
+    const root = await tempRoot();
+    const original = new Error("original child failure");
+    const { deps } = fakeDeps(root, { promptImpl: async () => { throw original; } });
+    const updates: SubagentToolDetails[] = [];
+    const result = await runSubagent({ task: "Fail." }, undefined, (update) => { updates.push(update.details); }, fakeContext(root, path.join(root, "parent.jsonl")), {
+      deps: { ...deps, artifactOptions: { manifest: { appendFile: async (manifest, text) => {
+        await appendFile(manifest, text);
+        if (JSON.parse(text).type === "finished") await rm(deps.createFreshSessionManager.mock.results[0]!.value.getSessionFile()!);
+      } } } },
+    });
+    expect(result).toMatchObject({ isError: true, details: { run: { status: "failed" } } });
+    expectRecoverableFailure(result.content[0]!.text, result.details.run.sessionId, original.message);
+    expect(result.details.savedConversations).toBeUndefined();
+    expect(updates[0]?.savedConversations).toBeDefined();
+    expect(updates.at(-1)?.savedConversations).toBeUndefined();
+  });
+
+  it("captures a real fork before model-entry work can fail", async () => {
+    const root = await tempRoot();
+    const parent = SessionManager.create(root, path.join(root, "sessions"));
+    parent.appendMessage({ role: "user", content: "Parent request.", timestamp: 1 });
+    parent.appendMessage(fallbackAnswer as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+    const { deps } = fakeDeps(root);
+    const original = new Error("fork model entry failed");
+    deps.openSessionManager = vi.fn((file, dir) => {
+      const manager = SessionManager.open(file, dir);
+      vi.spyOn(manager, "appendModelChange").mockImplementationOnce(() => { throw original; });
+      return manager;
+    });
+    const result = await runSubagent({ task: "Fork.", context: "fork" }, undefined, undefined, fakeContext(root, parent.getSessionFile(), { leafId: parent.getLeafId(), model: fakeModel("provider", "model") }), { deps });
+    expect(result).toMatchObject({ isError: true, details: { run: { status: "failed" } } });
+    expectRecoverableFailure(result.content[0]!.text, result.details.run.sessionId, original.message);
+    const declaration = result.details.savedConversations!;
+    const manager = deps.openSessionManager.mock.results[0]!.value;
+    expect(path.join(declaration.root, declaration.items[0].file)).toBe(manager.getSessionFile());
+    expect(declaration.items[0].sessionId).toBe(manager.getSessionId());
+    expect(deps.createAgentSession).not.toHaveBeenCalled();
+  });
+
+  it("does not require successful manifest writes to publish an exact readable save", async () => {
+    const root = await tempRoot();
+    const { deps } = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
+    const logger = vi.fn();
+    const result = await runSubagent({ task: "Save without manifest." }, undefined, undefined, fakeContext(root, path.join(root, "parent.jsonl")), {
+      deps: { ...deps, artifactOptions: { manifest: { appendFile: async () => { throw new Error("manifest unavailable"); }, logger } } },
+    });
+    expect(result.details.savedConversations?.items[0].sessionId).toBe(result.details.run.sessionId);
+    expect(logger).toHaveBeenCalledTimes(2);
+  });
+
+  it("omits unsafe presentation labels without losing the real saved identity", async () => {
+    const root = await tempRoot();
+    const agent = "review\u200ber";
+    const agentFile = path.join(root, ".pi", "agents", `${agent}.md`);
+    await mkdir(path.dirname(agentFile), { recursive: true });
+    await writeFile(agentFile, "---\ndescription: Reviews\n---\nReview.\n");
+    const { deps } = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
+    const result = await runSubagent({ task: "Save.", agent }, undefined, undefined, fakeContext(root, path.join(root, "parent.jsonl")), { deps });
+    expect(result.details.savedConversations!.items[0]).toEqual({ sessionId: result.details.run.sessionId, file: path.basename(deps.createFreshSessionManager.mock.results[0]!.value.getSessionFile()!) });
+  });
+
+  it("publishes no child for preflight validation and resume lookup failures", async () => {
+    const root = await tempRoot();
+    const { deps } = fakeDeps(root);
+    for (const promise of [
+      runSubagent({ task: "Validate." }, undefined, undefined, fakeContext(root), { deps }),
+      runSubagentResume({ sessionId: "missing", message: "Resume." }, undefined, undefined, fakeContext(root, path.join(root, "parent.jsonl")), { deps }),
+    ]) {
+      const error = await promise.catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(Error);
+      expect(error).toHaveProperty("cause", expect.any(Error));
+      expect(error).not.toHaveProperty("details");
+    }
+    expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+    expect(deps.createAgentSession).not.toHaveBeenCalled();
   });
 });
