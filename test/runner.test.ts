@@ -114,7 +114,7 @@ async function failedMessage(promise: Promise<TextToolResult<SubagentToolDetails
 }
 
 function expectNoModelVisiblePaths(text: string): void {
-  expect(text).not.toMatch(/\.jsonl|\.subagents|Activity log|stack|runId|episodeId/i);
+  expect(text).not.toMatch(/\.jsonl|\.subagents|stack|runId|episodeId/i);
 }
 
 function expectedPromptEnvelope(context: "fresh" | "fork", task: string, options: { parentDepth?: number; agentName?: string; agentBody?: string } = {}): string {
@@ -190,16 +190,6 @@ async function writeManifestRecords(parentSession: string, records: Array<Record
   await writeFile(manifest, records.map((record) => JSON.stringify(record)).join("\n") + "\n", "utf8");
 }
 
-function expectedActivityLogForParentSession(parentSession: string): string {
-  return `${parentSession}.subagents.md`;
-}
-
-function expectedActivityLogForSubagentsDir(subagentsDir: string): string {
-  const directoryName = path.basename(subagentsDir);
-  if (!directoryName.endsWith(".subagents")) throw new Error(`Invalid test subagents directory: ${subagentsDir}`);
-  return `${path.join(path.dirname(subagentsDir), directoryName.slice(0, -".subagents".length))}.subagents.md`;
-}
-
 function startedManifestRecord(input: {
   episodeId?: string;
   sessionId: string;
@@ -208,7 +198,6 @@ function startedManifestRecord(input: {
   cwd: string;
   context?: "fresh" | "fork";
   sessionFile: string;
-  activityLog?: string;
   agentFile?: string | null;
 }): Record<string, unknown> {
   return {
@@ -220,7 +209,6 @@ function startedManifestRecord(input: {
     cwd: input.cwd,
     context: input.context ?? "fresh",
     sessionFile: input.sessionFile,
-    activityLog: input.activityLog ?? expectedActivityLogForSubagentsDir(path.dirname(input.sessionFile)),
     agentFile: input.agentFile ?? null,
     startedAt: "2026-01-01T00:00:00.000Z",
   };
@@ -513,9 +501,6 @@ describe("subagent runner", () => {
     expect(fakeSession.shutdownEvents).toEqual([{ type: "session_shutdown", reason: "quit" }]);
     expectSubagentResult(result);
     expect(result.details.run).toMatchObject({ episodeId: "resume-1", sessionId: "child-session-1", agent: "subagent", status: "completed" });
-    const activityText = await readFile(`${parentSession}.subagents.md`, "utf8");
-    expect(activityText).toContain("started subagent — episode resume-1 — session:");
-    expect(activityText).toContain("completed subagent — 0 turns — session:");
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     expect(manifest).toEqual([
       expect.objectContaining({ type: "started", episodeId: "run-1", sessionId: "child-session-1" }),
@@ -646,7 +631,6 @@ describe("subagent runner", () => {
       sessionId: "outside-session",
       cwd,
       sessionFile: outsideChildSession,
-      activityLog: expectedActivityLogForParentSession(parentSession),
     }));
     const { deps } = fakeDeps(root);
 
@@ -668,26 +652,6 @@ describe("subagent runner", () => {
     const { deps } = fakeDeps(root);
 
     await expect(runSubagentResume({ sessionId: "cwd-mismatch-session", message: "continue" }, undefined, undefined, fakeContext(cwd, parentSession), { deps })).rejects.toThrow("Subagent session 'cwd-mismatch-session' has a child session cwd that does not match its manifest record.");
-
-    expect(deps.openSessionManager).not.toHaveBeenCalled();
-  });
-
-  it("rejects noncanonical activity-log manifest paths", async () => {
-    const root = await tempRoot();
-    const cwd = path.join(root, "project");
-    await mkdir(cwd, { recursive: true });
-    const parentSession = path.join(root, "sessions", "parent.jsonl");
-    const childSession = path.join(`${parentSession}.subagents`, "child.jsonl");
-    await writeChildSessionHeader(childSession, "bad-log-session", cwd);
-    await writeManifestRecord(parentSession, startedManifestRecord({
-      sessionId: "bad-log-session",
-      cwd,
-      sessionFile: childSession,
-      activityLog: path.join(root, "elsewhere", "parent.jsonl.subagents.md"),
-    }));
-    const { deps } = fakeDeps(root);
-
-    await expect(runSubagentResume({ sessionId: "bad-log-session", message: "continue" }, undefined, undefined, fakeContext(cwd, parentSession), { deps })).rejects.toThrow("Subagent session 'bad-log-session' has an invalid activity-log manifest path.");
 
     expect(deps.openSessionManager).not.toHaveBeenCalled();
   });
@@ -753,7 +717,7 @@ describe("subagent runner", () => {
     expectInterruptedCapsule(await failedMessage(running, "aborted"), "active-resume-session");
   });
 
-  it("records a failed resume activity entry when child session creation fails", async () => {
+  it("records a failed resume in the manifest when child session creation fails", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     await mkdir(cwd, { recursive: true });
@@ -768,9 +732,6 @@ describe("subagent runner", () => {
     const message = await failedMessage(runSubagentResume({ sessionId: "resume-create-failure-session", message: "continue" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
 
     expectRecoverableFailure(message, "resume-create-failure-session", "sdk resume session failed");
-    const activityText = await readFile(`${parentSession}.subagents.md`, "utf8");
-    expect(activityText).toContain("started subagent — episode resume-1 — session:");
-    expect(activityText).toContain("failed subagent — 0 turns — error: sdk resume session failed — session:");
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     expect(manifest.at(-1)).toMatchObject({ type: "resume_finished", episodeId: "resume-1", sessionId: "resume-create-failure-session", status: "failed" });
   });
@@ -800,24 +761,6 @@ describe("subagent runner", () => {
     const childText = await readFile(childSession, "utf8");
     expect(childText).toContain('"role":"user"');
     expect(childText).toContain("preserve this follow-up");
-  });
-
-  it("recreates the aggregate activity-log header before appending resume activity", async () => {
-    const root = await tempRoot();
-    const cwd = path.join(root, "project");
-    await mkdir(cwd, { recursive: true });
-    const parentSession = path.join(root, "sessions", "parent.jsonl");
-    const childSession = path.join(`${parentSession}.subagents`, "child.jsonl");
-    await writeChildSessionHeader(childSession, "missing-log-header-session", cwd);
-    await writeManifestRecord(parentSession, startedManifestRecord({ sessionId: "missing-log-header-session", cwd, sessionFile: childSession }));
-    const { deps } = fakeDeps(root);
-    deps.createEpisodeId = vi.fn(() => "resume-1");
-
-    await runSubagentResume({ sessionId: "missing-log-header-session", message: "continue" }, undefined, undefined, fakeContext(cwd, parentSession), { deps });
-
-    const activityText = await readFile(`${parentSession}.subagents.md`, "utf8");
-    expect(activityText).toMatch(/^# Subagents\n/);
-    expect(activityText).toContain("started subagent — episode resume-1 — session:");
   });
 
   it("keeps the nesting-depth guard when a deeply nested session tries to resume another child", async () => {
@@ -1113,10 +1056,10 @@ describe("subagent runner", () => {
     const nestedSession = path.join(subagentsDir, "level-4.jsonl");
     await mkdir(subagentsDir, { recursive: true });
     await writeFile(path.join(subagentsDir, "manifest.jsonl"), [
-      JSON.stringify({ type: "started", episodeId: "run-a", sessionId: "session-a", parentEpisodeId: null, agent: "subagent", cwd, context: "fresh", sessionFile: path.join(subagentsDir, "level-1.jsonl"), activityLog: expectedActivityLogForSubagentsDir(subagentsDir), agentFile: null, startedAt: "now" }),
-      JSON.stringify({ type: "started", episodeId: "run-b", sessionId: "session-b", parentEpisodeId: "run-a", agent: "subagent", cwd, context: "fresh", sessionFile: path.join(subagentsDir, "level-2.jsonl"), activityLog: expectedActivityLogForSubagentsDir(subagentsDir), agentFile: null, startedAt: "now" }),
-      JSON.stringify({ type: "started", episodeId: "run-c", sessionId: "session-c", parentEpisodeId: "run-b", agent: "subagent", cwd, context: "fresh", sessionFile: path.join(subagentsDir, "level-3.jsonl"), activityLog: expectedActivityLogForSubagentsDir(subagentsDir), agentFile: null, startedAt: "now" }),
-      JSON.stringify({ type: "started", episodeId: "run-d", sessionId: "session-d", parentEpisodeId: "run-c", agent: "subagent", cwd, context: "fresh", sessionFile: nestedSession, activityLog: expectedActivityLogForSubagentsDir(subagentsDir), agentFile: null, startedAt: "now" }),
+      JSON.stringify({ type: "started", episodeId: "run-a", sessionId: "session-a", parentEpisodeId: null, agent: "subagent", cwd, context: "fresh", sessionFile: path.join(subagentsDir, "level-1.jsonl"), agentFile: null, startedAt: "now" }),
+      JSON.stringify({ type: "started", episodeId: "run-b", sessionId: "session-b", parentEpisodeId: "run-a", agent: "subagent", cwd, context: "fresh", sessionFile: path.join(subagentsDir, "level-2.jsonl"), agentFile: null, startedAt: "now" }),
+      JSON.stringify({ type: "started", episodeId: "run-c", sessionId: "session-c", parentEpisodeId: "run-b", agent: "subagent", cwd, context: "fresh", sessionFile: path.join(subagentsDir, "level-3.jsonl"), agentFile: null, startedAt: "now" }),
+      JSON.stringify({ type: "started", episodeId: "run-d", sessionId: "session-d", parentEpisodeId: "run-c", agent: "subagent", cwd, context: "fresh", sessionFile: nestedSession, agentFile: null, startedAt: "now" }),
       "",
     ].join("\n"), "utf8");
     const { deps } = fakeDeps(root);
@@ -1138,14 +1081,39 @@ describe("subagent runner", () => {
     expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
   });
 
-  it("reconstructs nested activity-log paths from manifest lineage", async () => {
+  it("rejects a nested session whose manifest lineage is missing an ancestor", async () => {
+    const root = await tempRoot();
+    const cwd = path.join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    const subagentsDir = path.join(root, "parent.jsonl.subagents");
+    const nestedSession = path.join(subagentsDir, "nested-child.jsonl");
+    await mkdir(subagentsDir, { recursive: true });
+    await writeFile(path.join(subagentsDir, "manifest.jsonl"), `${JSON.stringify({
+      type: "started",
+      episodeId: "parent-run",
+      sessionId: "parent-session-id",
+      parentEpisodeId: "missing-ancestor",
+      agent: "subagent",
+      cwd,
+      context: "fresh",
+      sessionFile: nestedSession,
+      agentFile: null,
+      startedAt: "2026-01-01T00:00:00.000Z",
+    })}\n`, "utf8");
+    const { deps } = fakeDeps(root);
+
+    await expect(runSubagent({ task: "nested" }, undefined, undefined, fakeContext(cwd, nestedSession), { deps })).rejects.toThrow("Could not determine subagent lineage");
+
+    expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
+  });
+
+  it("finds a nested run's parent episode from manifest lineage", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     await mkdir(cwd, { recursive: true });
     const parentSession = path.join(root, "sessions", "parent.jsonl");
     const subagentsDir = `${parentSession}.subagents`;
     const parentChildSession = path.join(subagentsDir, "parent-child.jsonl");
-    const activityLog = expectedActivityLogForSubagentsDir(subagentsDir);
     await mkdir(subagentsDir, { recursive: true });
     await writeFile(path.join(subagentsDir, "manifest.jsonl"), `${JSON.stringify({
       type: "started",
@@ -1156,7 +1124,6 @@ describe("subagent runner", () => {
       cwd,
       context: "fresh",
       sessionFile: parentChildSession,
-      activityLog,
       agentFile: null,
       startedAt: "2026-01-01T00:00:00.000Z",
     })}\n`, "utf8");
@@ -1164,10 +1131,8 @@ describe("subagent runner", () => {
 
     const result = await runSubagent({ task: "nested from manifest" }, undefined, undefined, fakeContext(cwd, parentChildSession), { deps });
 
-    expect(result.details.run.activityLog).toBe(activityLog);
-    const activityText = await readFile(activityLog, "utf8");
-    expect(activityText).toContain("started experiment -> subagent — episode run-1 — session:");
-    expect(activityText).toContain("completed experiment -> subagent — 0 turns — session:");
+    const manifest = await readManifestRecords(path.join(subagentsDir, "manifest.jsonl"));
+    expect(manifest).toContainEqual(expect.objectContaining({ type: "started", episodeId: result.details.run.episodeId, parentEpisodeId: "parent-run" }));
   });
 
   it("ignores partial update callback failures so UI delivery cannot change tool semantics", async () => {
@@ -1203,17 +1168,15 @@ describe("subagent runner", () => {
 
     expect(fakeSession.promptedWith).toBe(expectedPromptEnvelope("fresh", "answer briefly"));
     expectSubagentResult(result, "## Subagent result", "child answer", "Model: zai/glm-5");
-    expect(result.content[0]?.text).not.toContain(".subagents.md");
     expect(result.content[0]?.text).not.toContain(".subagents");
     expect(result.content[0]?.text).not.toContain(".jsonl");
     const sessionId = result.details.run.sessionId;
-    const expectedActivityLog = expectedActivityLogForParentSession(parentSession);
-    expect(result.details.run).toMatchObject({ episodeId: "run-1", sessionId, agent: "subagent", status: "completed", activityLog: expectedActivityLog });
-    expect(updates.at(-1)).toMatchObject({ details: { run: { status: "completed", sessionId, activityLog: expectedActivityLog } } });
+    expect(result.details.run).toMatchObject({ episodeId: "run-1", sessionId, agent: "subagent", status: "completed" });
+    expect(updates.at(-1)).toMatchObject({ details: { run: { status: "completed", sessionId } } });
 
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
     expect(manifest).toEqual([
-      expect.objectContaining({ type: "started", episodeId: "run-1", sessionId, parentEpisodeId: null, agent: "subagent", agentFile: null, cwd, context: "fresh", sessionFile: expect.stringMatching(/parent\.jsonl\.subagents\/.+\.jsonl$/), activityLog: expectedActivityLog }),
+      expect.objectContaining({ type: "started", episodeId: "run-1", sessionId, parentEpisodeId: null, agent: "subagent", agentFile: null, cwd, context: "fresh", sessionFile: expect.stringMatching(/parent\.jsonl\.subagents\/.+\.jsonl$/) }),
       expect.objectContaining({ type: "finished", episodeId: "run-1", status: "completed" }),
     ]);
 
@@ -1318,8 +1281,7 @@ describe("subagent runner", () => {
       const childSession = path.join(`${parentSession}.subagents`, "child.jsonl");
       await writeChildSessionHeader(childSession, "invalid-policy", cwd);
       await writeManifestRecord(parentSession, { ...startedManifestRecord({ sessionId: "invalid-policy", cwd, context, sessionFile: childSession }), agentsMdOverride });
-      await writeFile(`${parentSession}.subagents.md`, "Existing log.\n", "utf8");
-      const paths = [childSession, `${parentSession}.subagents/manifest.jsonl`, `${parentSession}.subagents.md`];
+      const paths = [childSession, `${parentSession}.subagents/manifest.jsonl`];
       const before = await Promise.all(paths.map((file) => readFile(file, "utf8")));
       const { deps } = fakeDeps(root);
       const message = await rejectedMessage(runSubagentResume({ sessionId: "invalid-policy", message: "continue" }, undefined, undefined, fakeContext(cwd, parentSession), { deps }));
@@ -1718,23 +1680,6 @@ describe("subagent runner", () => {
       });
     });
 
-    it("records failed attempts in the activity log and names the serving model in the result", async () => {
-      const third = thinkingModel("provider", "c");
-      const { root, cwd, parentSession } = await chainFixture("provider/a@low,provider/b@high,provider/c@low");
-      const { deps } = fakeChainDeps(root,
-        { messagesByPrompt: [[firstModelError]] },
-        { messagesByPrompt: [[{ ...firstModelError, errorMessage: "second provider failed" }]] },
-        { messagesByPrompt: [[fallbackAnswer]] });
-      const result = await runSubagent({ agent: "reviewer", task: "review" }, undefined, undefined,
-        fakeContext(cwd, parentSession, { modelRegistry: fakeModelRegistry([first, second, third]) }), { deps });
-
-      expect(result.content[0]?.text)
-        .toContain("Model: provider/c — after failed attempts: provider/a (first provider failed), provider/b (second provider failed)");
-      const activity = await readFile(`${parentSession}.subagents.md`, "utf8");
-      expect(activity).toContain("reviewer: model provider/a failed (first provider failed); retrying on provider/b");
-      expect(activity).toContain("reviewer: model provider/b failed (second provider failed); retrying on provider/c");
-    });
-
     it.each(["markdown", "call"])("stays on the first model when the first turn succeeds (%s)", async (source) => {
       const { root, cwd, parentSession } = await chainFixture(source === "markdown" ? MODEL_CHAIN : "provider/a@low");
       const { deps, fakeSession } = fakeDeps(root, { messagesByPrompt: [[fallbackAnswer]] });
@@ -1963,7 +1908,6 @@ describe("subagent runner", () => {
           expect(await readFile(parentSession, "utf8")).toBe(parentText);
           await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
           await expect(readFile(`${parentSession}.subagents/manifest.jsonl`, "utf8")).rejects.toThrow();
-          await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
         });
       });
     });
@@ -1986,7 +1930,6 @@ describe("subagent runner", () => {
       expect(await readFile(parentSession, "utf8")).toBe(parentText);
       await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
       await expect(readFile(`${parentSession}.subagents/manifest.jsonl`, "utf8")).rejects.toThrow();
-      await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
     });
 
     it("inherits the live parent model and effort while copying an older fork branch", async () => {
@@ -2160,7 +2103,6 @@ describe("subagent runner", () => {
           expect(deps.createFreshSessionManager).not.toHaveBeenCalled();
           expect(deps.createAgentSession).not.toHaveBeenCalled();
           await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
-          await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
         });
       });
     });
@@ -2239,7 +2181,6 @@ describe("subagent runner", () => {
           expect(await readFile(parentSession, "utf8")).toBe(parentText);
           await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
           await expect(readFile(`${parentSession}.subagents/manifest.jsonl`, "utf8")).rejects.toThrow();
-          await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
         });
       });
     });
@@ -2358,7 +2299,7 @@ describe("subagent runner", () => {
     });
   });
 
-  it("streams child activity as portable partial updates and append-only activity-log entries", async () => {
+  it("streams child activity as portable partial updates", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     await mkdir(cwd, { recursive: true });
@@ -2376,35 +2317,15 @@ describe("subagent runner", () => {
     const updates: any[] = [];
 
     const result = await runSubagent({ task: "observable" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession), { deps });
-    const expectedActivityLog = expectedActivityLogForParentSession(parentSession);
 
     expect(updates.some((update) => update.details.run.activity === "thinking")).toBe(true);
     expect(updates.some((update) => update.details.run.activity.startsWith("using bash"))).toBe(true);
     expect(updates.some((update) => update.details.run.turnCount === 1)).toBe(true);
-    expect(updates.every((update) => update.content[0]?.text.split("\n")[0] === `Log: ${expectedActivityLog}`)).toBe(true);
-    expect(updates.every((update) => update.content[0]?.text.includes("\n- subagent"))).toBe(true);
-    expect(updates.every((update) => !update.content[0]?.text.includes("Activity log:"))).toBe(true);
+    expect(updates.every((update) => update.content[0]?.text.includes("- subagent"))).toBe(true);
     expect(updates.every((update) => !update.content[0]?.text.includes("ctx"))).toBe(true);
     expect(updates.some((update) => update.content[0]?.text.includes("- subagent (1 turn): turn completed"))).toBe(true);
     expectSubagentResult(result);
-    expect(result.content[0]?.text).not.toContain("Activity log:");
     expect(result.details.run).toMatchObject({ status: "completed", turnCount: 1 });
-
-    const activityLog = result.details.run.activityLog;
-    expect(activityLog).toBe(expectedActivityLog);
-    const artifactFiles = await readdir(`${parentSession}.subagents`);
-    expect(artifactFiles.filter((file) => file.endsWith(".md"))).toEqual([]);
-    const sessionFiles = await readdir(path.dirname(parentSession));
-    expect(sessionFiles).toContain("parent.jsonl.subagents.md");
-    const activityText = await readFile(activityLog, "utf8");
-    expect(activityText).toContain("started subagent — episode run-1 — session:");
-    expect(activityText).toContain("thinking");
-    expect(activityText).toContain("using bash");
-    expect(activityText).toContain("finished bash");
-    expect(activityText).toContain("responding");
-    expect(activityText).not.toContain("Partial answer");
-    expect(activityText).not.toContain("## Assistant");
-    expect(activityText).toContain("completed subagent — 1 turn — session:");
   });
 
   it("shows child context usage from Pi's session API in progress and final run details", async () => {
@@ -2479,7 +2400,6 @@ describe("subagent runner", () => {
       turnCount: 0,
       lastActivityAt: "2026-01-01T00:00:01.000Z",
       activity: "using read",
-      activityLog: expectedActivityLogForParentSession(parentSession),
       contextUsage: { tokens: 24_800, contextWindow: 200_000, percent: 12.4 },
       children: [],
     };
@@ -2496,16 +2416,10 @@ describe("subagent runner", () => {
     const result = await runSubagent({ task: "parent" }, undefined, (partial) => updates.push(partial), fakeContext(cwd, parentSession), { deps });
 
     expect(result.details.run.children).toHaveLength(1);
-    expect(result.details.run.children[0]).toMatchObject({ episodeId: "child-1", status: "completed", activityLog: nestedRun.activityLog });
+    expect(result.details.run.children[0]).toMatchObject({ episodeId: "child-1", status: "completed" });
     expectSubagentResult(result);
     expect(result.content[0]?.text).not.toContain("nested final output");
     expect(updates.some((update) => update.content[0]?.text.includes("- subagent (6% ctx, 0 turns) -> scout (12% ctx, 0 turns): using read"))).toBe(true);
-    expect(updates.every((update) => !update.content[0]?.text.includes("Activity log:"))).toBe(true);
-
-    const activityText = await readFile(result.details.run.activityLog, "utf8");
-    expect(activityText).toContain("using subagent");
-    expect(activityText).not.toContain("  - activity log:");
-    expect(activityText).not.toContain("nested final output");
   });
 
   it("fails named-skill resource validation before creating a child session", async () => {
@@ -2627,7 +2541,7 @@ describe("subagent runner", () => {
     expect(manifest.at(-1)).toMatchObject({ type: "finished", episodeId: "run-1", status: "failed", error: "Child subagent was aborted." });
   });
 
-  it("records retry activity through runner partial updates and activity logs", async () => {
+  it("records retry activity through runner partial updates", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
     await mkdir(cwd, { recursive: true });
@@ -2647,10 +2561,6 @@ describe("subagent runner", () => {
     expect(updates.some((update) => update.details.run.activity === "retrying attempt 1/3 after rate limited")).toBe(true);
     expect(updates.some((update) => update.details.run.activity === "retry pending")).toBe(true);
     expect(updates.some((update) => update.details.run.activity === "retry attempt 1 succeeded")).toBe(true);
-    const activityText = await readFile(result.details.run.activityLog, "utf8");
-    expect(activityText).toContain("retrying attempt 1/3 after rate limited");
-    expect(activityText).toContain("retry pending");
-    expect(activityText).toContain("retry attempt 1 succeeded");
   });
 
   it("treats a final assistant stopReason error as a failed subagent run", async () => {
@@ -2676,10 +2586,6 @@ describe("subagent runner", () => {
     const sessionId = manifest[0]?.type === "started" ? manifest[0].sessionId : "";
     expectRecoverableFailure(message, sessionId, "provider exhausted retries");
     expect(manifest.at(-1)).toMatchObject({ type: "finished", episodeId: "run-1", status: "failed", error: "provider exhausted retries" });
-    const activityText = await readFile(`${parentSession}.subagents.md`, "utf8");
-    expect(activityText).toContain("retrying attempt 2/3 after provider overloaded");
-    expect(activityText).toContain("retry attempt 2 failed: provider exhausted retries");
-    expect(activityText).toContain("failed subagent — 0 turns — error: provider exhausted retries — session:");
   });
 
   it("records failure artifacts, emits a failed partial update, and cleans up resources", async () => {
@@ -2838,8 +2744,6 @@ describe("subagent runner", () => {
     const childSessionFile = manifest[0]?.type === "started" ? manifest[0].sessionFile : "";
     const childHeader = JSON.parse((await readFile(childSessionFile, "utf8")).split("\n")[0]!);
     expect(childHeader).toMatchObject({ type: "session", id: sessionId, cwd });
-    const activityText = await readFile(`${parentSession}.subagents.md`, "utf8");
-    expect(activityText).toContain("failed subagent — 0 turns — error: sdk session failed — session:");
   });
 
   it("shuts down bound child extensions before disposing the session", async () => {
@@ -2947,21 +2851,6 @@ describe("subagent runner", () => {
     expect(logger).toHaveBeenCalledWith(expect.stringContaining("Could not append subagent manifest"), expect.any(Error));
   });
 
-  it("continues when activity-log writes degrade", async () => {
-    const root = await tempRoot();
-    const cwd = path.join(root, "project");
-    await mkdir(cwd, { recursive: true });
-    const parentSession = path.join(root, "sessions", "parent.jsonl");
-    const logger = vi.fn();
-    const { deps } = fakeDeps(root);
-    Object.assign(deps, { artifactOptions: { activityLog: { appendFile: async () => { throw new Error("log disk full"); }, logger } } });
-
-    const result = await runSubagent({ task: "activity log degraded" }, undefined, undefined, fakeContext(cwd, parentSession), { deps });
-
-    expectSubagentResult(result);
-    expect(logger).toHaveBeenCalledWith(expect.stringContaining("Could not append subagent activity log"), expect.any(Error));
-  });
-
   it("lets an in-process nested run find its parent when the outer manifest start append degraded", async () => {
     const root = await tempRoot();
     const cwd = path.join(root, "project");
@@ -2985,13 +2874,8 @@ describe("subagent runner", () => {
 
     expectSubagentResult(result);
     const manifest = await readManifestRecords(`${parentSession}.subagents/manifest.jsonl`);
-    const expectedActivityLog = expectedActivityLogForParentSession(parentSession);
-    expect(manifest).toContainEqual(expect.objectContaining({ type: "started", episodeId: "run-2", parentEpisodeId: "run-1", activityLog: expectedActivityLog }));
-    const activityText = await readFile(expectedActivityLog, "utf8");
+    expect(manifest).toContainEqual(expect.objectContaining({ type: "started", episodeId: "run-2", parentEpisodeId: "run-1" }));
     expect(nested.fakeSession.promptedWith).toBe(expectedPromptEnvelope("fresh", "inner", { parentDepth: 1 }));
-    expect(activityText).toContain("started subagent — episode run-1 — session:");
-    expect(activityText).toContain("started subagent -> subagent — episode run-2 — session:");
-    expect(activityText).toContain("completed subagent -> subagent — 0 turns — session:");
   });
 
   it("propagates parent aborts to the child session and reports an interrupted capsule", async () => {
@@ -3074,8 +2958,6 @@ describe("subagent runner", () => {
     expect(started).toBeDefined();
     const childHeader = JSON.parse((await readFile(started!.sessionFile, "utf8")).split("\n")[0]!);
     expect(childHeader).toMatchObject({ type: "session", id: sessionId, cwd });
-    const activityText = await readFile(`${parentSession}.subagents.md`, "utf8");
-    expect(activityText).toContain("aborted subagent — 0 turns — error: Interrupted by parent abort. — session:");
   });
 
   it("logs rejected child aborts without creating unhandled cleanup failures", async () => {
@@ -3123,7 +3005,6 @@ describe("subagent runner", () => {
     expect(deps.createResourceLoader).not.toHaveBeenCalled();
     expect(deps.createAgentSession).not.toHaveBeenCalled();
     await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
-    await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
   });
 
   it("requires a current leaf for fork runs", async () => {
@@ -3157,7 +3038,6 @@ describe("subagent runner", () => {
     expect(await readFile(parentSession, "utf8")).toBe(parentText);
     await expect(readdir(`${parentSession}.subagents`)).rejects.toThrow();
     await expect(readFile(`${parentSession}.subagents/manifest.jsonl`, "utf8")).rejects.toThrow();
-    await expect(readFile(`${parentSession}.subagents.md`, "utf8")).rejects.toThrow();
   });
 
   it("reports stale fork leaf failures with the leaf id", async () => {
