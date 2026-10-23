@@ -18,8 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { MissingMarkdownAgentError, resolveMarkdownAgent } from "./agents.js";
 import { cloneRunView, createActivityState, createInitialRunView, reduceActivityEvent } from "./activity.js";
-import { QueuedActivityLogWriter, appendActivityLogFinished, appendActivityLogStarted, ensureActivityLogHeader, type DegradedActivityLogOptions } from "./activity-log.js";
-import { appendManifestRecord, findLatestEpisodeStartedRecordBySessionFile, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
+import { appendManifestRecord, findParentEpisodeId, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
 import { parseModelChain, resolveRecordedSubagentModel, resolveSubagentModel, resolveSubagentThinkingLevel, type ModelCandidate } from "./models.js";
 import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult } from "./render.js";
 import { assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
@@ -56,7 +55,6 @@ export interface RunnerDependencies {
   createResourceLoader: (options: DefaultResourceLoaderOptions) => ResourceLoader;
   createAgentSession: (options: CreateAgentSessionOptions) => Promise<ChildSessionResult>;
   artifactOptions?: {
-    activityLog?: DegradedActivityLogOptions;
     manifest?: DegradedAppendOptions;
   };
 }
@@ -68,7 +66,6 @@ interface BaseRunPlan {
   root: SubagentsRoot;
   manifestPath: string;
   parentDepth: number;
-  parentPath: string[];
   agentDir: string;
   settingsManager: ProjectTrustedSettingsManager;
   resourceLoader: ResourceLoader;
@@ -103,9 +100,6 @@ interface ResumeRunPlan extends ChildSessionPlan {
   startedRecord: StartedManifestRecord;
   childSessionManager: SessionManager;
   childSessionFile: string;
-  activityPath: string[];
-  rootSessionFile: string;
-  activityLogPath: string;
   userPrompt: string;
 }
 
@@ -122,7 +116,6 @@ interface StartedRun {
   run: SubagentToolDetails["run"];
   childSessionManager: SessionManager;
   childSessionFile: string;
-  activityPath: string[];
   ownedSave: OwnedSave | undefined;
 }
 
@@ -131,7 +124,6 @@ const PARENT_ABORT_ERROR = "Interrupted by parent abort.";
 const runtimeEpisodeBySessionFile = new Map<string, string>();
 const runtimeSessionFileByEpisode = new Map<string, string>();
 const runtimeEpisodeDepthByEpisode = new Map<string, number>();
-const runtimeActivityPathByEpisode = new Map<string, string[]>();
 const activeChildSessionFiles = new Set<string>();
 
 class SubagentInterruptedError extends Error {
@@ -259,7 +251,6 @@ export async function runSubagent(
   let unsubscribe: (() => void) | undefined;
   let detachAbortHandler: (() => void) | undefined;
   let reservedChildSessionFile: string | undefined;
-  let activityLogWriter: QueuedActivityLogWriter | undefined;
 
   try {
     plan = await prepareRun(params, signal, ctx, deps, options);
@@ -280,7 +271,6 @@ export async function runSubagent(
     let activeChildSession = childSession;
     let abortState = attachAbortHandler(signal, activeChildSession);
     detachAbortHandler = abortState.detach;
-    activityLogWriter = new QueuedActivityLogWriter(run.activityLog, startedRun.activityPath, startedRun.childSessionFile, deps.artifactOptions?.activityLog);
     const activityState = createActivityState(run);
     let toolProgress = false;
     const subscribe = (session: ChildAgentSession) => session.subscribe((event) => {
@@ -290,7 +280,6 @@ export async function runSubagent(
       const reduction = reduceActivityEvent(activityState, event, deps.now());
       if (reduction.changed) {
         refreshContextUsage(activityState.run, session);
-        activityLogWriter?.appendStatus(activityState.run.lastActivityAt, activityState.run.activity);
         emitUpdate(onUpdate, toolDetails(activityState.run, startedRun?.ownedSave));
       }
     });
@@ -311,7 +300,6 @@ export async function runSubagent(
         const failed = describeModel(attemptModel(plan, attempt)!);
         const reason = summarizeProviderError(error instanceof Error ? error.message : String(error));
         failedAttempts.push(`${failed} (${reason})`);
-        activityLogWriter?.appendStatus(deps.now(), `model ${failed} failed (${reason}); retrying on ${describeModel(next.model)}`);
         // Recreate the AgentSession on the pre-prompt branch so failed requests
         // remain inspectable but do not enter the next model's context.
         runCleanup("remove subagent abort listener", detachAbortHandler);
@@ -342,8 +330,7 @@ export async function runSubagent(
       }
     }
     refreshContextUsage(run, activeChildSession);
-    await activityLogWriter.drain();
-    await finishRun(plan.manifestPath, startedRun, "completed", deps.now(), deps, activityLogWriter);
+    await finishRun(plan.manifestPath, run, "completed", deps.now(), deps);
     const details = await bestEffortTerminalDetails(run, startedRun.ownedSave);
     emitUpdate(onUpdate, details);
     forgetRuntimeEpisode(startedRun.run.episodeId);
@@ -356,12 +343,11 @@ export async function runSubagent(
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     const interrupted = isSubagentInterruptedError(error);
-    await activityLogWriter?.drain();
     if (run && childSession) refreshContextUsage(run, childSession);
     if (startedRun && plan) preservePlannedSelection(plan, startedRun.childSessionManager);
     if (startedRun) await materializeChildSessionFile(startedRun.childSessionManager);
     if (startedRun && plan) {
-      await finishRun(plan.manifestPath, startedRun, interrupted ? "aborted" : "failed", deps.now(), deps, activityLogWriter,
+      await finishRun(plan.manifestPath, startedRun.run, interrupted ? "aborted" : "failed", deps.now(), deps,
         interrupted ? PARENT_ABORT_ERROR : message);
     }
     if (run) {
@@ -402,7 +388,6 @@ export async function runSubagentResume(
   let unsubscribe: (() => void) | undefined;
   let detachAbortHandler: (() => void) | undefined;
   let reservedChildSessionFile: string | undefined;
-  let activityLogWriter: QueuedActivityLogWriter | undefined;
 
   try {
     plan = await prepareResumeRun(params, signal, ctx, deps, options.extensionFactories, (sessionFile, sessionId) => {
@@ -413,12 +398,9 @@ export async function runSubagentResume(
       episodeId: deps.createEpisodeId(),
       sessionId: plan.startedRecord.sessionId,
       agent: plan.startedRecord.agent,
-      activityLog: plan.activityLogPath,
       now: startedAt,
     });
     ownedSave = captureOwnedSave(plan.root.subagentsDir, plan.childSessionManager, plan.profile.agentName);
-    await ensureActivityLogHeader(run.activityLog, plan.rootSessionFile, startedAt, deps.artifactOptions?.activityLog);
-    await appendActivityLogStarted(run.activityLog, { timestamp: startedAt, path: plan.activityPath, episodeId: run.episodeId, sessionFile: plan.childSessionFile }, deps.artifactOptions?.activityLog);
     await appendManifestRecord(plan.manifestPath, {
       type: "resume_started",
       episodeId: run.episodeId,
@@ -428,12 +410,10 @@ export async function runSubagentResume(
       cwd: plan.startedRecord.cwd,
       context: plan.startedRecord.context,
       sessionFile: plan.childSessionFile,
-      activityLog: run.activityLog,
       agentFile: plan.profile.agentFile ?? null,
       startedAt,
     }, deps.artifactOptions?.manifest);
-    rememberRuntimeEpisode(plan.childSessionFile, run.episodeId, plan.parentDepth + 1, plan.activityPath);
-    activityLogWriter = new QueuedActivityLogWriter(run.activityLog, plan.activityPath, plan.childSessionFile, deps.artifactOptions?.activityLog);
+    rememberRuntimeEpisode(plan.childSessionFile, run.episodeId, plan.parentDepth + 1);
     emitUpdate(onUpdate, toolDetails(run, ownedSave));
     throwIfInterrupted(signal);
 
@@ -450,15 +430,13 @@ export async function runSubagentResume(
       const reduction = reduceActivityEvent(activityState, event, deps.now());
       if (reduction.changed) {
         refreshContextUsage(activityState.run, activeChildSession);
-        activityLogWriter?.appendStatus(activityState.run.lastActivityAt, activityState.run.activity);
         emitUpdate(onUpdate, toolDetails(activityState.run, ownedSave));
       }
     });
 
     const answer = await promptChildAndExtractAnswer(activeChildSession, plan.childSessionManager, plan.userPrompt, abortState);
     refreshContextUsage(run, activeChildSession);
-    await activityLogWriter.drain();
-    await finishResumeRun(plan.manifestPath, run, "completed", deps.now(), deps, activityLogWriter);
+    await finishResumeRun(plan.manifestPath, run, "completed", deps.now(), deps);
     const details = await bestEffortTerminalDetails(run, ownedSave);
     emitUpdate(onUpdate, details);
 
@@ -469,11 +447,10 @@ export async function runSubagentResume(
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     const interrupted = isSubagentInterruptedError(error);
-    await activityLogWriter?.drain();
     if (run && childSession) refreshContextUsage(run, childSession);
     if (plan) await materializeChildSessionFile(plan.childSessionManager);
     if (run && plan) {
-      await finishResumeRun(plan.manifestPath, run, interrupted ? "aborted" : "failed", deps.now(), deps, activityLogWriter,
+      await finishResumeRun(plan.manifestPath, run, interrupted ? "aborted" : "failed", deps.now(), deps,
         interrupted ? PARENT_ABORT_ERROR : message);
       const details = await bestEffortTerminalDetails(run, ownedSave);
       emitUpdate(onUpdate, details);
@@ -522,11 +499,10 @@ async function prepareResumeRun(
   const parentSessionFile = ctx.sessionManager.getSessionFile();
   if (!parentSessionFile) throw new Error("subagent_resume requires a persisted parent Pi session.");
 
-  const { root, manifestPath, parentDepth, parentPath, records } = await resolveArtifactRoot(parentSessionFile);
+  const { root, manifestPath, parentDepth, records } = await resolveArtifactRoot(parentSessionFile);
   const startedRecord = requireUniqueStartedRecordBySessionId(records, params.sessionId);
   assertUsableStartedRecord(startedRecord, params.sessionId);
   assertSessionFileInSubagentsRoot(startedRecord.sessionFile, root.subagentsDir, params.sessionId);
-  assertActivityLogMatchesCanonicalPath(startedRecord.activityLog, root.activityLogPath, params.sessionId);
   if (path.resolve(parentSessionFile) === path.resolve(startedRecord.sessionFile)) {
     throw new Error(`Subagent session '${params.sessionId}' is the current session; send a normal message instead of resuming it through subagent_resume.`);
   }
@@ -578,9 +554,6 @@ async function prepareResumeRun(
     startedRecord,
     childSessionManager,
     childSessionFile,
-    activityPath: [...parentPath, startedRecord.agent],
-    rootSessionFile: root.rootSessionFile,
-    activityLogPath: root.activityLogPath,
     agentDir,
     settingsManager,
     resourceLoader,
@@ -611,7 +584,7 @@ async function prepareFreshRun(
   const userAgentsDir = path.join(agentDir, "agents");
   const profile = await resolveAgentProfile(params, effectiveCwd, profileResolutionOptions(userAgentsDir, params, ctx));
   const { model, thinkingLevel, fallbacks } = resolveRunModelChoices(params, profile, ctx);
-  const { root, manifestPath, parentDepth, parentPath } = await resolveArtifactRoot(parentSessionFile);
+  const { root, manifestPath, parentDepth } = await resolveArtifactRoot(parentSessionFile);
   const loaderContext = extensionFactories === undefined
     ? { cwd: effectiveCwd, agentDir, settingsManager }
     : { cwd: effectiveCwd, agentDir, settingsManager, extensionFactories };
@@ -626,7 +599,6 @@ async function prepareFreshRun(
     root,
     manifestPath,
     parentDepth,
-    parentPath,
     agentDir,
     settingsManager,
     resourceLoader,
@@ -654,7 +626,7 @@ async function prepareForkRun(
   const currentLeafId = ctx.sessionManager.getLeafId();
   if (!currentLeafId) throw new Error("subagent fork execution requires a current session leaf.");
 
-  const { root, manifestPath, parentDepth, parentPath } = await resolveArtifactRoot(parentSessionFile);
+  const { root, manifestPath, parentDepth } = await resolveArtifactRoot(parentSessionFile);
   const effectiveCwd = ctx.sessionManager.getCwd();
   await assertDirectoryExists(effectiveCwd);
   throwIfAborted(signal, "Subagent run was aborted before child execution.");
@@ -678,7 +650,6 @@ async function prepareForkRun(
     root,
     manifestPath,
     parentDepth,
-    parentPath,
     agentDir,
     settingsManager,
     resourceLoader,
@@ -782,7 +753,6 @@ function assertUsableStartedRecord(record: StartedManifestRecord, sessionId: str
     || typeof record.cwd !== "string"
     || (record.context !== "fresh" && record.context !== "fork")
     || typeof record.sessionFile !== "string"
-    || typeof record.activityLog !== "string"
     || (Object.hasOwn(record, "agentsMdOverride")
       && (record.context !== "fresh" || (record.agentsMdOverride !== "none" && record.agentsMdOverride !== "auto")))) {
     throw new Error(`Subagent session '${sessionId}' has an invalid manifest record.`);
@@ -793,12 +763,6 @@ function assertSessionFileInSubagentsRoot(sessionFile: string, subagentsDir: str
   const relative = path.relative(path.resolve(subagentsDir), path.resolve(sessionFile));
   if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error(`Subagent session '${sessionId}' points outside the current parent/root subagents directory.`);
-  }
-}
-
-function assertActivityLogMatchesCanonicalPath(activityLog: string, expectedActivityLog: string, sessionId: string): void {
-  if (path.resolve(activityLog) !== path.resolve(expectedActivityLog)) {
-    throw new Error(`Subagent session '${sessionId}' has an invalid activity-log manifest path.`);
   }
 }
 
@@ -848,7 +812,7 @@ function assertSessionCwdMatchesManifest(headerCwd: string, manifestCwd: string,
   }
 }
 
-async function resolveArtifactRoot(parentSessionFile: string): Promise<{ root: SubagentsRoot; manifestPath: string; parentDepth: number; parentPath: string[]; records: ManifestRecords }> {
+async function resolveArtifactRoot(parentSessionFile: string): Promise<{ root: SubagentsRoot; manifestPath: string; parentDepth: number; records: ManifestRecords }> {
   const provisionalRoot = resolveSubagentsRoot(parentSessionFile, null);
   const manifestPath = manifestPathForSubagentsRoot(provisionalRoot.subagentsDir);
   const isNestedRun = path.dirname(path.resolve(parentSessionFile)) === path.resolve(provisionalRoot.subagentsDir);
@@ -857,11 +821,7 @@ async function resolveArtifactRoot(parentSessionFile: string): Promise<{ root: S
   if (isNestedRun) {
     parentEpisodeId = runtimeEpisodeBySessionFile.get(path.resolve(parentSessionFile)) ?? null;
     if (parentEpisodeId === null) {
-      const parentRecord = findLatestEpisodeStartedRecordBySessionFile(records, parentSessionFile);
-      if (parentRecord) {
-        assertActivityLogMatchesCanonicalPath(parentRecord.activityLog, provisionalRoot.activityLogPath, parentRecord.sessionId);
-        parentEpisodeId = parentRecord.episodeId;
-      }
+      parentEpisodeId = findParentEpisodeId(records, parentSessionFile);
     }
   }
   if (isNestedRun && parentEpisodeId === null) {
@@ -873,39 +833,30 @@ async function resolveArtifactRoot(parentSessionFile: string): Promise<{ root: S
     throw new Error(`Subagent nesting limit exceeded: maximum depth is ${MAX_SUBAGENT_DEPTH}.`);
   }
 
-  const parentPath = parentEpisodeId === null ? [] : activityPathForEpisode(parentEpisodeId, records);
-  if (isNestedRun && parentPath === undefined) {
-    throw new Error(`Could not determine parent subagent path for nested session: ${parentSessionFile}`);
-  }
-
   const root = resolveSubagentsRoot(parentSessionFile, parentEpisodeId);
-  return { root, manifestPath: manifestPathForSubagentsRoot(root.subagentsDir), parentDepth, parentPath: parentPath ?? [], records };
+  return { root, manifestPath: manifestPathForSubagentsRoot(root.subagentsDir), parentDepth, records };
 }
 
 function createStartedRun(plan: RunPlan, deps: RunnerDependencies): StartedRun {
   const episodeId = deps.createEpisodeId();
   const startedAt = deps.now();
-  const activityLog = plan.root.activityLogPath;
-  const activityPath = [...plan.parentPath, plan.profile.agentName];
   const childSessionManager = createChildSessionManager(plan, deps);
   const childSessionFile = childSessionManager.getSessionFile();
   if (!childSessionFile) throw new Error("Could not create a persisted child subagent session.");
   const sessionId = childSessionManager.getSessionId();
 
-  const run = createInitialRunView({ episodeId, sessionId, agent: plan.profile.agentName, activityLog, now: startedAt });
-  return { run, childSessionManager, childSessionFile, activityPath,
+  const run = createInitialRunView({ episodeId, sessionId, agent: plan.profile.agentName, now: startedAt });
+  return { run, childSessionManager, childSessionFile,
     ownedSave: captureOwnedSave(plan.root.subagentsDir, childSessionManager, plan.profile.agentName) };
 }
 
 async function startRunArtifacts(plan: RunPlan, started: StartedRun, deps: RunnerDependencies): Promise<void> {
-  const { run, childSessionManager, childSessionFile, activityPath } = started;
-  const { episodeId, sessionId, activityLog, lastActivityAt: startedAt } = run;
+  const { run, childSessionManager, childSessionFile } = started;
+  const { episodeId, sessionId, lastActivityAt: startedAt } = run;
   if (plan.context === "fork") {
     if (plan.model) childSessionManager.appendModelChange(plan.model.provider, plan.model.id);
     if (plan.thinkingLevel !== undefined) childSessionManager.appendThinkingLevelChange(plan.thinkingLevel);
   }
-  await ensureActivityLogHeader(activityLog, plan.root.rootSessionFile, startedAt, deps.artifactOptions?.activityLog);
-  await appendActivityLogStarted(activityLog, { timestamp: startedAt, path: activityPath, episodeId, sessionFile: childSessionFile }, deps.artifactOptions?.activityLog);
   await appendManifestRecord(plan.manifestPath, {
     type: "started",
     episodeId,
@@ -916,11 +867,10 @@ async function startRunArtifacts(plan: RunPlan, started: StartedRun, deps: Runne
     context: plan.context,
     ...(plan.context === "fresh" && plan.agentsMdOverride !== undefined ? { agentsMdOverride: plan.agentsMdOverride } : {}),
     sessionFile: childSessionFile,
-    activityLog,
     agentFile: plan.profile.agentFile ?? null,
     startedAt,
   }, deps.artifactOptions?.manifest);
-  rememberRuntimeEpisode(childSessionFile, episodeId, plan.parentDepth + 1, activityPath);
+  rememberRuntimeEpisode(childSessionFile, episodeId, plan.parentDepth + 1);
 }
 
 function createChildSessionManager(plan: RunPlan, deps: RunnerDependencies): SessionManager {
@@ -1136,23 +1086,15 @@ type TerminalRunStatus = Exclude<SubagentToolDetails["run"]["status"], "running"
 
 async function finishRun(
   manifestPath: string,
-  started: StartedRun,
+  run: SubagentToolDetails["run"],
   status: TerminalRunStatus,
   finishedAt: string,
   deps: RunnerDependencies,
-  activityLogWriter: QueuedActivityLogWriter | undefined,
   errorMessage?: string,
 ): Promise<void> {
-  const run = started.run;
   run.status = status;
   run.activity = terminalActivity(status);
   run.lastActivityAt = finishedAt;
-  if (activityLogWriter) {
-    activityLogWriter.appendFinished(finishedAt, run, errorMessage);
-    await activityLogWriter.drain();
-  } else {
-    await appendActivityLogFinished(run.activityLog, finishedAt, started.activityPath, started.childSessionFile, run, errorMessage, deps.artifactOptions?.activityLog);
-  }
   await appendManifestRecord(manifestPath, {
     type: "finished",
     episodeId: run.episodeId,
@@ -1168,16 +1110,11 @@ async function finishResumeRun(
   status: TerminalRunStatus,
   finishedAt: string,
   deps: RunnerDependencies,
-  activityLogWriter: QueuedActivityLogWriter | undefined,
   errorMessage?: string,
 ): Promise<void> {
   run.status = status;
   run.activity = terminalActivity(status);
   run.lastActivityAt = finishedAt;
-  if (activityLogWriter) {
-    activityLogWriter.appendFinished(finishedAt, run, errorMessage);
-    await activityLogWriter.drain();
-  }
   await appendManifestRecord(manifestPath, {
     type: "resume_finished",
     episodeId: run.episodeId,
@@ -1210,12 +1147,11 @@ function runCleanup(label: string, cleanup: (() => void) | undefined): void {
   }
 }
 
-function rememberRuntimeEpisode(sessionFile: string, episodeId: string, depth: number, activityPath: readonly string[]): void {
+function rememberRuntimeEpisode(sessionFile: string, episodeId: string, depth: number): void {
   const normalized = path.resolve(sessionFile);
   runtimeEpisodeBySessionFile.set(normalized, episodeId);
   runtimeSessionFileByEpisode.set(episodeId, normalized);
   runtimeEpisodeDepthByEpisode.set(episodeId, depth);
-  runtimeActivityPathByEpisode.set(episodeId, [...activityPath]);
 }
 
 function reserveActiveChildSession(sessionFile: string, sessionId: string): string {
@@ -1240,26 +1176,6 @@ function forgetRuntimeEpisode(episodeId: string): void {
   if (sessionFile) runtimeEpisodeBySessionFile.delete(sessionFile);
   runtimeSessionFileByEpisode.delete(episodeId);
   runtimeEpisodeDepthByEpisode.delete(episodeId);
-  runtimeActivityPathByEpisode.delete(episodeId);
-}
-
-function activityPathForEpisode(episodeId: string, records: ManifestRecords): string[] | undefined {
-  const runtimePath = runtimeActivityPathByEpisode.get(episodeId);
-  if (runtimePath) return [...runtimePath];
-
-  const byEpisodeId = startedRecordsByEpisodeId(records);
-  const pathSegments: string[] = [];
-  const seen = new Set<string>();
-  let current: string | null = episodeId;
-  while (current) {
-    if (seen.has(current)) return undefined;
-    seen.add(current);
-    const record = byEpisodeId.get(current);
-    if (!record) return undefined;
-    pathSegments.unshift(record.agent);
-    current = record.parentEpisodeId;
-  }
-  return pathSegments;
 }
 
 function episodeDepth(episodeId: string, records: ManifestRecords): number {
@@ -1269,9 +1185,11 @@ function episodeDepth(episodeId: string, records: ManifestRecords): number {
   const seen = new Set<string>([episodeId]);
   while (current) {
     if (seen.has(current)) return MAX_SUBAGENT_DEPTH;
+    const record = byEpisodeId.get(current);
+    if (record === undefined) throw new Error(`Could not determine subagent lineage: episode '${current}' is missing from the manifest.`);
     seen.add(current);
     depth += 1;
-    current = byEpisodeId.get(current)?.parentEpisodeId ?? null;
+    current = record.parentEpisodeId;
   }
   return depth;
 }

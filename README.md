@@ -310,21 +310,17 @@ root parent session when possible, even if the episode later fails or is aborted
 
 ```text
 <parent-session>.jsonl
-<parent-session>.jsonl.subagents.md
 <parent-session>.jsonl.subagents/
 	manifest.jsonl
 	<child-session>.jsonl
 ```
 
 `manifest.jsonl` records lifecycle data used for resume and nesting.
-`<parent-session>.jsonl.subagents.md` is an append-only status stream
-suitable for `tail -f`, not a transcript. It reports status and fallback
-attempts. Full child messages remain in the child session JSONL.
+Full child messages remain in the child session JSONL.
 
 While a child runs, Pi frontends receive text partial updates like this:
 
 ```text
-Log: ~/.pi/agent/sessions/.../parent.jsonl.subagents.md
 - subagent (6% ctx, 1 turn) -> reviewer (? ctx, 2 turns): using read
 ```
 
@@ -339,7 +335,6 @@ type SubagentRunView = {
 	turnCount: number
 	lastActivityAt: string
 	activity: string
-	activityLog: string
 	contextUsage?: {
 		tokens: number | null
 		contextWindow: number
@@ -400,13 +395,12 @@ for the full contract.
   `customTools`. If the Pi process dies before it finalizes the parent result,
   those details are not saved. A later extension can replace result details.
 - `pi-submarine`'s wrapper text does not add session-file paths,
-  activity-log paths, stack traces, child transcripts, or the Markdown
-  activity log to model-visible success, interruption, or recovery
-  text. The original provider or extension error message is preserved
-  and may contain its own details.
-- Manifest and activity-log append failures are logged and do not fail
-  an otherwise successful child episode. Recovery is not guaranteed if
-  the original manifest write failed.
+  stack traces, or child transcripts to model-visible success,
+  interruption, or recovery text. The original provider or extension
+  error message is preserved and may contain its own details.
+- Manifest append failures are logged and do not fail an otherwise
+  successful child episode. Recovery is not guaranteed if the original
+  manifest write failed.
 - In one Pi process, `pi-submarine` rejects concurrent attempts to
   append to the same child session, including `subagent_resume` while
   the original `subagent` is still active. This is not a cross-process lock.

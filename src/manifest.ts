@@ -45,16 +45,12 @@ export async function readManifestRecords(filePath: string): Promise<ManifestRec
     .map((line) => JSON.parse(line) as ManifestRecord);
 }
 
-export function findLatestEpisodeStartedRecordBySessionFile(records: ManifestRecord[], sessionFile: string): EpisodeStartedManifestRecord | undefined {
+export function findParentEpisodeId(records: ManifestRecord[], sessionFile: string): string | null {
   const normalizedSessionFile = path.resolve(sessionFile);
   const matches = records.filter(
     (record): record is EpisodeStartedManifestRecord => (record.type === "started" || record.type === "resume_started") && path.resolve(record.sessionFile) === normalizedSessionFile,
   );
-  return matches.at(-1);
-}
-
-export function findParentEpisodeId(records: ManifestRecord[], sessionFile: string): string | null {
-  return findLatestEpisodeStartedRecordBySessionFile(records, sessionFile)?.episodeId ?? null;
+  return matches.at(-1)?.episodeId ?? null;
 }
 
 export function findStartedRecordsBySessionId(records: ManifestRecord[], sessionId: string): StartedManifestRecord[] {

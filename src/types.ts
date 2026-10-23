@@ -68,7 +68,6 @@ export interface SubagentRunView {
   turnCount: number;
   lastActivityAt: string;
   activity: string;
-  activityLog: string;
   contextUsage?: SubagentContextUsage;
   children: SubagentRunView[];
 }
@@ -91,7 +90,6 @@ export interface ManifestStartedRecord {
   cwd: string;
   context: SubagentContextMode;
   sessionFile: string;
-  activityLog: string;
   startedAt: string;
   agentFile?: string | null;
   agentsMdOverride?: AgentResourceMode;
@@ -114,7 +112,6 @@ export interface ManifestResumeStartedRecord {
   cwd: string;
   context: SubagentContextMode;
   sessionFile: string;
-  activityLog: string;
   startedAt: string;
   agentFile?: string | null;
 }

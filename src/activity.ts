@@ -23,7 +23,6 @@ export function createInitialRunView(input: {
   episodeId: string;
   sessionId: string;
   agent: string;
-  activityLog: string;
   now: string;
 }): SubagentRunView {
   return {
@@ -34,7 +33,6 @@ export function createInitialRunView(input: {
     turnCount: 0,
     lastActivityAt: input.now,
     activity: "starting",
-    activityLog: input.activityLog,
     children: [],
   };
 }
@@ -183,7 +181,6 @@ function isRunView(value: unknown): value is SubagentRunView {
     && typeof value.turnCount === "number"
     && typeof value.lastActivityAt === "string"
     && typeof value.activity === "string"
-    && typeof value.activityLog === "string"
     && (!("contextUsage" in value) || isContextUsage(value.contextUsage))
     && Array.isArray(value.children)
     && value.children.every(isRunView);
