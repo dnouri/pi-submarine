@@ -116,6 +116,19 @@ describe("pi-submarine extension registration", () => {
     expect(validateToolArguments(subagentTool, { type: "toolCall", id: "valid", name: "subagent", arguments: args })).toEqual(args);
   });
 
+  it("exposes agent omission, chain validation, and child tool access in model-facing help", () => {
+    const subagent = registeredToolsFromFactory().find((tool) => tool.name === "subagent");
+    assert(subagent && IsObject(subagent.parameters));
+
+    const { agent, model } = subagent.parameters.properties;
+    expect(agent).toHaveProperty("description", expect.stringContaining("Omit this key for an unnamed child."));
+    expect(agent).toHaveProperty("description", expect.stringContaining("not a role, context mode, or empty string."));
+    expect(model).toHaveProperty("description", expect.stringContaining("The whole chain is validated before any candidate runs."));
+    const guidelines = subagent.promptGuidelines?.join("\n");
+    expect(guidelines).toContain("Children can use Pi tools such as `read`, `edit`, and `bash`.");
+    expect(guidelines).toContain("`agentsMd` selects instruction files, not tools or permissions.");
+  });
+
   it("registers model-facing help from TOOL_PROMPTS for every tool and parameter", () => {
     const tools = registeredToolsFromFactory();
     for (const [name, prompt] of [

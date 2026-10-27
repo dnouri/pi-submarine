@@ -4,9 +4,9 @@ export const TOOL_PROMPTS = {
     description: "Delegate one focused task and wait for its answer and session ID.",
     promptSnippet: "Delegate one foreground task",
     parameterDescriptions: {
-      agent: "Existing agent filename stem, not a role name. Omit for an unnamed child. Project `.pi/agents/*.md` overrides same-named user agents.",
+      agent: "Omit this key for an unnamed child. Otherwise use an existing agent filename stem, not a role, context mode, or empty string. Project `.pi/agents/*.md` overrides same-named user agents.",
       task: "Task and expected output. For `fresh`, include the needed context, paths, constraints, and checks.",
-      model: "Comma-separated `model@effort` or `provider/model@effort` candidates, tried in order for one child. Replaces the profile chain. Omit to use the profile chain or inherit the parent's current model and effort.",
+      model: "Comma-separated `model@effort` or `provider/model@effort` candidates, tried in order for one child. The whole chain is validated before any candidate runs. Replaces the profile chain. Omit to use the profile chain or inherit the parent's current model and effort.",
       agentsMd: "Fresh only. `none` skips inclusion of AGENTS.md or CLAUDE.md. `auto` loads them normally. Defaults to the profile's choice or `none` for an unnamed child. Explicit overrides persist on resume.",
       context: "`fresh` starts without parent history. `fork` copies the selected parent branch and rejects `cwd` and `agentsMd`. Defaults to `fresh`.",
       cwd: "Fresh-only workspace override, relative to caller cwd. Usually omit to keep caller cwd. Project agents, instructions, skills, and tools follow it. Read external files by path in `task`.",
@@ -14,7 +14,7 @@ export const TOOL_PROMPTS = {
     promptGuidelines: [
       "Use `multi_tool_use.parallel` to run independent `subagent` calls together. Each call waits for its child. Start dependent calls after their prerequisites finish.",
       "Fallback advances only on an initial provider error before assistant success or tool progress. Abort, prompt rejection, later failure, and weak answers do not trigger fallback.",
-      "Changing `model` or `agentsMd` keeps the named prompt and skills. Context-file selection does not restrict the child's permissions.",
+      "Changing `model` or `agentsMd` keeps the named prompt and skills. Children can use Pi tools such as `read`, `edit`, and `bash`. `agentsMd` selects instruction files, not tools or permissions.",
     ],
   },
   subagentResume: {
