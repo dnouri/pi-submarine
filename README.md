@@ -7,7 +7,7 @@ brings back their answers. The child's transcript stays out of the parent's
 context.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/dnouri/pi-submarine/0.5/media/pi-submarine.gif" alt="pi-submarine animation" width="480">
+  <img src="https://raw.githubusercontent.com/dnouri/pi-submarine/0.6/media/pi-submarine.gif" alt="pi-submarine animation" width="480">
 </p>
 
 ## Install
@@ -20,8 +20,11 @@ Requires Pi `1.3.0` or newer in the 1.x series. Both Pi peer dependency ranges
 are `^1.3.0`, and the tests run against SDK `1.3.0` only, so a later 1.x
 release is not covered.
 
-**Upgrading to 0.5.** Remove `thinkingLevel` from calls and agent files,
-and append `@effort` to every explicit model candidate.
+**Upgrading to 0.6.** Upgrade Pi to `1.3.0` or newer in the 1.x series.
+Children no longer inherit parent-only provider configuration. See
+[Child configuration](#child-configuration) to configure provider access.
+The Markdown activity log and the `activityLog` run detail are gone. Read the
+child session transcript instead.
 
 ## Features
 
