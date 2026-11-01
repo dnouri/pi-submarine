@@ -44,11 +44,13 @@ async function verifySave(details: SubagentToolDetails, cwd: string) {
   expect(details).not.toHaveProperty("pilish");
   const saved = details.savedConversations!;
   expect(saved).toBeDefined();
-  expect(saved.version).toBe(1);
+  expect(saved.version).toBe(2);
   expect(saved.items).toHaveLength(1);
-  const item = saved.items[0];
+  const item = saved.items[0]!;
   expect(item.sessionId).toBe(details.run.sessionId);
-  const file = path.join(saved.root, item.file);
+  expect(item.save).toMatchObject({ kind: "pi-v3", readiness: "checked" });
+  if (item.save.kind !== "pi-v3") throw new Error("Unavailable saved conversation");
+  const file = path.join(saved.root, item.save.file);
   const header = JSON.parse((await readFile(file, "utf8")).split("\n")[0]!);
   expect(header).toMatchObject({ type: "session", version: 3, id: item.sessionId, cwd });
   expect(SessionManager.open(file).getSessionId()).toBe(item.sessionId);
@@ -91,7 +93,7 @@ export default function(pi) {
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
         content: child ? [{ type: "text", text: "Offline child answer." }]
           : result ? [{ type: "text", text: "Parent continued after the child." }]
-          : [{ type: "toolCall", id: "normal-auth-call", name: "subagent", arguments: { task: "Verify normal offline configuration." } }],
+          : [{ type: "toolCall", id: "normal-auth-call", name: "subagent", arguments: { task: "Verify normal offline configuration.", title: "Verify offline config" } }],
         stopReason: child || result ? "stop" : "toolUse",
       };
       const stream = createAssistantMessageEventStream();
@@ -129,7 +131,7 @@ describe("normal child SDK model runtime", () => {
       const result = savedResults(parent)[0]!;
       expect(result).toMatchObject({ isError: false, details: { run: { status: "completed" } } });
       const details = result.details as unknown as SubagentToolDetails;
-      expect(result.content).toEqual([{ type: "text", text: `## Subagent result\nSubagent session ID: ${details.run.sessionId}\nModel: submarine-offline/selected\n\nOffline child answer.` }]);
+      expect(result.content).toEqual([{ type: "text", text: `## Subagent result\nSubagent session ID: ${details.run.sessionId}\nTask: Verify offline config\nRan 1 turn at ${details.run.contextUsage?.percent}% context\nModel: submarine-offline/selected\n\nOffline child answer.` }]);
       const childFile = await verifySave(details, f.cwd);
       expect(SessionManager.open(childFile).buildSessionContext()).toMatchObject({ model: { provider: "submarine-offline", modelId: "selected" }, thinkingLevel: "high" });
       const requests = (await readFile(path.join(f.agentDir, "requests.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
@@ -168,7 +170,7 @@ describe("normal child SDK model runtime", () => {
           role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(),
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
           content: failed ? [{ type: "text", text: "Parent continued after missing child configuration." }]
-            : [{ type: "toolCall", id: "parent-only-call", name: "subagent", arguments: { task: "Use parent-only configuration." } }],
+            : [{ type: "toolCall", id: "parent-only-call", name: "subagent", arguments: { task: "Use parent-only configuration.", title: "Use parent config" } }],
           stopReason: failed ? "stop" : "toolUse",
         };
         const stream = createAssistantMessageEventStream();

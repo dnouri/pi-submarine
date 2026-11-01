@@ -6,6 +6,7 @@ export const TOOL_PROMPTS = {
     parameterDescriptions: {
       agent: "Omit this key for an unnamed child. Otherwise use an existing agent filename stem, not a role, context mode, or empty string. Project `.pi/agents/*.md` overrides same-named user agents.",
       task: "Task and expected output. For `fresh`, include the needed context, paths, constraints, and checks.",
+      title: "Required. Three to five words naming the task, shown to the user while the child runs and in its saved-chat tree. One line, at most 120 characters, never derived from `task`.",
       model: "Comma-separated `model@effort` or `provider/model@effort` candidates, tried in order for one child. The whole chain is validated before any candidate runs. Replaces the profile chain. Omit to use the profile chain or inherit the parent's current model and effort.",
       agentsMd: "Fresh only. `none` skips inclusion of AGENTS.md or CLAUDE.md. `auto` loads them normally. Defaults to the profile's choice or `none` for an unnamed child. Explicit overrides persist on resume.",
       context: "`fresh` starts without parent history. `fork` copies the selected parent branch and rejects `cwd` and `agentsMd`. Defaults to `fresh`.",
@@ -24,6 +25,7 @@ export const TOOL_PROMPTS = {
     parameterDescriptions: {
       sessionId: "Child session ID from a tool result or recovery hint.",
       message: "User message to append before waiting for the child's next answer.",
+      title: "Required. Three to five words naming this continuation, shown to the user while the child runs. One line, at most 120 characters, never derived from `message`.",
     },
     promptGuidelines: [
       "Use `subagent` for new work and ordinary follow-ups. Resume stays within this root session and adds no new parent history.",

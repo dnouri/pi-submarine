@@ -10,6 +10,7 @@ export const subagentParameters = Type.Object(
   {
     agent: Type.Optional(Type.String({ description: TOOL_PROMPTS.subagent.parameterDescriptions.agent })),
     task: Type.String({ minLength: 1, description: TOOL_PROMPTS.subagent.parameterDescriptions.task }),
+    title: Type.String({ minLength: 1, maxLength: 120, description: TOOL_PROMPTS.subagent.parameterDescriptions.title }),
     model: Type.Optional(Type.String({ minLength: 1, description: TOOL_PROMPTS.subagent.parameterDescriptions.model })),
     agentsMd: Type.Optional(
       StringEnum(["none", "auto"] as const, {
@@ -31,6 +32,7 @@ export const subagentResumeParameters = Type.Object(
   {
     sessionId: Type.String({ minLength: 1, description: TOOL_PROMPTS.subagentResume.parameterDescriptions.sessionId }),
     message: Type.String({ minLength: 1, description: TOOL_PROMPTS.subagentResume.parameterDescriptions.message }),
+    title: Type.String({ minLength: 1, maxLength: 120, description: TOOL_PROMPTS.subagentResume.parameterDescriptions.title }),
   },
   { additionalProperties: false },
 );

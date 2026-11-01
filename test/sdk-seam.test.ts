@@ -131,16 +131,23 @@ async function expectExactSave(details: SubagentToolDetails) {
   const declaration = details.savedConversations;
   expect(declaration).toBeDefined();
   if (!declaration) throw new Error("Missing saved conversation");
-  expect(declaration.version).toBe(1);
-  expect(declaration.items).toHaveLength(1);
-  const item = declaration.items[0];
-  const file = path.join(declaration.root, item.file);
-  const header = JSON.parse((await readFile(file, "utf8")).split("\n")[0]!);
-  expect(header).toMatchObject({ type: "session", version: 3, id: item.sessionId });
-  expect(item.sessionId).toBe(details.run.sessionId);
-  const manager = SessionManager.open(file);
-  expect(manager.getSessionId()).toBe(item.sessionId);
-  return { file, manager };
+  expect(declaration.version).toBe(2);
+  expect(declaration.coverage).toBe("complete");
+  expect(declaration.items.length).toBeGreaterThan(0);
+  for (const item of declaration.items) {
+    expect(item.save).toMatchObject({ kind: "pi-v3", readiness: "checked" });
+    if (item.save.kind !== "pi-v3") throw new Error("Unavailable saved conversation");
+    const file = path.join(declaration.root, item.save.file);
+    const header = JSON.parse((await readFile(file, "utf8")).split("\n")[0]!);
+    expect(header).toMatchObject({ type: "session", version: 3, id: item.sessionId });
+    expect(SessionManager.open(file).getSessionId()).toBe(item.sessionId);
+  }
+  const item = declaration.items[0]!;
+  expect(item).toMatchObject({ id: details.run.episodeId, parentId: null, sessionId: details.run.sessionId,
+    title: details.run.title, stats: { turns: details.run.turnCount, contextPercent: details.run.contextUsage?.percent ?? null } });
+  if (item.save.kind !== "pi-v3") throw new Error("Unavailable direct saved conversation");
+  const file = path.join(declaration.root, item.save.file);
+  return { file, manager: SessionManager.open(file) };
 }
 
 async function scriptedRegisteredFixture(name: string, childSteps: (options: Parameters<RunnerDependencies["createAgentSession"]>[0]) => ScriptStep[], rename = false, standalone = false) {
@@ -206,6 +213,33 @@ async function scriptedRegisteredFixture(name: string, childSteps: (options: Par
 }
 
 describe("Pi SDK integration seam", () => {
+  it("persists task descriptions and per-episode stats through nested registered tools", async () => {
+    const answer = syntheticAssistant(getModel("anthropic", "claude-opus-4-5"));
+    let created = 0;
+    const fixture = await scriptedRegisteredFixture("task-descriptions", () => ++created === 1 ? [
+      () => toolRequest("subagent", { task: "Inspect the nested catalog.\nReturn the conflicts.", title: "Check catalog conflicts" }),
+      () => answer,
+    ] : [() => answer]);
+    try {
+      scriptSession(fixture.parent, [() => toolRequest("subagent", { task: "Review catalog records.\nDelegate the inspection.", title: "Review catalog records" }), () => answer]);
+      await fixture.parent.prompt("Review the catalog.");
+      const result = toolMessages(SessionManager.open(fixture.parentManager.getSessionFile()!))[0]!;
+      const saved = await expectExactSave(result.details!);
+      const nested = toolMessages(saved.manager)[0]!;
+      await expectExactSave(nested.details!);
+      expect(result.details!.run).toMatchObject({ title: "Review catalog records", turnCount: 2 });
+      expect(nested.details!.run).toMatchObject({ title: "Check catalog conflicts", turnCount: 1 });
+      const direct = nested.details!.savedConversations!.items[0]!;
+      expect(result.details!.savedConversations!.items[1]).toEqual({ ...direct, parentId: result.details!.run.episodeId });
+      expect(direct).toMatchObject({ title: "Check catalog conflicts", stats: { turns: 1, contextPercent: nested.details!.run.contextUsage?.percent ?? null } });
+      expect(result.details!.run.children[0]?.title).toBe("Check catalog conflicts");
+      expect(result.content).toEqual([{ type: "text", text: expect.stringContaining("Task: Review catalog records\nRan 2 turns at ") }]);
+      expect(fixture.events.at(-1)?.result.details).toEqual(result.details);
+    } finally {
+      fixture.parent.dispose();
+    }
+  });
+
   it.each([
     ["fresh", "failed"], ["fresh", "aborted"], ["resume", "failed"], ["resume", "aborted"],
   ] as const)("persists registered %s %s terminal details through real parent tool execution", async (mode, outcome) => {
@@ -216,14 +250,14 @@ describe("Pi SDK integration seam", () => {
       : answer]);
     try {
       if (mode === "resume") {
-        scriptSession(fixture.parent, [() => toolRequest("subagent", { task: "Save the first turn." }), () => answer]);
+        scriptSession(fixture.parent, [() => toolRequest("subagent", { task: "Save the first turn.", title: "Save the first turn" }), () => answer]);
         await fixture.parent.prompt("Create the child.");
         failChild = true;
       }
       const first = toolMessages(fixture.parentManager)[0];
       if (outcome === "aborted") fixture.abortOnChildResponse();
       const name = mode === "resume" ? "subagent_resume" : "subagent";
-      const args = mode === "resume" ? { sessionId: first!.details!.run.sessionId, message: "Continue the child." } : { task: "Fail the child." };
+      const args = mode === "resume" ? { sessionId: first!.details!.run.sessionId, message: "Continue the child.", title: "Continue the child" } : { task: "Fail the child.", title: "Fail the child" };
       scriptSession(fixture.parent, [() => toolRequest(name, args, "terminal-call"), () => answer]);
       await fixture.parent.prompt("Run the failing tool.");
       const message = toolMessages(SessionManager.open(fixture.parentManager.getSessionFile()!)).at(-1)!;
@@ -246,7 +280,11 @@ describe("Pi SDK integration seam", () => {
       expect(fixture.events.at(-1)?.isError).toBe(true);
       expect(fixture.events.at(-1)?.result.details).toEqual(message.details);
       expect(fixture.events.at(-1)?.result.content).toEqual(message.content);
-      if (first) expect(message.details?.savedConversations).toEqual(first.details?.savedConversations);
+      if (first) {
+        expect(message.details?.savedConversations?.items[0]?.save).toEqual(first.details?.savedConversations?.items[0]?.save);
+        expect(message.details?.savedConversations?.items[0]).toMatchObject({ kind: "resume", sessionId: first.details!.run.sessionId });
+        expect(message.details!.run.episodeId).not.toBe(first.details!.run.episodeId);
+      }
       await fixture.exportResults();
     } finally {
       fixture.parent.dispose();
@@ -262,7 +300,7 @@ describe("Pi SDK integration seam", () => {
     try {
       let sessionId: string | undefined;
       if (mode === "resume") {
-        scriptSession(fixture.parent, [() => toolRequest("subagent", { task: "Save the child." }), () => answer]);
+        scriptSession(fixture.parent, [() => toolRequest("subagent", { task: "Save the child.", title: "Save the child" }), () => answer]);
         await fixture.parent.prompt("Create a standalone child.");
         const first = toolMessages(fixture.parentManager)[0]!;
         expect(first.isError).toBe(false);
@@ -270,8 +308,8 @@ describe("Pi SDK integration seam", () => {
         failChild = true;
       }
       scriptSession(fixture.parent, [() => sessionId
-        ? toolRequest("subagent_resume", { sessionId, message: "Fail the follow-up." })
-        : toolRequest("subagent", { task: "Fail the child." }), () => answer]);
+        ? toolRequest("subagent_resume", { sessionId, message: "Fail the follow-up.", title: "Fail the follow-up" })
+        : toolRequest("subagent", { task: "Fail the child.", title: "Fail the child" }), () => answer]);
       await fixture.parent.prompt("Run the standalone failure.");
       const message = toolMessages(SessionManager.open(fixture.parent.sessionFile!)).at(-1)!;
       expect(message).toMatchObject({ isError: true, details: { run: { status: "failed" } } });
@@ -295,7 +333,7 @@ describe("Pi SDK integration seam", () => {
     const fixture = await scriptedRegisteredFixture("early-failed", () => { throw new Error("early SDK allocation failure"); });
     try {
       const answer = syntheticAssistant(getModel("anthropic", "claude-opus-4-5"));
-      scriptSession(fixture.parent, [() => toolRequest("subagent", { task: "Fail before creating the SDK session." }), () => answer]);
+      scriptSession(fixture.parent, [() => toolRequest("subagent", { task: "Fail before creating the SDK session.", title: "Fail before session creation" }), () => answer]);
       await fixture.parent.prompt("Run the early failing tool.");
       const message = toolMessages(SessionManager.open(fixture.parentManager.getSessionFile()!))[0]!;
       expect(message.isError).toBe(true);
@@ -312,25 +350,76 @@ describe("Pi SDK integration seam", () => {
     }
   });
 
-  it("follows immediate-child links through real nested failed and resumed tool results, including a renamed parent tool", async () => {
+  it("keeps valid siblings without a phantom child after a real SDK preflight error with empty details", async () => {
+    const answer = syntheticAssistant(getModel("anthropic", "claude-opus-4-5"));
+    let created = 0;
+    const fixture = await scriptedRegisteredFixture("nested-preflight", () => ++created === 1 ? [
+      () => toolRequest("subagent", { task: "Save a valid sibling.", title: "Save a valid sibling" }),
+      () => toolRequest("subagent", { agent: "missing-agent", task: "Fail preflight.", title: "Fail preflight" }),
+      () => answer,
+    ] : [() => answer]);
+    try {
+      scriptSession(fixture.parent, [() => toolRequest("subagent", { task: "Create a child with a valid and an invalid nested call.", title: "Create one valid and invalid child" }), () => answer]);
+      await fixture.parent.prompt("Run nested calls including a preflight failure.");
+      expect(fixture.observedChildren).toHaveLength(2);
+      const parentResult = toolMessages(SessionManager.open(fixture.parentManager.getSessionFile()!))[0]!;
+      expect(parentResult.isError).toBe(false);
+      const nestedResults = toolMessages(SessionManager.open(fixture.observedChildren[0]!.sessionFile!));
+      expect(nestedResults).toHaveLength(2);
+      expect(nestedResults[0]).toMatchObject({ isError: false, details: { run: { status: "completed" } } });
+      expect(nestedResults[1]).toMatchObject({ isError: true, details: {} });
+      expect(nestedResults[1]!.details).toEqual({});
+      expect(nestedResults[1]!.content).toEqual([{ type: "text", text: expect.stringContaining("missing-agent") }]);
+      expect(nestedResults.map((result) => result.toolCallId)).toEqual(["scripted-call", "scripted-call"]);
+      const declaration = parentResult.details!.savedConversations!;
+      const sibling = nestedResults[0]!.details!;
+      expect(declaration.coverage).toBe("partial");
+      expect(declaration.items).toHaveLength(2);
+      expect(declaration.items.map((item) => [item.id, item.parentId, item.sessionId])).toEqual([
+        [parentResult.details!.run.episodeId, null, parentResult.details!.run.sessionId],
+        [sibling.run.episodeId, parentResult.details!.run.episodeId, sibling.run.sessionId],
+      ]);
+      expect(parentResult.details!.run.children.map((child) => child.episodeId)).toEqual([sibling.run.episodeId]);
+      for (const item of declaration.items) {
+        expect(item.save).toMatchObject({ kind: "pi-v3", readiness: "checked" });
+        if (item.save.kind !== "pi-v3") throw new Error("Unavailable saved conversation");
+        const header = JSON.parse((await readFile(path.join(declaration.root, item.save.file), "utf8")).split("\n")[0]!);
+        expect(header).toMatchObject({ type: "session", version: 3, id: item.sessionId });
+      }
+      expect(fixture.events.at(-1)!.result.details).toEqual(parentResult.details);
+      await fixture.exportResults();
+    } finally {
+      fixture.parent.dispose();
+    }
+  });
+
+  it("publishes a recursive occurrence ledger through three levels, failed and repeated resumes, and duplicate agent labels", async () => {
     const answer = syntheticAssistant(getModel("anthropic", "claude-opus-4-5"));
     let created = 0;
     const fixture = await scriptedRegisteredFixture("nested", () => {
       created += 1;
-      if (created === 1) return [() => toolRequest("subagent", { task: "Create B." }), () => answer];
+      if (created === 1) return [() => toolRequest("subagent", { agent: "worker", task: "Create B.", title: "Create B" }), () => answer];
+      const resumeC = (messages: AgentSession["messages"]) => {
+        const result = [...messages].reverse().find((message) => message.role === "toolResult") as unknown as SavedToolMessage;
+        return toolRequest("subagent_resume", { sessionId: result.details!.run.sessionId, message: "Continue C.", title: "Continue C" }, `resume-C-${created}`);
+      };
       if (created === 2) return [
-        () => toolRequest("subagent", { task: "Create C and fail." }),
-        (messages) => {
-          const result = [...messages].reverse().find((message) => message.role === "toolResult") as unknown as SavedToolMessage;
-          return toolRequest("subagent_resume", { sessionId: result.details!.run.sessionId, message: "Recover C." }, "resume-C");
-        },
+        () => toolRequest("subagent", { agent: "scout", task: "Create C and fail.", title: "Create C and fail" }),
+        resumeC,
+        resumeC,
+        () => toolRequest("subagent", { agent: "scout", task: "Create a different chat with the same label.", title: "Create same-label chat" }, "second-scout"),
         () => answer,
       ];
       if (created === 3) return [() => ({ ...answer, content: [], stopReason: "error", errorMessage: "nested scripted failure" })];
       return [() => answer];
     }, true);
     try {
-      scriptSession(fixture.parent, [() => toolRequest("delegate_work", { task: "Create A." }), () => answer]);
+      const agentsDir = path.join(fixture.root, "project", ".pi", "agents");
+      await mkdir(agentsDir, { recursive: true });
+      for (const name of ["coordinator", "worker", "scout"]) {
+        await writeFile(path.join(agentsDir, `${name}.md`), `---\ndescription: ${name}\n---\nDo the assigned work.\n`);
+      }
+      scriptSession(fixture.parent, [() => toolRequest("delegate_work", { agent: "coordinator", task: "Create A.", title: "Create A" }), () => answer]);
       await fixture.parent.prompt("Run a nested delegation.");
       const parentResult = toolMessages(SessionManager.open(fixture.parentManager.getSessionFile()!))[0]!;
       expect(parentResult.details, JSON.stringify(parentResult)).toHaveProperty("run");
@@ -344,15 +433,33 @@ describe("Pi SDK integration seam", () => {
       expect(aResult.isError).toBe(false);
       const b = await expectExactSave(aResult.details!);
       const bResults = toolMessages(b.manager);
-      expect(bResults).toHaveLength(2);
-      expect(bResults.map((message) => message.isError)).toEqual([true, false]);
+      expect(bResults).toHaveLength(4);
+      expect(bResults.map((message) => message.isError)).toEqual([true, false, false, false]);
       expect(bResults[0]?.details?.run.status).toBe("failed");
       expect(bResults[1]?.details?.run.status).toBe("completed");
-      expect(bResults[0]?.details?.savedConversations).toEqual(bResults[1]?.details?.savedConversations);
+      expect(bResults[0]?.details?.savedConversations?.items[0]?.save).toEqual(bResults[1]?.details?.savedConversations?.items[0]?.save);
       const c = await expectExactSave(bResults[0]!.details!);
       expect([a.file, b.file, c.file]).toEqual(fixture.observedChildren.slice(0, 3).map((session) => session.sessionFile));
       expect(fixture.observedChildren[3]?.sessionFile).toBe(c.file);
-      await writeFile(path.join(parentResult.details!.savedConversations!.root, "manifest.jsonl"), "poisoned after emission\n");
+      expect(fixture.observedChildren[4]?.sessionFile).toBe(c.file);
+      const rootRun = parentResult.details!.run;
+      const bRun = aResult.details!.run;
+      const [startC, resumeC, resumeCAgain, secondScout] = bResults.map((result) => result.details!.run);
+      const ledger = parentResult.details!.savedConversations!;
+      expect(ledger.coverage).toBe("complete");
+      expect(ledger.items.map(({ id, parentId, kind, sessionId, label }) => ({ id, parentId, kind, sessionId, label }))).toEqual([
+        { id: rootRun.episodeId, parentId: null, kind: "start", sessionId: rootRun.sessionId, label: "coordinator" },
+        { id: bRun.episodeId, parentId: rootRun.episodeId, kind: "start", sessionId: bRun.sessionId, label: "worker" },
+        { id: startC!.episodeId, parentId: bRun.episodeId, kind: "start", sessionId: startC!.sessionId, label: "scout" },
+        { id: resumeC!.episodeId, parentId: bRun.episodeId, kind: "resume", sessionId: startC!.sessionId, label: "scout" },
+        { id: resumeCAgain!.episodeId, parentId: bRun.episodeId, kind: "resume", sessionId: startC!.sessionId, label: "scout" },
+        { id: secondScout!.episodeId, parentId: bRun.episodeId, kind: "start", sessionId: secondScout!.sessionId, label: "scout" },
+      ]);
+      expect(new Set(ledger.items.map((item) => item.id)).size).toBe(6);
+      expect(new Set(ledger.items.map((item) => item.sessionId)).size).toBe(4);
+      expect(startC!.sessionId).not.toBe(secondScout!.sessionId);
+      expect(rootRun.children[0]?.children.map((child) => child.status)).toEqual(["failed", "completed", "completed", "completed"]);
+      await writeFile(path.join(ledger.root, "manifest.jsonl"), "poisoned after emission\n");
       for (const result of [parentResult, aResult, ...bResults]) await expectExactSave(result.details!);
       await fixture.exportResults();
     } finally {
@@ -621,7 +728,7 @@ export default function(pi) {
     { context: "fresh", agent: "reviewer" }, { context: "fork", agent: "reviewer" },
   ] as const)("executes and records current parent model/effort for $context (agent: $agent), then resumes those child choices", async ({ context, agent }) => {
     const { agentDir, ctx, deps, model, historicalModel, observed } = await runnerSdkFixture();
-    const result = await runSubagent({ task: "Synthetic child task.", context, ...(agent === undefined ? {} : { agent }) }, undefined, undefined, ctx, { deps });
+    const result = await runSubagent({ title: "Test task", task: "Synthetic child task.", context, ...(agent === undefined ? {} : { agent }) }, undefined, undefined, ctx, { deps });
     expect(observed[0]).toMatchObject({ model, thinkingLevel: "high", messageCount: context === "fork" ? 2 : 0 });
     const child = observed[0]?.session;
     if (!child?.sessionFile) throw new Error("Expected persisted SDK child");
@@ -631,9 +738,11 @@ export default function(pi) {
     });
 
     await writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ defaultThinkingLevel: "low" }), "utf8");
-    const resumed = await runSubagentResume({ sessionId: result.details.run.sessionId, message: "Synthetic follow-up." }, undefined, undefined,
+    const resumed = await runSubagentResume({ title: "Test task", sessionId: result.details.run.sessionId, message: "Synthetic follow-up." }, undefined, undefined,
       { ...ctx, model: historicalModel, thinkingLevel: "off" }, { deps });
-    expect(resumed.details.savedConversations).toEqual(result.details.savedConversations);
+    expect(resumed.details.savedConversations?.items[0]?.save).toEqual(result.details.savedConversations?.items[0]?.save);
+    expect(resumed.details.savedConversations?.items[0]).toMatchObject({ id: resumed.details.run.episodeId, kind: "resume", parentId: null, sessionId: result.details.run.sessionId });
+    expect(resumed.details.run.episodeId).not.toBe(result.details.run.episodeId);
     expect(observed[1]).toMatchObject({ model, thinkingLevel: "high", messageCount: context === "fork" ? 4 : 2 });
     expect(observed[1]?.session.sessionFile).toBe(child.sessionFile);
     expect(SessionManager.open(child.sessionFile).buildSessionContext()).toMatchObject({
@@ -647,7 +756,7 @@ export default function(pi) {
     if (source === "profile") {
       await writeFile(path.join(ctx.cwd, ".pi", "agents", "reviewer.md"), `---\ndescription: Reviews\nmodel: ${chain}\n---\n\nReview the task.\n`, "utf8");
     }
-    await runSubagent({ task: "Use the explicit fork model and effort.", context: "fork", ...(source === "call" ? { model: chain } : { agent: "reviewer" }) },
+    await runSubagent({ title: "Test task", task: "Use the explicit fork model and effort.", context: "fork", ...(source === "call" ? { model: chain } : { agent: "reviewer" }) },
       undefined, undefined, { ...ctx, thinkingLevel: "low" }, { deps });
     expect(observed[0]).toMatchObject({ model, thinkingLevel: "high", messageCount: 2 });
     const child = observed[0]?.session;
@@ -664,7 +773,7 @@ export default function(pi) {
       if (interrupt) controller.abort();
       else appendSyntheticTurn(session, text);
     });
-    const interrupted = await runSubagent({ task: "Interrupt before recording a message.", ...(selection === "explicit" ? { model: `${model.provider}/${model.id}@high` } : {}) },
+    const interrupted = await runSubagent({ title: "Test task", task: "Interrupt before recording a message.", ...(selection === "explicit" ? { model: `${model.provider}/${model.id}@high` } : {}) },
       controller.signal, undefined, { ...ctx, thinkingLevel: selection === "explicit" ? "low" : "high" }, { deps });
     expect(interrupted).toMatchObject({ isError: true, details: { run: { status: "aborted" } } });
     expect(interrupted.content[0]?.text).toContain("Subagent interrupted");
@@ -679,7 +788,7 @@ export default function(pi) {
 
     interrupt = false;
     await writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ defaultThinkingLevel: "low" }), "utf8");
-    await runSubagentResume({ sessionId: child.sessionId, message: "Recover the interrupted task." }, undefined, undefined,
+    await runSubagentResume({ title: "Test task", sessionId: child.sessionId, message: "Recover the interrupted task." }, undefined, undefined,
       { ...ctx, model: historicalModel, thinkingLevel: "off" }, { deps });
     expect(observed[1]).toMatchObject({ model, thinkingLevel: "high", messageCount: 0 });
     expect(observed[1]?.session.sessionFile).toBe(child.sessionFile);

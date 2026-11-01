@@ -1,5 +1,6 @@
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { SUBAGENT_RESUME_TOOL_NAME, SUBAGENT_TOOL_NAME, type SubagentContextUsage, type SubagentRunView } from "./types.js";
+import { replaceSavedConversationSource, startSavedConversationSource, type SavedConversationCollection } from "./saved-conversations.js";
 
 const MAX_TOOL_ARGS_LENGTH = 160;
 
@@ -12,6 +13,7 @@ interface ActiveTool {
 export interface SubagentActivityState {
   run: SubagentRunView;
   activeTools: Map<string, ActiveTool>;
+  savedConversations?: SavedConversationCollection;
 }
 
 export interface ActivityReduction {
@@ -23,12 +25,14 @@ export function createInitialRunView(input: {
   episodeId: string;
   sessionId: string;
   agent: string;
+  title: string;
   now: string;
 }): SubagentRunView {
   return {
     episodeId: input.episodeId,
     sessionId: input.sessionId,
     agent: input.agent,
+    title: input.title,
     status: "running",
     turnCount: 0,
     lastActivityAt: input.now,
@@ -37,8 +41,8 @@ export function createInitialRunView(input: {
   };
 }
 
-export function createActivityState(run: SubagentRunView): SubagentActivityState {
-  return { run, activeTools: new Map() };
+export function createActivityState(run: SubagentRunView, savedConversations?: SavedConversationCollection): SubagentActivityState {
+  return { run, activeTools: new Map(), ...(savedConversations === undefined ? {} : { savedConversations }) };
 }
 
 export function reduceActivityEvent(state: SubagentActivityState, event: AgentSessionEvent, now: string): ActivityReduction {
@@ -57,6 +61,9 @@ export function reduceActivityEvent(state: SubagentActivityState, event: AgentSe
     case "message_end":
       return setActivity(state, state.activeTools.size > 0 ? summarizeActiveTools(state.activeTools) : messageEndActivity(event.message));
     case "tool_execution_start":
+      if (state.savedConversations && isSubagentActivityTool(event.toolName)) {
+        startSavedConversationSource(state.savedConversations, event.toolCallId);
+      }
       state.activeTools.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, argsSummary: compactToolArgs(event.args) });
       return setActivity(state, summarizeActiveTools(state.activeTools), { forceChanged: true });
     case "tool_execution_update": {
@@ -67,13 +74,18 @@ export function reduceActivityEvent(state: SubagentActivityState, event: AgentSe
         state.activeTools.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, argsSummary: compactToolArgs(event.args) });
       }
 
+      const nestedSave = isSubagentActivityTool(event.toolName) ? state.savedConversations : undefined;
+      const savedChanged = nestedSave ? replaceSavedConversationSource(nestedSave, event.toolCallId, event.partialResult, false) : false;
       const nestedRun = isSubagentActivityTool(event.toolName) ? extractRunView(event.partialResult) : undefined;
       if (nestedRun) return reduceNestedRunUpdate(state, nestedRun);
 
-      return setActivity(state, summarizeActiveTools(state.activeTools));
+      return setActivity(state, summarizeActiveTools(state.activeTools), { forceChanged: savedChanged });
     }
     case "tool_execution_end": {
       state.activeTools.delete(event.toolCallId);
+      if (state.savedConversations && isSubagentActivityTool(event.toolName)) {
+        replaceSavedConversationSource(state.savedConversations, event.toolCallId, event.result, true);
+      }
       const nestedRun = isSubagentActivityTool(event.toolName) ? extractRunView(event.result) : undefined;
       if (nestedRun) return reduceNestedRunUpdate(state, nestedRun);
       if (isSubagentActivityTool(event.toolName) && event.isError) return summarizeThrownNestedToolEnd(state);
@@ -177,6 +189,7 @@ function isRunView(value: unknown): value is SubagentRunView {
   return typeof value.episodeId === "string"
     && typeof value.sessionId === "string"
     && typeof value.agent === "string"
+    && typeof value.title === "string"
     && (value.status === "running" || value.status === "completed" || value.status === "failed" || value.status === "aborted")
     && typeof value.turnCount === "number"
     && typeof value.lastActivityAt === "string"

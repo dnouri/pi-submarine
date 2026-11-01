@@ -11,6 +11,7 @@ export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhig
 export interface SubagentParams {
   agent?: string;
   task: string;
+  title: string;
   model?: string;
   agentsMd?: AgentResourceMode;
   context?: SubagentContextMode;
@@ -20,6 +21,7 @@ export interface SubagentParams {
 export interface SubagentResumeParams {
   sessionId: string;
   message: string;
+  title: string;
 }
 
 export interface SubagentListParams {
@@ -64,6 +66,7 @@ export interface SubagentRunView {
   episodeId: string;
   sessionId: string;
   agent: string;
+  title: string;
   status: SubagentRunStatus;
   turnCount: number;
   lastActivityAt: string;
@@ -72,13 +75,31 @@ export interface SubagentRunView {
   children: SubagentRunView[];
 }
 
+export type SavedConversationSave =
+  | { kind: "pi-v3"; file: string; readiness: "planned" | "checked" }
+  | { kind: "unavailable"; reason: string };
+
+export interface SavedConversationOccurrence {
+  id: string;
+  parentId: string | null;
+  kind: "start" | "resume" | "unknown";
+  sessionId: string;
+  label?: string;
+  title?: string;
+  stats?: { turns: number; contextPercent: number | null };
+  save: SavedConversationSave;
+}
+
+export interface SavedConversations {
+  version: 2;
+  root: string;
+  coverage: "observed" | "complete" | "partial";
+  items: SavedConversationOccurrence[];
+}
+
 export interface SubagentToolDetails {
   run: SubagentRunView;
-  savedConversations?: {
-    version: 1;
-    root: string;
-    items: [{ sessionId: string; file: string; label?: string }];
-  };
+  savedConversations?: SavedConversations;
 }
 
 export interface ManifestStartedRecord {

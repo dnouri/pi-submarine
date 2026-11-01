@@ -20,7 +20,7 @@ describe("package metadata", () => {
     expect(packageJson.author).toBe("Daniel Nouri");
     expect(packageJson.repository).toEqual({
       type: "git",
-      url: "https://github.com/dnouri/pi-submarine",
+      url: "git+https://github.com/dnouri/pi-submarine.git",
     });
     expect(packageJson.homepage).toBe("https://github.com/dnouri/pi-submarine#readme");
     expect(packageJson.bugs).toEqual({ url: "https://github.com/dnouri/pi-submarine/issues" });

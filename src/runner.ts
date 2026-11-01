@@ -17,10 +17,11 @@ import {
   type Skill,
 } from "@earendil-works/pi-coding-agent";
 import { MissingMarkdownAgentError, resolveMarkdownAgent } from "./agents.js";
-import { cloneRunView, createActivityState, createInitialRunView, reduceActivityEvent } from "./activity.js";
+import { cloneRunView, createActivityState, createInitialRunView, reduceActivityEvent, type SubagentActivityState } from "./activity.js";
+import { createSavedConversationCollection, safeReferenceText, savedConversationSnapshot, type SavedConversationCollection } from "./saved-conversations.js";
 import { appendManifestRecord, findParentEpisodeId, readManifestRecords, requireUniqueStartedRecordBySessionId, type DegradedAppendOptions, type EpisodeStartedManifestRecord, type StartedManifestRecord } from "./manifest.js";
 import { parseModelChain, resolveRecordedSubagentModel, resolveSubagentModel, resolveSubagentThinkingLevel, type ModelCandidate } from "./models.js";
-import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult } from "./render.js";
+import { errorHeading, namedAgentSelection, omittedAgentSelection, renderSubagentInterrupted, renderSubagentProgress, renderSubagentRecoverableError, renderSubagentResult, requiredRunTitle } from "./render.js";
 import { assertDirectoryExists, manifestPathForSubagentsRoot, resolveFreshCwd, resolveSubagentsRoot, type SubagentsRoot } from "./sessions.js";
 import { buildSubagentPromptEnvelope } from "./tool-prompts.js";
 import { DEFAULT_AGENT_ALIAS, OMITTED_AGENT_LABEL, type AgentResourceMode, type AgentSelection, type MarkdownAgent, type SubagentContextMode, type SubagentContextUsage, type SubagentParams, type SubagentResumeParams, type SubagentToolDetails, type TextToolResult } from "./types.js";
@@ -109,7 +110,10 @@ interface OwnedSave {
   file: string;
   sessionId: string;
   cwd: string;
-  label?: string;
+}
+
+interface ResultActivityState extends SubagentActivityState {
+  savedConversations: SavedConversationCollection;
 }
 
 interface StartedRun {
@@ -120,6 +124,7 @@ interface StartedRun {
 }
 
 const MAX_SUBAGENT_DEPTH = 4;
+const HEARTBEAT_INTERVAL_MS = 15_000;
 const PARENT_ABORT_ERROR = "Interrupted by parent abort.";
 const runtimeEpisodeBySessionFile = new Map<string, string>();
 const runtimeSessionFileByEpisode = new Map<string, string>();
@@ -242,26 +247,32 @@ export async function runSubagent(
   options: RunnerOptions = {},
 ): Promise<TextToolResult<SubagentToolDetails>> {
   const deps = { ...productionRunnerDependencies, ...options.deps };
+  const emit = (details: SubagentToolDetails) => emitUpdate(onUpdate, details, Date.parse(deps.now()));
   const requestedSelection = params.agent === undefined ? omittedAgentSelection() : namedAgentSelection(params.agent.trim() || params.agent);
   let plan: RunPlan | undefined;
   let run: SubagentToolDetails["run"] | undefined;
   let startedRun: StartedRun | undefined;
+  let activityState: ResultActivityState | undefined;
   let childSession: ChildAgentSession | undefined;
   let childExtensionsStarted = false;
   let unsubscribe: (() => void) | undefined;
   let detachAbortHandler: (() => void) | undefined;
   let reservedChildSessionFile: string | undefined;
+  let stopHeartbeat: (() => void) | undefined;
 
   try {
+    const title = requiredRunTitle(params.title);
     plan = await prepareRun(params, signal, ctx, deps, options);
     throwIfAborted(signal, "Subagent run was aborted before child execution.");
 
-    startedRun = createStartedRun(plan, deps);
+    startedRun = createStartedRun(plan, title, deps);
     run = startedRun.run;
+    activityState = createResultState(run, plan.root.subagentsDir, "start", startedRun.ownedSave);
     reservedChildSessionFile = reserveActiveChildSession(startedRun.childSessionFile, run.sessionId);
     await startRunArtifacts(plan, startedRun, deps);
     throwIfInterrupted(signal);
-    emitUpdate(onUpdate, toolDetails(run, startedRun.ownedSave));
+    emit(toolDetails(activityState));
+    stopHeartbeat = startHeartbeat(activityState, () => childSession, emit, signal);
 
     const created = await createChildSession(plan, startedRun.childSessionManager, deps);
     childSession = created.session;
@@ -271,16 +282,16 @@ export async function runSubagent(
     let activeChildSession = childSession;
     let abortState = attachAbortHandler(signal, activeChildSession);
     detachAbortHandler = abortState.detach;
-    const activityState = createActivityState(run);
+    const activeState = activityState;
     let toolProgress = false;
     const subscribe = (session: ChildAgentSession) => session.subscribe((event) => {
       if (event.type === "tool_execution_start" || event.type === "tool_execution_end"
         || (event.type === "turn_end" && event.toolResults.length > 0)
         || (event.type === "message_end" && event.message.role === "toolResult")) toolProgress = true;
-      const reduction = reduceActivityEvent(activityState, event, deps.now());
+      const reduction = reduceActivityEvent(activeState, event, deps.now());
       if (reduction.changed) {
-        refreshContextUsage(activityState.run, session);
-        emitUpdate(onUpdate, toolDetails(activityState.run, startedRun?.ownedSave));
+        refreshContextUsage(activeState.run, session);
+        emit(toolDetails(activeState));
       }
     });
     unsubscribe = subscribe(activeChildSession);
@@ -329,18 +340,20 @@ export async function runSubagent(
         unsubscribe = subscribe(activeChildSession);
       }
     }
+    stopHeartbeat();
     refreshContextUsage(run, activeChildSession);
     await finishRun(plan.manifestPath, run, "completed", deps.now(), deps);
-    const details = await bestEffortTerminalDetails(run, startedRun.ownedSave);
-    emitUpdate(onUpdate, details);
+    const details = await bestEffortTerminalDetails(activityState, startedRun.ownedSave);
+    emit(details);
     forgetRuntimeEpisode(startedRun.run.episodeId);
 
     return {
-      content: [{ type: "text", text: renderSubagentResult(plan.profile.selection, run.sessionId, answer,
+      content: [{ type: "text", text: renderSubagentResult(plan.profile.selection, run, answer,
         formatModelNote(attemptModel(plan, failedAttempts.length), failedAttempts)) }],
       details,
     };
   } catch (error: unknown) {
+    stopHeartbeat?.();
     const message = error instanceof Error ? error.message : String(error);
     const interrupted = isSubagentInterruptedError(error);
     if (run && childSession) refreshContextUsage(run, childSession);
@@ -350,9 +363,9 @@ export async function runSubagent(
       await finishRun(plan.manifestPath, startedRun.run, interrupted ? "aborted" : "failed", deps.now(), deps,
         interrupted ? PARENT_ABORT_ERROR : message);
     }
-    if (run) {
-      const details = await bestEffortTerminalDetails(run, startedRun?.ownedSave);
-      emitUpdate(onUpdate, details);
+    if (run && activityState) {
+      const details = await bestEffortTerminalDetails(activityState, startedRun?.ownedSave);
+      emit(details);
       forgetRuntimeEpisode(run.episodeId);
       const selection = agentSelectionFromRun(run, plan?.profile.selection ?? requestedSelection);
       return {
@@ -365,6 +378,7 @@ export async function runSubagent(
     }
     throw new Error(`${errorHeading(plan?.profile.selection ?? requestedSelection)}\n\n${message}`, { cause: error });
   } finally {
+    stopHeartbeat?.();
     runCleanup("remove subagent abort listener", detachAbortHandler);
     runCleanup("unsubscribe subagent activity listener", unsubscribe);
     await closeChildSession(childSession, childExtensionsStarted, "subagent");
@@ -380,16 +394,20 @@ export async function runSubagentResume(
   options: RunnerOptions = {},
 ): Promise<TextToolResult<SubagentToolDetails>> {
   const deps = { ...productionRunnerDependencies, ...options.deps };
+  const emit = (details: SubagentToolDetails) => emitUpdate(onUpdate, details, Date.parse(deps.now()));
   let plan: ResumeRunPlan | undefined;
   let run: SubagentToolDetails["run"] | undefined;
   let ownedSave: OwnedSave | undefined;
+  let activityState: ResultActivityState | undefined;
   let childSession: ChildAgentSession | undefined;
   let childExtensionsStarted = false;
   let unsubscribe: (() => void) | undefined;
   let detachAbortHandler: (() => void) | undefined;
   let reservedChildSessionFile: string | undefined;
+  let stopHeartbeat: (() => void) | undefined;
 
   try {
+    const title = requiredRunTitle(params.title);
     plan = await prepareResumeRun(params, signal, ctx, deps, options.extensionFactories, (sessionFile, sessionId) => {
       reservedChildSessionFile = reserveActiveChildSession(sessionFile, sessionId);
     });
@@ -398,9 +416,11 @@ export async function runSubagentResume(
       episodeId: deps.createEpisodeId(),
       sessionId: plan.startedRecord.sessionId,
       agent: plan.startedRecord.agent,
+      title,
       now: startedAt,
     });
-    ownedSave = captureOwnedSave(plan.root.subagentsDir, plan.childSessionManager, plan.profile.agentName);
+    ownedSave = captureOwnedSave(plan.root.subagentsDir, plan.childSessionManager);
+    activityState = createResultState(run, plan.root.subagentsDir, "resume", ownedSave);
     await appendManifestRecord(plan.manifestPath, {
       type: "resume_started",
       episodeId: run.episodeId,
@@ -414,7 +434,8 @@ export async function runSubagentResume(
       startedAt,
     }, deps.artifactOptions?.manifest);
     rememberRuntimeEpisode(plan.childSessionFile, run.episodeId, plan.parentDepth + 1);
-    emitUpdate(onUpdate, toolDetails(run, ownedSave));
+    emit(toolDetails(activityState));
+    stopHeartbeat = startHeartbeat(activityState, () => childSession, emit, signal);
     throwIfInterrupted(signal);
 
     const created = await createChildSession(plan, plan.childSessionManager, deps);
@@ -425,35 +446,37 @@ export async function runSubagentResume(
     const activeChildSession = childSession;
     const abortState = attachAbortHandler(signal, activeChildSession);
     detachAbortHandler = abortState.detach;
-    const activityState = createActivityState(run);
+    const activeState = activityState;
     unsubscribe = activeChildSession.subscribe((event) => {
-      const reduction = reduceActivityEvent(activityState, event, deps.now());
+      const reduction = reduceActivityEvent(activeState, event, deps.now());
       if (reduction.changed) {
-        refreshContextUsage(activityState.run, activeChildSession);
-        emitUpdate(onUpdate, toolDetails(activityState.run, ownedSave));
+        refreshContextUsage(activeState.run, activeChildSession);
+        emit(toolDetails(activeState));
       }
     });
 
     const answer = await promptChildAndExtractAnswer(activeChildSession, plan.childSessionManager, plan.userPrompt, abortState);
+    stopHeartbeat();
     refreshContextUsage(run, activeChildSession);
     await finishResumeRun(plan.manifestPath, run, "completed", deps.now(), deps);
-    const details = await bestEffortTerminalDetails(run, ownedSave);
-    emitUpdate(onUpdate, details);
+    const details = await bestEffortTerminalDetails(activityState, ownedSave);
+    emit(details);
 
     return {
-      content: [{ type: "text", text: renderSubagentResult(plan.profile.selection, run.sessionId, answer) }],
+      content: [{ type: "text", text: renderSubagentResult(plan.profile.selection, run, answer) }],
       details,
     };
   } catch (error: unknown) {
+    stopHeartbeat?.();
     const message = error instanceof Error ? error.message : String(error);
     const interrupted = isSubagentInterruptedError(error);
     if (run && childSession) refreshContextUsage(run, childSession);
     if (plan) await materializeChildSessionFile(plan.childSessionManager);
-    if (run && plan) {
+    if (run && plan && activityState) {
       await finishResumeRun(plan.manifestPath, run, interrupted ? "aborted" : "failed", deps.now(), deps,
         interrupted ? PARENT_ABORT_ERROR : message);
-      const details = await bestEffortTerminalDetails(run, ownedSave);
-      emitUpdate(onUpdate, details);
+      const details = await bestEffortTerminalDetails(activityState, ownedSave);
+      emit(details);
       return {
         content: [{ type: "text", text: interrupted
           ? renderSubagentInterrupted(plan.profile.selection, run.sessionId)
@@ -465,6 +488,7 @@ export async function runSubagentResume(
     const heading = plan ? errorHeading(plan.profile.selection) : "## Subagent resume error";
     throw new Error(`${heading}\n\n${message}`, { cause: error });
   } finally {
+    stopHeartbeat?.();
     if (run) forgetRuntimeEpisode(run.episodeId);
     runCleanup("remove subagent resume abort listener", detachAbortHandler);
     runCleanup("unsubscribe subagent resume activity listener", unsubscribe);
@@ -837,7 +861,7 @@ async function resolveArtifactRoot(parentSessionFile: string): Promise<{ root: S
   return { root, manifestPath: manifestPathForSubagentsRoot(root.subagentsDir), parentDepth, records };
 }
 
-function createStartedRun(plan: RunPlan, deps: RunnerDependencies): StartedRun {
+function createStartedRun(plan: RunPlan, title: string, deps: RunnerDependencies): StartedRun {
   const episodeId = deps.createEpisodeId();
   const startedAt = deps.now();
   const childSessionManager = createChildSessionManager(plan, deps);
@@ -845,9 +869,9 @@ function createStartedRun(plan: RunPlan, deps: RunnerDependencies): StartedRun {
   if (!childSessionFile) throw new Error("Could not create a persisted child subagent session.");
   const sessionId = childSessionManager.getSessionId();
 
-  const run = createInitialRunView({ episodeId, sessionId, agent: plan.profile.agentName, now: startedAt });
+  const run = createInitialRunView({ episodeId, sessionId, agent: plan.profile.agentName, title, now: startedAt });
   return { run, childSessionManager, childSessionFile,
-    ownedSave: captureOwnedSave(plan.root.subagentsDir, childSessionManager, plan.profile.agentName) };
+    ownedSave: captureOwnedSave(plan.root.subagentsDir, childSessionManager) };
 }
 
 async function startRunArtifacts(plan: RunPlan, started: StartedRun, deps: RunnerDependencies): Promise<void> {
@@ -1216,16 +1240,12 @@ const productionRunnerDependencies: RunnerDependencies = {
   createAgentSession,
 };
 
-function safeReferenceText(value: string): boolean {
-  return value.length > 0 && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
-}
-
 function containedFile(root: string, file: string): boolean {
   const relative = path.relative(root, file);
   return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
-function captureOwnedSave(root: string, manager: SessionManager, label: string): OwnedSave | undefined {
+function captureOwnedSave(root: string, manager: SessionManager): OwnedSave | undefined {
   try {
     const header = manager.getHeader();
     const absoluteFile = manager.getSessionFile();
@@ -1237,24 +1257,33 @@ function captureOwnedSave(root: string, manager: SessionManager, label: string):
       || !containedFile(root, absoluteFile)) return undefined;
     const file = path.relative(root, absoluteFile).split(path.sep).join("/");
     if (file.startsWith("~") || file.includes("\\") || file.split("/").some((part) => part === "" || part === "." || part === "..")) return undefined;
-    return { root, absoluteFile, file, sessionId, cwd: header.cwd, ...(safeReferenceText(label) ? { label } : {}) };
+    return { root, absoluteFile, file, sessionId, cwd: header.cwd };
   } catch {
     return undefined;
   }
 }
 
-function toolDetails(run: SubagentToolDetails["run"], save: OwnedSave | undefined): SubagentToolDetails {
+function createResultState(run: SubagentToolDetails["run"], root: string, kind: "start" | "resume", save: OwnedSave | undefined): ResultActivityState {
+  const savedConversations = createSavedConversationCollection(root, {
+    id: run.episodeId,
+    parentId: null,
+    kind,
+    sessionId: run.sessionId,
+    ...(safeReferenceText(run.agent) ? { label: run.agent } : {}),
+    save: save ? { kind: "pi-v3", file: save.file, readiness: "planned" }
+      : { kind: "unavailable", reason: "Could not capture an exact Pi v3 save." },
+  });
+  return { ...createActivityState(run), savedConversations };
+}
+
+function toolDetails(state: ResultActivityState): SubagentToolDetails {
   return {
-    run: cloneRunView(run),
-    ...(save === undefined ? {} : { savedConversations: {
-      version: 1 as const,
-      root: save.root,
-      items: [{ sessionId: save.sessionId, file: save.file, ...(save.label === undefined ? {} : { label: save.label }) }],
-    } }),
+    run: cloneRunView(state.run),
+    savedConversations: savedConversationSnapshot(state.savedConversations, state.run.status !== "running", state.run),
   };
 }
 
-async function bestEffortTerminalDetails(run: SubagentToolDetails["run"], save: OwnedSave | undefined): Promise<SubagentToolDetails> {
+async function bestEffortTerminalDetails(state: ResultActivityState, save: OwnedSave | undefined): Promise<SubagentToolDetails> {
   let readable: OwnedSave | undefined;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
@@ -1279,14 +1308,38 @@ async function bestEffortTerminalDetails(run: SubagentToolDetails["run"], save: 
   } finally {
     await handle?.close().catch(() => undefined);
   }
-  return toolDetails(run, readable);
+  state.savedConversations.direct.save = readable
+    ? { kind: "pi-v3", file: readable.file, readiness: "checked" }
+    : { kind: "unavailable", reason: "The exact Pi v3 save could not be validated." };
+  return toolDetails(state);
 }
 
-function emitUpdate(onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined, details: SubagentToolDetails): void {
+function startHeartbeat(
+  state: ResultActivityState,
+  getSession: () => ChildAgentSession | undefined,
+  emit: (details: SubagentToolDetails) => void,
+  signal: AbortSignal | undefined,
+): () => void {
+  const interval = setInterval(() => {
+    if (state.run.status !== "running" || signal?.aborted) return;
+    const session = getSession();
+    if (session) refreshContextUsage(state.run, session);
+    emit(toolDetails(state));
+  }, HEARTBEAT_INTERVAL_MS);
+  const stop = () => {
+    clearInterval(interval);
+    signal?.removeEventListener("abort", stop);
+  };
+  signal?.addEventListener("abort", stop, { once: true });
+  if (signal?.aborted) stop();
+  return stop;
+}
+
+function emitUpdate(onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined, details: SubagentToolDetails, now: number): void {
   if (!onUpdate) return;
   try {
     onUpdate({
-      content: [{ type: "text", text: renderSubagentProgress(details.run) }],
+      content: [{ type: "text", text: renderSubagentProgress(details.run, now) }],
       details: structuredClone(details),
     });
   } catch (error: unknown) {
