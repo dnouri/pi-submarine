@@ -7,7 +7,7 @@ brings back their answers. The child's transcript stays out of the parent's
 context.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/dnouri/pi-submarine/0.6/media/pi-submarine.gif" alt="pi-submarine animation" width="480">
+  <img src="https://raw.githubusercontent.com/dnouri/pi-submarine/0.7/media/pi-submarine.gif" alt="pi-submarine animation" width="480">
 </p>
 
 ## Install
@@ -20,11 +20,11 @@ Requires Pi `1.3.0` or newer in the 1.x series. Both Pi peer dependency ranges
 are `^1.3.0`, and the tests run against SDK `1.3.0` only, so a later 1.x
 release is not covered.
 
-**Upgrading to 0.6.** Upgrade Pi to `1.3.0` or newer in the 1.x series.
-Children no longer inherit parent-only provider configuration. See
-[Child configuration](#child-configuration) to configure provider access.
-The Markdown activity log and the `activityLog` run detail are gone. Read the
-child session transcript instead.
+**Upgrading to 0.7.** Tool results now publish version 2 saved-conversation
+declarations with every descendant. Consumers that support only version 1
+must add version 2 support before upgrading. Older nested version 1
+declarations remain readable as degraded leaves. See
+[Saved-conversation references](#saved-conversation-references).
 
 ## Features
 
@@ -41,7 +41,8 @@ child session transcript instead.
   usage.
 - A depth limit for nested subagents, and parallel calls through
   `multi_tool_use.parallel`.
-- Saved-conversation references that let a viewer open a child transcript.
+- Recursive saved-conversation references that let a viewer open every
+  descendant transcript.
 - Child sessions that resume after a failure, an interruption, or an
   explicit user request to continue that exact child.
 
@@ -58,8 +59,8 @@ no built-in agent roles, background jobs, or workflow engine.
 The extension registers three tools:
 
 ```ts
-subagent({ task, agent?, model?, agentsMd?, context?, cwd? })
-subagent_resume({ sessionId, message })
+subagent({ task, title, agent?, model?, agentsMd?, context?, cwd? })
+subagent_resume({ sessionId, message, title })
 subagent_list({ cwd? })
 ```
 
@@ -86,12 +87,18 @@ paths, constraints, checks, and expected output in `task`. Use
 Use `multi_tool_use.parallel` to run independent `subagent` calls together.
 Start dependent calls after their prerequisites finish.
 
-### `subagent({ task, agent?, model?, agentsMd?, context?, cwd? })`
+### `subagent({ task, title, agent?, model?, agentsMd?, context?, cwd? })`
 
 Runs one focused task in a child Pi session and returns the child's answer
 and session ID. The arguments are:
 
 - `task` is required. It is the task and expected output for the child.
+- `title` is required, with a maximum of 120 characters. Use three to
+  five words to name the task for the user; it appears while the child
+  runs, in the result, and in saved-chat viewers. Titles are never derived
+  from `task`. Whitespace collapses to single spaces, and a title that is
+  still empty or holds control or formatting characters is rejected
+  before any child work starts.
 - `agent` is optional. Omit it for an unnamed child. Pass an existing
   filename stem such as `"reviewer"` to use `reviewer.md`, not a role
   name. A literal `agent: "subagent"` loads `subagent.md`.
@@ -145,6 +152,8 @@ A successful initial result looks like this:
 ```md
 ## Subagent reviewer result
 Subagent session ID: 019...
+Task: Check catalog conflicts
+Ran 3 turns at 42% context
 Model: acme/fast
 
 <child assistant answer>
@@ -153,14 +162,18 @@ Model: acme/fast
 The `Subagent session ID` identifies the child for recovery or an explicit
 request to resume that exact child session. Initial results name the serving
 model when known and summarize earlier failed attempts with truncated
-provider errors.
+provider errors. The task and per-episode turn count appear after the
+session ID. Unknown or unavailable context usage appears as `? context`.
+The model note follows those lines, and the child's answer comes last.
 
-### `subagent_resume({ sessionId, message })`
+### `subagent_resume({ sessionId, message, title })`
 
 Continues a child Pi session within the current root session. It opens the
 recorded child JSONL session, appends `message`, and waits for the child's
 answer. It returns the answer and the same session ID, without the initial
-`Model` line. The arguments are:
+`Model` line. `title` is required and names this continuation; it is never
+derived from `message`. Resume results include the same `Task` and `Ran`
+lines under that title. The arguments are:
 
 - `sessionId` is required. Use the child Pi session ID from an earlier
   `subagent` or `subagent_resume` result, including recovery text after
@@ -174,6 +187,7 @@ For example, recover an interrupted task with:
 subagent_resume({
 	sessionId: "<returned-child-id>",
 	message: "Continue the interrupted task from where you left off.",
+	title: "Continue the interrupted review",
 })
 ```
 
@@ -331,7 +345,7 @@ Full child messages remain in the child session JSONL.
 While a child runs, Pi frontends receive partial text updates like this:
 
 ```text
-- subagent (6% ctx, 1 turn) -> reviewer (? ctx, 2 turns): using read
+- Review catalog records (subagent, 6% ctx, 1 turn, 15s) -> Check catalog conflicts (reviewer, ? ctx, 2 turns, 8s): using read
 ```
 
 Each update also carries structured `details.run` data:
@@ -341,6 +355,7 @@ type SubagentRunView = {
 	episodeId: string
 	sessionId: string
 	agent: string
+	title: string
 	status: "running" | "completed" | "failed" | "aborted"
 	turnCount: number
 	lastActivityAt: string
@@ -366,45 +381,92 @@ reports unknown usage, the progress text shows `? ctx`. If usage is
 unavailable, the segment omits it. The extension uses Pi's standard
 tool update callback, so it needs no custom TUI renderer.
 
+Each progress segment is the caller's title followed by the agent name and
+ends with whole seconds since that episode's last activity, with a minimum
+of `0s` and no maximum. Nested segments have their own titles and ages. While an episode runs, the runner
+emits an update every 15 seconds even if the activity text has not changed.
+It refreshes context usage before each heartbeat without changing the last
+activity timestamp. The heartbeat stops on completion, failure, or abort.
+
 ### Saved-conversation references
 
 A saved-conversation reference is a pointer to a child transcript. A viewer
-that renders tool details can use it to open the transcript. The reference
-appears in `details.savedConversations`, beside `details.run`. The field
-does not depend on the tool name. It is a viewer convention, not an upstream
-Pi API. It has this shape:
+that renders tool details can use it to open the transcript. The references
+appear in `details.savedConversations`, beside `details.run`. The field does
+not depend on the tool name. It is a viewer convention, not an upstream Pi
+API. Version 2 has this shape:
 
 ```ts
 // Shape of details.savedConversations
 type SavedConversations = {
-	version: 1
+	version: 2
 	root: string
-	items: [{ sessionId: string; file: string; label?: string }]
+	coverage: "observed" | "complete" | "partial"
+	items: SavedConversationOccurrence[]
+}
+
+type SavedConversationOccurrence = {
+	id: string
+	parentId: string | null
+	kind: "start" | "resume" | "unknown"
+	sessionId: string
+	label?: string
+	title?: string
+	stats?: { turns: number; contextPercent: number | null }
+	save:
+		| { kind: "pi-v3"; file: string; readiness: "planned" | "checked" }
+		| { kind: "unavailable"; reason: string }
 }
 ```
 
-`root` is an absolute directory, not a filesystem root. `items` contains
-exactly one entry, for the immediate child. That entry has the exact session
-ID from the child's Pi v3 header, a safe path relative to `root`, and an
-optional display `label`. The child's session manager supplies the file and
-the ID. Fresh and fork runs label the child with its agent name. Fallback
-attempts and resume runs keep the same child session ID and file.
+`root` is an absolute directory, not a filesystem root. `items` is an
+ordered occurrence ledger for the immediate child and every declared
+descendant. The immediate child is the single root occurrence with
+`parentId: null`. Other rows use `parentId` to describe invocation ancestry.
+Each row has the exact session ID from its child's Pi v3 header. Fresh and
+fork runs label the child with its agent name. Duplicate labels are valid.
 
-A running update can include the reference before Pi writes the session
-file. A viewer that opens it too early should retry after the child finishes.
-Terminal details include the reference only when three checks pass. The file
-must be readable, sit inside `root`, and have a header that matches the
-recorded session ID and cwd. If the file fails these checks, terminal
-details omit the reference without changing the tool's outcome. The file
-can still disappear after it is published.
+`title` is display text, not chat identity. `stats.turns` is the owning
+episode's turn count, and `stats.contextPercent` is its context percentage
+or `null` when unknown or unavailable. The runner snapshots these fields
+from its run view on each declaration. Nested occurrences retain the title
+and stats declared by their producer. Stats permit integer turn counts
+from 0 to 1,000,000 and context percentages from 0 to 100.
 
-For nested work, open the immediate child's reference, then follow that
-child's tool results to the next child, including failed results. The parent
-result lists only its immediate child. It does not aggregate descendant
-references or forward native nested tool events from independent children.
+Normal `id` values are pi-submarine episode IDs. A resume gets a new episode
+ID and keeps the same child session ID and file. Treat every `id` as opaque.
+Legacy imports and conflicting sources can use synthetic IDs to preserve
+their declarations without borrowing identity from run metadata. Use the root and
+session ID to identify a chat, not the label or occurrence ID.
+
+`coverage` describes declaration completeness, not task success or file
+availability. Running results use `observed`. Terminal results use
+`complete` when every nested declaration is represented and `partial` when
+a declaration is missing, malformed, conflicted, or over a limit. An
+unavailable save does not by itself make coverage partial.
+
+A `pi-v3` save contains a safe path relative to `root`. A `planned` save can
+appear before Pi writes the session file. A viewer that opens it too early
+should retry after the child finishes. Each invocation validates only its
+own file at completion and changes that save to `checked`. The file must be
+readable, sit inside `root`, and have a header that matches the recorded
+session ID and cwd. A failed check produces an `unavailable` row without
+changing the tool's outcome or hiding valid descendants. Any published file
+can still disappear or change later.
+
+The collector accepts version 1 declarations from older nested producers.
+It imports every item as an `unknown` leaf and marks coverage `partial`. It
+does not infer missing descendants or episode IDs. Consumers should retain
+version 1 support for historical results.
+
+A result retains at most 1,024 occurrence rows and 1,024 nested invocation
+slots for its lifetime. Each validated string can contain at most 4 KiB of
+UTF-8. Overflow marks coverage `partial`. Row overflow keeps the direct child
+and an ancestor-closed selection instead of emitting dangling descendants.
+
 A result without this field remains readable text. See [Pilish's extension
 author guide](https://github.com/dnouri/pilish#extension-support) for the
-full contract.
+consumer contract.
 
 ## Errors and limits
 

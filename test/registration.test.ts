@@ -53,7 +53,7 @@ describe("pi-submarine extension registration", () => {
     const tool = registeredToolsFromFactory()[0]!;
     for (const thinkingLevel of ["high", "low", "off"] as const) {
       const ctx = { thinkingLevel } as ExtensionToolContext;
-      await expect(tool.execute("call", { task: "review" }, undefined, undefined, ctx)).rejects.toBe(stopped);
+      await expect(tool.execute("call", { task: "review", title: "Review the catalog" }, undefined, undefined, ctx)).rejects.toBe(stopped);
       expect(run.mock.calls.at(-1)?.[3]).toBe(ctx);
       expect(run.mock.calls.at(-1)?.[4]).toEqual({ extensionFactories: [register] });
     }
@@ -65,10 +65,11 @@ describe("pi-submarine extension registration", () => {
     expect(subagent?.parameters).toMatchObject({
       type: "object",
       additionalProperties: false,
-      required: ["task"],
+      required: ["task", "title"],
       properties: {
         agent: { type: "string" },
         task: { type: "string", minLength: 1 },
+        title: { type: "string", minLength: 1, maxLength: 120 },
         model: { type: "string", minLength: 1 },
         agentsMd: { type: "string", enum: ["none", "auto"] },
         context: { type: "string", enum: ["fresh", "fork"], default: "fresh" },
@@ -77,16 +78,18 @@ describe("pi-submarine extension registration", () => {
     });
 
     assert(subagent && IsObject(subagent.parameters));
-    expect(Object.keys(subagent.parameters.properties).sort()).toEqual(["agent", "agentsMd", "context", "cwd", "model", "task"]);
+    expect(Object.keys(subagent.parameters.properties).sort()).toEqual(["agent", "agentsMd", "context", "cwd", "model", "task", "title"]);
     expect(subagent.parameters.properties.agentsMd).not.toHaveProperty("default");
+    expect(subagent.parameters.properties.title).toMatchObject({ type: "string", minLength: 1, maxLength: 120, description: expect.stringMatching(/Three to five words.*never derived/) });
 
     expect(subagentResume?.parameters).toMatchObject({
       type: "object",
       additionalProperties: false,
-      required: ["sessionId", "message"],
+      required: ["sessionId", "message", "title"],
       properties: {
         sessionId: { type: "string", minLength: 1 },
         message: { type: "string", minLength: 1 },
+        title: { type: "string", minLength: 1, maxLength: 120 },
       },
     });
 
@@ -99,20 +102,31 @@ describe("pi-submarine extension registration", () => {
     });
     assert(subagentResume && IsObject(subagentResume.parameters));
     assert(subagentList && IsObject(subagentList.parameters));
-    expect(Object.keys(subagentResume.parameters.properties).sort()).toEqual(["message", "sessionId"]);
+    expect(Object.keys(subagentResume.parameters.properties).sort()).toEqual(["message", "sessionId", "title"]);
     expect(Object.keys(subagentList.parameters.properties)).toEqual(["cwd"]);
   });
 
   it.each([
-    { task: "review", thinkingLevel: "low" },
-    { task: "review", agentsMd: "bogus" },
-    { task: "review", unknown: true },
+    { task: "review", title: "Review the catalog", thinkingLevel: "low" },
+    { task: "review", title: "Review the catalog", agentsMd: "bogus" },
+    { task: "review", title: "Review the catalog", unknown: true },
+    { task: "review", title: "" },
+    { task: "review", title: "x".repeat(121) },
+    { task: "review" },
   ])("rejects invalid public arguments through Pi's validator (%j)", (args) => {
     expect(() => validateToolArguments(subagentTool, { type: "toolCall", id: "invalid", name: "subagent", arguments: args })).toThrow();
   });
 
+  it.each([
+    { sessionId: "session-1", message: "continue" },
+    { sessionId: "session-1", message: "continue", title: "" },
+    { sessionId: "session-1", message: "continue", title: "x".repeat(121) },
+  ])("rejects invalid resume arguments through Pi's validator (%j)", (args) => {
+    expect(() => validateToolArguments(subagentResumeTool, { type: "toolCall", id: "invalid", name: "subagent_resume", arguments: args })).toThrow();
+  });
+
   it.each(["none", "auto"])("accepts agentsMd %s through Pi's validator", (agentsMd) => {
-    const args = { task: "review", agentsMd };
+    const args = { task: "review", title: "Review the catalog", agentsMd };
     expect(validateToolArguments(subagentTool, { type: "toolCall", id: "valid", name: "subagent", arguments: args })).toEqual(args);
   });
 
@@ -176,13 +190,13 @@ describe("pi-submarine extension registration", () => {
       }
     })();
 
-    await expect(subagentTool.execute("tool-call-1", { task: "say hi" }, undefined, undefined, {
+    await expect(subagentTool.execute("tool-call-1", { task: "say hi", title: "Say hi" }, undefined, undefined, {
       cwd,
       sessionManager: { getSessionFile: () => undefined },
       modelRegistry: {},
       model: undefined,
     } as unknown as ExtensionToolContext)).rejects.toThrow("requires a persisted parent Pi session");
-    await expect(subagentResumeTool.execute("tool-call-resume", { sessionId: "session-1", message: "continue" }, undefined, undefined, {
+    await expect(subagentResumeTool.execute("tool-call-resume", { sessionId: "session-1", message: "continue", title: "Continue the child" }, undefined, undefined, {
       cwd,
       sessionManager: { getSessionFile: () => undefined },
       modelRegistry: {},

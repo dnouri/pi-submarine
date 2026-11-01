@@ -1,3 +1,4 @@
+import { safeReferenceText } from "./saved-conversations.js";
 import { OMITTED_AGENT_LABEL, type AgentSelection, type SubagentRunView } from "./types.js";
 
 export function omittedAgentSelection(): AgentSelection {
@@ -17,9 +18,24 @@ export function resultHeading(selection: AgentSelection): string {
   return `## ${subagentTitle(selection)} result`;
 }
 
-export function renderSubagentResult(selection: AgentSelection, sessionId: string, answer: string, modelNote?: string): string {
+export function requiredRunTitle(title: string): string {
+  const trimmed = title.trim().replace(/\s+/g, " ");
+  if (!safeReferenceText(trimmed)) {
+    throw new Error("Title must be one short line of printable text. Give the call a three-to-five-word title and retry.");
+  }
+  return trimmed;
+}
+
+export function safeRunTitle(title: string): string {
+  return safeReferenceText(title) ? title : "";
+}
+
+export function renderSubagentResult(selection: AgentSelection, run: Pick<SubagentRunView, "sessionId" | "title" | "turnCount" | "contextUsage">, answer: string, modelNote?: string): string {
   const note = modelNote === undefined ? "" : `\n${modelNote}`;
-  return `${resultHeading(selection)}\nSubagent session ID: ${sessionId}${note}\n\n${answer}`;
+  const percent = run.contextUsage?.percent;
+  const context = percent == null ? "? context" : `${percent}% context`;
+  const task = run.title ? `\nTask: ${run.title}` : "";
+  return `${resultHeading(selection)}\nSubagent session ID: ${run.sessionId}${task}\nRan ${formatTurnCount(run.turnCount)} at ${context}${note}\n\n${answer}`;
 }
 
 export function interruptedHeading(selection: AgentSelection): string {
@@ -57,8 +73,8 @@ export function renderSubagentRecoverableError(selection: AgentSelection, sessio
   ].join("\n");
 }
 
-export function renderSubagentProgress(run: SubagentRunView): string {
-  return activeRunPaths(run).map(formatRunProgressBullet).join("\n");
+export function renderSubagentProgress(run: SubagentRunView, now = Date.now()): string {
+  return activeRunPaths(run).map((path) => formatRunProgressBullet(path, now)).join("\n");
 }
 
 function activeRunPaths(run: SubagentRunView): SubagentRunView[][] {
@@ -66,18 +82,20 @@ function activeRunPaths(run: SubagentRunView): SubagentRunView[][] {
   return runningPaths.length > 0 ? runningPaths : [[run]];
 }
 
-function formatRunPath(path: readonly SubagentRunView[]): string {
-  return path.map(formatRunSegment).join(" -> ");
+function formatRunPath(path: readonly SubagentRunView[], now: number): string {
+  return path.map((run) => formatRunSegment(run, now)).join(" -> ");
 }
 
-function formatRunSegment(run: SubagentRunView): string {
-  return `${run.agent} (${formatRunSegmentDetails(run).join(", ")})`;
+function formatRunSegment(run: SubagentRunView, now: number): string {
+  const details = formatRunSegmentDetails(run, now).join(", ");
+  const title = safeRunTitle(run.title);
+  return title ? `${title} (${run.agent}, ${details})` : `${run.agent} (${details})`;
 }
 
-function formatRunProgressBullet(path: readonly SubagentRunView[]): string {
+function formatRunProgressBullet(path: readonly SubagentRunView[], now: number): string {
   const leaf = path.at(-1);
   if (!leaf) throw new Error("Cannot render an empty subagent path.");
-  return `- ${formatRunPath(path)}: ${leaf.activity}`;
+  return `- ${formatRunPath(path, now)}: ${leaf.activity}`;
 }
 
 function runningLeafPaths(run: SubagentRunView, ancestors: readonly SubagentRunView[]): SubagentRunView[][] {
@@ -88,12 +106,20 @@ function runningLeafPaths(run: SubagentRunView, ancestors: readonly SubagentRunV
   return childPaths.length > 0 ? childPaths : [path];
 }
 
-function formatRunSegmentDetails(run: Pick<SubagentRunView, "contextUsage" | "turnCount">): string[] {
+function formatRunSegmentDetails(run: SubagentRunView, now: number): string[] {
   const details: string[] = [];
   const contextUsage = formatContextUsage(run);
   if (contextUsage) details.push(contextUsage);
   details.push(formatTurnCount(run.turnCount));
+  const age = formatActivityAge(run.lastActivityAt, now);
+  if (age !== undefined) details.push(age);
   return details;
+}
+
+export function formatActivityAge(lastActivityAt: string, now: number): string | undefined {
+  const timestamp = Date.parse(lastActivityAt);
+  if (Number.isNaN(timestamp)) return undefined;
+  return `${Math.max(0, Math.floor((now - timestamp) / 1000))}s`;
 }
 
 function formatContextUsage(run: Pick<SubagentRunView, "contextUsage">): string | undefined {
